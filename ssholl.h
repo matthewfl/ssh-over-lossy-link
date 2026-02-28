@@ -79,9 +79,10 @@ struct Config {
 struct Args {
   Config config;
   bool server_mode = false;
-  std::string lossy_ssh_host;   // required in client mode
+  std::string lossy_ssh_host;   // required in client mode unless unix_socket_connection is set
   std::string remote_hostname = "localhost";
   uint16_t remote_port = 22;
+  std::string unix_socket_connection;  // if non-empty, connect directly to this socket (no SSH -L)
 };
 
 // Parse argc/argv into Args. Returns true on success; otherwise prints usage

@@ -20,6 +20,7 @@ const struct option LONG_OPTS[] = {
   { "rs-redundancy",       required_argument, nullptr, 'R' },
   { "max-delay",            required_argument, nullptr, 'd' },
   { "server",               no_argument,       nullptr, 'S' },
+  { "unix-socket-connection", required_argument, nullptr, 'u' },
   { "help",                 no_argument,       nullptr, 'h' },
   { nullptr, 0, nullptr, 0 },
 };
@@ -59,6 +60,7 @@ uint16_t parse_port(const char* s) {
 void usage(const char* program_name) {
   std::cerr
     << "Usage: " << program_name << " [options] lossy-ssh-host [hostname-on-remote [remote-port]]\n"
+    << "   Or: " << program_name << " [options] --unix-socket-connection PATH  (connect via proxy socket, no SSH)\n"
     << "   Or: " << program_name << " --server [hostname] [port]\n"
     << "\n"
     << "Options:\n"
@@ -71,13 +73,14 @@ void usage(const char* program_name) {
     << "  --rs-redundancy N             Extra Reed–Solomon packets as fraction. Default: 0.2\n"
     << "  --max-delay N                 Max delay (ms) waiting for buffer for RS. Default: 1\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
+    << "  --unix-socket-connection PATH Connect directly to Unix socket PATH instead of SSH -L\n"
     << "  --help                        Show this help\n";
 }
 
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:Sh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:Su:h", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -110,6 +113,9 @@ bool parse_args(int argc, char* argv[], Args& out) {
         case 'S':
           out.server_mode = true;
           break;
+        case 'u':
+          out.unix_socket_connection = optarg;
+          break;
         case 'h':
           usage(argv[0]);
           return false;
@@ -136,13 +142,14 @@ bool parse_args(int argc, char* argv[], Args& out) {
       return false;
     }
   } else {
-    // client: lossy-ssh-host [hostname-on-remote] [remote-port]
-    if (optind >= argc) {
-      std::cerr << "ssh-oll: lossy-ssh-host required\n";
+    // client: [lossy-ssh-host] [hostname-on-remote] [remote-port]; lossy-ssh-host optional if --unix-socket-connection set
+    if (out.unix_socket_connection.empty() && optind >= argc) {
+      std::cerr << "ssh-oll: lossy-ssh-host required (or use --unix-socket-connection)\n";
       usage(argv[0]);
       return false;
     }
-    out.lossy_ssh_host = argv[optind++];
+    if (optind < argc)
+      out.lossy_ssh_host = argv[optind++];
     if (optind < argc)
       out.remote_hostname = argv[optind++];
     if (optind < argc)

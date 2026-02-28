@@ -53,6 +53,7 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --rs-redundancy [N]           Number of extra packets when using Reed–Solomon, as a fraction.  Default 0.2
 --max-delay [N]               Max delay in ms for sending data while waiting for buffer to fill for Reed–Solomon.  Default 1ms
 --server                      Start the server instance of ssh-oll.  Default off (client mode).
+--unix-socket-connection PATH  Connect directly to Unix socket PATH instead of using SSH -L (for testing).
 ```
 
 
@@ -116,6 +117,24 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 };
 
 ```
+
+## Development testing
+
+A Python script `test_ssh_oll.py` exercises the stack without SSH:
+
+1. Starts a TCP server (default port 2222) that `ssh-oll --server` uses as its backend instead of real SSH.
+2. Starts `ssh-oll --server localhost <port>` and reads its Unix socket path.
+3. Creates a proxy Unix socket (e.g. `/tmp/ssh-oll-test-script.<suffix>`) that forwards to the server socket, with optional `--latency-ms` to simulate delay.
+4. Runs the client with `--unix-socket-connection <proxy>` so the client connects via the proxy (no SSH).
+5. Measures latency: client stdin → TCP and TCP → client stdout.
+
+Example:
+
+```bash
+./test_ssh_oll.py --ssh-oll-path ./ssh-oll [--latency-ms 5] [--iterations 10]
+```
+
+Use `--unix-socket-connection` on the client to point at the proxy socket when driving the client manually.
 
 ## License
 

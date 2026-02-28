@@ -119,56 +119,66 @@ struct CarrierState {
 }  // namespace
 
 int run_client(const Args& args) {
-  std::string socket_path = launch_server(args);
-  if (socket_path.empty()) {
-    std::fprintf(stderr, "ssh-oll: failed to launch server on %s\n", args.lossy_ssh_host.c_str());
-    return 1;
-  }
+  std::string socket_path;
+  std::string client_dir;
+  std::vector<pid_t> ssh_pids;
 
-  std::string client_dir = make_client_dir();
-  if (mkdir(client_dir.c_str(), 0700) < 0) {
-    std::perror("ssh-oll: mkdir");
-    return 1;
+  if (!args.unix_socket_connection.empty()) {
+    socket_path = args.unix_socket_connection;
+  } else {
+    socket_path = launch_server(args);
+    if (socket_path.empty()) {
+      std::fprintf(stderr, "ssh-oll: failed to launch server on %s\n", args.lossy_ssh_host.c_str());
+      return 1;
+    }
+    client_dir = make_client_dir();
+    if (mkdir(client_dir.c_str(), 0700) < 0) {
+      std::perror("ssh-oll: mkdir");
+      return 1;
+    }
+
+    const unsigned N = args.config.connections;
+    ssh_pids.reserve(N);
+
+    for (unsigned i = 0; i < N; ++i) {
+      std::string local_path = client_dir + "/" + std::to_string(i);
+      pid_t pid = fork();
+      if (pid < 0) {
+        std::perror("ssh-oll: fork");
+        for (pid_t p : ssh_pids) kill(p, SIGTERM);
+        rmdir(client_dir.c_str());
+        return 1;
+      }
+      if (pid == 0) {
+        std::string spec = local_path + ":" + socket_path;
+        const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+        execvp("ssh", const_cast<char* const*>(argv));
+        _exit(127);
+      }
+      ssh_pids.push_back(pid);
+    }
+
+    // Wait for SSH to create sockets and accept connections.
+    for (int wait_ms = 0; wait_ms < 5000; wait_ms += 100) {
+      usleep(100 * 1000);
+      bool any = false;
+      for (unsigned i = 0; i < N; ++i) {
+        std::string path = client_dir + "/" + std::to_string(i);
+        if (access(path.c_str(), F_OK) == 0) { any = true; break; }
+      }
+      if (any) break;
+    }
   }
 
   const unsigned N = args.config.connections;
-  std::vector<pid_t> ssh_pids;
-  ssh_pids.reserve(N);
-
-  for (unsigned i = 0; i < N; ++i) {
-    std::string local_path = client_dir + "/" + std::to_string(i);
-    pid_t pid = fork();
-    if (pid < 0) {
-      std::perror("ssh-oll: fork");
-      for (pid_t p : ssh_pids) kill(p, SIGTERM);
-      rmdir(client_dir.c_str());
-      return 1;
-    }
-    if (pid == 0) {
-      std::string spec = local_path + ":" + socket_path;
-      const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
-      execvp("ssh", const_cast<char* const*>(argv));
-      _exit(127);
-    }
-    ssh_pids.push_back(pid);
-  }
-
-  // Wait for SSH to create sockets and accept connections.
-  for (int wait_ms = 0; wait_ms < 5000; wait_ms += 100) {
-    usleep(100 * 1000);
-    bool any = false;
-    for (unsigned i = 0; i < N; ++i) {
-      std::string path = client_dir + "/" + std::to_string(i);
-      if (access(path.c_str(), F_OK) == 0) { any = true; break; }
-    }
-    if (any) break;
-  }
 
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
     std::perror("ssh-oll: epoll_create1");
-    for (pid_t p : ssh_pids) kill(p, SIGTERM);
-    rmdir(client_dir.c_str());
+    if (args.unix_socket_connection.empty()) {
+      for (pid_t p : ssh_pids) kill(p, SIGTERM);
+      rmdir(client_dir.c_str());
+    }
     return 1;
   }
 
@@ -192,7 +202,7 @@ int run_client(const Args& args) {
   epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
 
   for (unsigned i = 0; i < N; ++i) {
-    std::string path = client_dir + "/" + std::to_string(i);
+    std::string path = args.unix_socket_connection.empty() ? (client_dir + "/" + std::to_string(i)) : socket_path;
     int fd = connect_unix(path);
     if (fd < 0) continue;
     ev.events = EPOLLIN | EPOLLOUT;
@@ -206,8 +216,10 @@ int run_client(const Args& args) {
   if (carriers.empty()) {
     std::fprintf(stderr, "ssh-oll: could not connect any carrier to server\n");
     close(epfd);
-    for (pid_t p : ssh_pids) kill(p, SIGTERM);
-    rmdir(client_dir.c_str());
+    if (args.unix_socket_connection.empty()) {
+      for (pid_t p : ssh_pids) kill(p, SIGTERM);
+      rmdir(client_dir.c_str());
+    }
     return 1;
   }
 
@@ -452,11 +464,15 @@ int run_client(const Args& args) {
   for (auto& [fd, _] : carriers)
     close(fd);
   close(epfd);
-  for (pid_t p : ssh_pids)
-    kill(p, SIGTERM);
-  for (unsigned i = 0; i < N; ++i)
-    unlink((client_dir + "/" + std::to_string(i)).c_str());
-  rmdir(client_dir.c_str());
+  if (!args.unix_socket_connection.empty()) {
+    // Direct Unix socket mode: no SSH processes or client_dir to clean up
+  } else {
+    for (pid_t p : ssh_pids)
+      kill(p, SIGTERM);
+    for (unsigned i = 0; i < N; ++i)
+      unlink((client_dir + "/" + std::to_string(i)).c_str());
+    rmdir(client_dir.c_str());
+  }
   return 0;
 }
 
