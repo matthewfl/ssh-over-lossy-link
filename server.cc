@@ -416,12 +416,13 @@ int run_server(const Args& args) {
           rp.k = k;
           rp.block_size = block_sz;
         }
-        if (rp.n != n || rp.k != k || rp.block_size != block_sz) {
+        if (rp.k != 0 && (rp.k != k || rp.block_size != block_sz)) {
           s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
           continue;
         }
+        rp.n = (rp.k == 0) ? n : std::max(rp.n, n);
         unsigned idx = prs->shard_index;
-        if (idx >= n) {
+        if (idx >= rp.n || idx >= 256u) {
           s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
           continue;
         }
