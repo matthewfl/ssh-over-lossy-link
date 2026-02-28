@@ -223,7 +223,9 @@ int run_client(const Args& args) {
     return 1;
   }
 
-  auto queue_to_carrier = [&](int fd, const uint8_t* data, size_t len) {
+  // Queue a SMALL packet to one carrier. If same_id is true, use current next_send_id
+  // and do not increment (caller will increment once after queuing to all carriers).
+  auto queue_to_carrier = [&](int fd, const uint8_t* data, size_t len, bool same_id = false) {
     if (len == 0) return;
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
@@ -235,7 +237,8 @@ int run_client(const Args& args) {
     s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
     s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
     s.write_buf.insert(s.write_buf.end(), data, data + len);
-    next_send_id++;
+    if (!same_id)
+      next_send_id++;
   };
 
   auto flush_stdout = [&]() {
@@ -397,7 +400,7 @@ int run_client(const Args& args) {
           if (carriers.empty()) break;
           auto it = carriers.begin();
           std::advance(it, next_carrier % carriers.size());
-          queue_to_carrier(it->first, stdin_buf.data(), chunk);
+          queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
           stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
           next_carrier++;
           ev.events = EPOLLIN | EPOLLOUT;
@@ -451,11 +454,22 @@ int run_client(const Args& args) {
     if (stdin_eof && !stdin_buf.empty() && !carriers.empty()) {
       while (!stdin_buf.empty()) {
         size_t chunk = std::min(stdin_buf.size(), max_packet);
-        auto it = carriers.begin();
-        std::advance(it, next_carrier % carriers.size());
-        queue_to_carrier(it->first, stdin_buf.data(), chunk);
+        const bool small_packet = (chunk < max_packet);
+        const unsigned n_copies = small_packet
+            ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), args.config.small_packet_redundancy))
+            : 1u;
+        for (unsigned i = 0; i < n_copies; ++i) {
+          auto it = carriers.begin();
+          std::advance(it, (next_carrier + i) % carriers.size());
+          queue_to_carrier(it->first, stdin_buf.data(), chunk, small_packet && n_copies > 1);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = it->first;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+        }
+        if (small_packet && n_copies > 1)
+          next_send_id++;
         stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
-        next_carrier++;
+        next_carrier += n_copies;
       }
     }
 

@@ -307,8 +307,11 @@ int run_server(const Args& args) {
         size_t total = sizeof(PacketHeader) + sizeof(uint16_t) + size;
         if (s.read_buf.size() < total) break;
         uint64_t id = h->id;
-        std::vector<uint8_t> payload(p->data, p->data + size);
-        reassembly[id] = std::move(payload);
+        // First copy wins: ignore duplicate small packets (redundancy copies).
+        if (!reassembly.count(id)) {
+          std::vector<uint8_t> payload(p->data, p->data + size);
+          reassembly[id] = std::move(payload);
+        }
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total);
         connect_backend();
         deliver_pending_to_backend();
