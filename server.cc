@@ -15,6 +15,7 @@
 #include <sys/un.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 
 namespace ssholl {
@@ -183,6 +184,8 @@ int run_server(const Args& args) {
     int err = get_so_error(backend_fd);
     if (err == 0) {
       backend_connected = true;
+      int one = 1;
+      setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
       ev.events = EPOLLIN;
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);

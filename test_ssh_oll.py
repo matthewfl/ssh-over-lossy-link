@@ -357,6 +357,20 @@ def main():
     latencies_client_to_tcp = []
     latencies_tcp_to_client = []
 
+    # Warmup: one full round-trip each direction so the first timed iteration
+    # doesn't pay for cold caches / scheduler; reduces stdin->TCP latency variance.
+    _warm = os.urandom(args.payload_size)
+    client_proc.stdin.write(_warm)
+    client_proc.stdin.flush()
+    _got = b""
+    while len(_got) < len(_warm):
+        _got += tcp_conn.recv(len(_warm) - len(_got))
+    _warm = os.urandom(args.payload_size)
+    tcp_conn.sendall(_warm)
+    _got = b""
+    while len(_got) < len(_warm):
+        _got += client_proc.stdout.read(len(_warm) - len(_got))
+
     for _ in range(args.iterations):
         # Measurement 1: client stdin -> TCP (client sends, we read on TCP)
         payload = os.urandom(args.payload_size)

@@ -381,13 +381,17 @@ int run_client(const Args& args) {
       if (fd == STDIN_FILENO) {
         if (stdin_eof) continue;
         uint8_t buf[READ_BUF_SIZE];
-        ssize_t nr = read(STDIN_FILENO, buf, sizeof buf);
-        if (nr <= 0) {
-          if (nr == 0) stdin_eof = true;
-          else if (errno != EAGAIN && errno != EWOULDBLOCK) stdin_eof = true;
-          continue;
+        // Drain stdin completely in one epoll iteration so we don't need multiple
+        // wakeups to receive a full payload (avoids extra ~scheduler latency).
+        while (true) {
+          ssize_t nr = read(STDIN_FILENO, buf, sizeof buf);
+          if (nr <= 0) {
+            if (nr == 0) stdin_eof = true;
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) stdin_eof = true;
+            break;
+          }
+          stdin_buf.insert(stdin_buf.end(), buf, buf + nr);
         }
-        stdin_buf.insert(stdin_buf.end(), buf, buf + nr);
         while (stdin_buf.size() >= max_packet) {
           size_t chunk = max_packet;
           if (carriers.empty()) break;
@@ -400,6 +404,9 @@ int run_client(const Args& args) {
           ev.data.fd = it->first;
           epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
         }
+        // Flush immediately so data reaches kernel (and thus server) in this
+        // iteration instead of after processing other events in the batch.
+        flush_carrier_writes();
         continue;
       }
 
