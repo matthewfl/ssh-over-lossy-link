@@ -5,7 +5,9 @@ Test script for ssh-oll development.
 - Starts a TCP server that ssh-oll --server connects to as its "backend" (instead of real SSH).
 - Starts ssh-oll --server localhost <tcp_port> and captures its Unix socket path.
 - Creates a proxy Unix socket that forwards connections to the real server socket,
-  with optional latency injection to simulate lossy links.
+  with optional latency injection (--latency-ms or --latency-random) to simulate lossy links.
+- With --latency-random: a fraction of chunks get a long delay (e.g. 5%% get 5s, 95%% get 0.1s),
+  emulating packet loss where TCP retransmits and eventually gets data through.
 - Runs ssh-oll client with --unix-socket-connection <proxy> so the client talks via the proxy.
 - Measures latency: client stdin -> TCP (and TCP -> client stdout).
 
@@ -22,6 +24,7 @@ Usage:
 
 import argparse
 import os
+import queue
 import random
 import select
 import socket
@@ -54,15 +57,33 @@ def unix_listen(path):
     return sock
 
 
-def relay_with_latency(sock_from, sock_to, delay_sec, label=""):
-    """Read from sock_from, optionally delay, write to sock_to. Stops on EOF/error."""
+def _relay_reader(sock_from, queue, stop_event):
+    """Read from sock_from and put chunks in queue. Runs until EOF or stop_event."""
     try:
-        while True:
+        while not stop_event.is_set():
             data = sock_from.recv(65536)
             if not data:
                 break
-            if delay_sec > 0:
-                time.sleep(delay_sec)
+            queue.put((data, None))
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        queue.put((b"", None))  # EOF sentinel
+
+
+def _relay_sender(sock_to, q, delay_spec, stop_event):
+    """Pop chunks from queue, apply delay_spec, send to sock_to. Runs until EOF sentinel."""
+    try:
+        while not stop_event.is_set():
+            try:
+                data, _ = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not data:
+                break
+            delay = delay_spec() if callable(delay_spec) else delay_spec
+            if delay > 0:
+                time.sleep(delay)
             sock_to.sendall(data)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
@@ -73,7 +94,45 @@ def relay_with_latency(sock_from, sock_to, delay_sec, label=""):
             pass
 
 
-def proxy_connection(client_conn, server_socket_path, latency_sec):
+def _relay_zero_latency(sock_from, sock_to):
+    """Direct relay with no delay: read from sock_from, write to sock_to. Stops on EOF/error."""
+    try:
+        while True:
+            data = sock_from.recv(65536)
+            if not data:
+                break
+            sock_to.sendall(data)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        try:
+            sock_to.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def relay_with_latency(sock_from, sock_to, delay_spec):
+    """Read from sock_from, optionally delay, write to sock_to. Stops on EOF/error.
+
+    When delay_spec is 0 (constant), uses a direct relay. Otherwise uses a queue and
+    sender thread so we keep reading while delaying (avoids blocking the peer).
+    delay_spec: float (constant seconds) or callable() -> float per chunk (randomize mode).
+    """
+    # Zero latency: direct relay, no queue (fast path that matches original working behavior)
+    if not callable(delay_spec) and delay_spec == 0:
+        _relay_zero_latency(sock_from, sock_to)
+        return
+    q = queue.Queue()
+    stop = threading.Event()
+    reader = threading.Thread(target=_relay_reader, args=(sock_from, q, stop), daemon=True)
+    sender = threading.Thread(target=_relay_sender, args=(sock_to, q, delay_spec, stop), daemon=True)
+    reader.start()
+    sender.start()
+    reader.join()
+    sender.join()
+
+
+def proxy_connection(client_conn, server_socket_path, delay_spec):
     """Connect to server socket and relay client_conn <-> server in both directions with optional latency."""
     try:
         server_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -83,12 +142,12 @@ def proxy_connection(client_conn, server_socket_path, latency_sec):
         return
     t1 = threading.Thread(
         target=relay_with_latency,
-        args=(client_conn, server_conn, latency_sec),
+        args=(client_conn, server_conn, delay_spec),
         daemon=True,
     )
     t2 = threading.Thread(
         target=relay_with_latency,
-        args=(server_conn, client_conn, latency_sec),
+        args=(server_conn, client_conn, delay_spec),
         daemon=True,
     )
     t1.start()
@@ -99,7 +158,7 @@ def proxy_connection(client_conn, server_socket_path, latency_sec):
     server_conn.close()
 
 
-def proxy_accept_loop(proxy_path, server_socket_path, latency_sec, stop_event):
+def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event):
     """Accept on proxy_path, for each connection relay to server_socket_path with latency."""
     listen_sock = unix_listen(proxy_path)
     listen_sock.settimeout(0.5)
@@ -111,7 +170,7 @@ def proxy_accept_loop(proxy_path, server_socket_path, latency_sec, stop_event):
                 continue
             t = threading.Thread(
                 target=proxy_connection,
-                args=(conn, server_socket_path, latency_sec),
+                args=(conn, server_socket_path, delay_spec),
                 daemon=True,
             )
             t.start()
@@ -155,6 +214,29 @@ def main():
         help="Extra latency in ms to inject in proxy (each direction). Default 0",
     )
     parser.add_argument(
+        "--latency-random",
+        action="store_true",
+        help="Randomize latency: --latency-random-pct of chunks get --latency-random-high-ms, rest get --latency-random-low-ms (emulates packet loss / retransmit)",
+    )
+    parser.add_argument(
+        "--latency-random-pct",
+        type=float,
+        default=5.0,
+        help="When --latency-random: percent of chunks that get the high delay. Default 5",
+    )
+    parser.add_argument(
+        "--latency-random-high-ms",
+        type=float,
+        default=5000.0,
+        help="When --latency-random: high delay in ms (emulates drop/retransmit). Default 5000",
+    )
+    parser.add_argument(
+        "--latency-random-low-ms",
+        type=float,
+        default=100.0,
+        help="When --latency-random: normal delay in ms. Default 100",
+    )
+    parser.add_argument(
         "--iterations",
         type=int,
         default=5,
@@ -173,7 +255,19 @@ def main():
     )
     args = parser.parse_args()
 
-    latency_sec = args.latency_ms / 1000.0 if args.latency_ms else 0.0
+    # Build delay spec: constant seconds or callable() -> seconds for randomize mode
+    if args.latency_random:
+        low_sec = args.latency_random_low_ms / 1000.0
+        high_sec = args.latency_random_high_ms / 1000.0
+        pct_high = max(0.0, min(100.0, args.latency_random_pct)) / 100.0
+        # Per-chunk random delay: pct_high of the time use high_sec, else low_sec
+        def delay_spec():
+            return random.choices(
+                [low_sec, high_sec], weights=[1.0 - pct_high, pct_high], k=1
+            )[0]
+    else:
+        latency_sec = args.latency_ms / 1000.0 if args.latency_ms else 0.0
+        delay_spec = latency_sec
     proxy_path = args.proxy_socket or f"/tmp/ssh-oll-test-script.{random_suffix()}"
 
     # 1. Start TCP server (backend for ssh-oll --server)
@@ -210,7 +304,7 @@ def main():
     stop_proxy = threading.Event()
     proxy_thread = threading.Thread(
         target=proxy_accept_loop,
-        args=(proxy_path, server_socket_path, latency_sec, stop_proxy),
+        args=(proxy_path, server_socket_path, delay_spec, stop_proxy),
         daemon=True,
     )
     proxy_thread.start()
@@ -245,7 +339,12 @@ def main():
 
     tcp_conn = tcp_conn_holder["conn"]
     # Longer timeout when injecting latency (each chunk is delayed)
-    recv_timeout = 30.0 + (args.latency_ms * args.payload_size / max(args.packet_size, 1) * 2 / 1000.0)
+    if args.latency_random:
+        # Worst case: every chunk gets high delay
+        chunks_per_iter = (args.payload_size + args.packet_size - 1) // max(args.packet_size, 1)
+        recv_timeout = 60.0 + args.iterations * 2 * chunks_per_iter * (args.latency_random_high_ms / 1000.0)
+    else:
+        recv_timeout = 30.0 + (args.latency_ms * args.payload_size / max(args.packet_size, 1) * 2 / 1000.0)
     tcp_conn.settimeout(max(30.0, recv_timeout))
 
     # Drain any data that came from the initial burst (so we start clean for measurements)
@@ -323,7 +422,12 @@ def main():
     else:
         print("  TCP -> client stdout: (no successful samples)")
 
-    if args.latency_ms:
+    if args.latency_random:
+        print(
+            f"  (random latency: {args.latency_random_pct}% of chunks "
+            f"{args.latency_random_high_ms} ms, rest {args.latency_random_low_ms} ms)"
+        )
+    elif args.latency_ms:
         print(f"  (injected proxy latency: {args.latency_ms} ms per direction)")
 
     return 0
