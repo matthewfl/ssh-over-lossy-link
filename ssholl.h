@@ -19,6 +19,7 @@ enum class PacketKind : uint8_t {
   REED_SOLOMON = 3,
   SET_CONFIG = 4,         // client -> server: adjust redundancy / packet size
   START_CONNECTION = 5,   // new carrier joins; associate carrier with stream
+  ACK = 6,                // server -> client; cumulative ack: all data up to id delivered
 };
 
 #pragma pack(push, 1)

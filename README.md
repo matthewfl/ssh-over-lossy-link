@@ -91,6 +91,7 @@ enum packet_kind_e : uint8_t {
     PACKET_REED_SOLOMON = 3,
     PACKET_SET_CONFIG = 4,        // client -> server; adjust redundancy / packet size etc.
     PACKET_START_CONNECTION = 5,  // sent when a new carrier joins; used to associate the carrier with the logical stream
+    PACKET_ACK = 6,               // server -> client; cumulative ack: all data up to and including header.id has been delivered (for latency measurement)
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -116,6 +117,10 @@ struct __attribute__((__packed__)) packet_config : packet_header {
     float reed_solomon_redundancy;
     // other fields as needed
 };
+
+// PACKET_ACK: header only. header.id = acked_id (all data with id <= acked_id has been
+// delivered to the backend). Server sends on all carriers for efficiency; client uses
+// ACKs received per carrier to measure per-link RTT (round-trip time) for latency.
 
 ```
 

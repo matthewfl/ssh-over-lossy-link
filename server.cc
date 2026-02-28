@@ -287,8 +287,21 @@ int run_server(const Args& args) {
     }
   };
 
-  auto deliver_pending_to_backend = [&]() {
-    if (backend_fd < 0 || !backend_connected) return;
+  // Queue ACK packet to a carrier's write buffer (server -> client).
+  auto queue_ack_to_carrier = [&](int fd, uint64_t acked_id) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    PacketHeader h{};
+    h.id = acked_id;
+    h.packet_kind = PacketKind::ACK;
+    CarrierState& s = it->second;
+    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+  };
+
+  // Returns last delivered id (for ACK), or 0 if none delivered this call.
+  auto deliver_pending_to_backend = [&]() -> uint64_t {
+    if (backend_fd < 0 || !backend_connected) return 0;
+    uint64_t last_delivered = 0;
     while (reassembly.count(next_deliver_id)) {
       std::vector<uint8_t>& vec = reassembly[next_deliver_id];
       while (!vec.empty()) {
@@ -298,7 +311,7 @@ int run_server(const Args& args) {
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = backend_fd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
-            return;
+            return last_delivered;
           }
           break;
         }
@@ -306,9 +319,11 @@ int run_server(const Args& args) {
       }
       if (vec.empty()) {
         reassembly.erase(next_deliver_id);
+        last_delivered = next_deliver_id;
         next_deliver_id++;
       }
     }
+    return last_delivered;
   };
 
   auto process_carrier_read = [&](int fd, CarrierState& s) {
@@ -346,7 +361,14 @@ int run_server(const Args& args) {
         }
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total);
         connect_backend();
-        deliver_pending_to_backend();
+        if (uint64_t acked = deliver_pending_to_backend(); acked != 0) {
+          for (auto& [cfd, _] : carriers) {
+            queue_ack_to_carrier(cfd, acked);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          }
+        }
         continue;
       }
       if (h->packet_kind == PacketKind::SET_CONFIG) {
@@ -422,7 +444,14 @@ int run_server(const Args& args) {
           }
           rs_pending.erase(id);
           connect_backend();
-          deliver_pending_to_backend();
+          if (uint64_t acked = deliver_pending_to_backend(); acked != 0) {
+            for (auto& [cfd, _] : carriers) {
+              queue_ack_to_carrier(cfd, acked);
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = cfd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            }
+          }
         }
         continue;
       }
@@ -478,7 +507,14 @@ int run_server(const Args& args) {
           backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
         }
         if (e & EPOLLOUT) {
-          deliver_pending_to_backend();
+          if (uint64_t acked = deliver_pending_to_backend(); acked != 0) {
+            for (auto& [cfd, _] : carriers) {
+              queue_ack_to_carrier(cfd, acked);
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = cfd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            }
+          }
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
           running = false;
@@ -544,7 +580,14 @@ int run_server(const Args& args) {
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
       }
     }
-    deliver_pending_to_backend();
+    if (uint64_t acked = deliver_pending_to_backend(); acked != 0) {
+      for (auto& [cfd, _] : carriers) {
+        queue_ack_to_carrier(cfd, acked);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = cfd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+      }
+    }
     flush_carrier_writes();
   }
 

@@ -2,8 +2,10 @@
 #include "reed_solomon.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <map>
 #include <random>
@@ -115,6 +117,7 @@ struct CarrierState {
   std::vector<uint8_t> write_buf;
   size_t write_pos = 0;
   bool connecting = true;
+  uint64_t last_rtt_ns = 0;  // last measured RTT for this link (from ACK)
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -204,6 +207,10 @@ int run_client(const Args& args) {
   bool stdin_eof = false;
   unsigned next_carrier = 0;
   const size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
+  auto now_ns = []() {
+    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  };
+  std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
 
   struct epoll_event ev{};
 
@@ -239,6 +246,7 @@ int run_client(const Args& args) {
     if (len == 0) return;
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
+    carrier_pending_acks[fd].emplace_back(next_send_id, now_ns());
     CarrierState& s = it->second;
     PacketHeader h{};
     h.id = next_send_id;
@@ -255,6 +263,7 @@ int run_client(const Args& args) {
   auto queue_rs_shard_to_carrier = [&](int fd, unsigned n, unsigned k, uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
+    carrier_pending_acks[fd].emplace_back(next_send_id, now_ns());
     CarrierState& s = it->second;
     PacketHeader h{};
     h.id = next_send_id;
@@ -323,6 +332,23 @@ int run_client(const Args& args) {
 
     while (s.read_buf.size() >= sizeof(PacketHeader)) {
       const auto* h = reinterpret_cast<const PacketHeader*>(s.read_buf.data());
+      if (h->packet_kind == PacketKind::ACK) {
+        uint64_t acked_id = h->id;
+        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+        auto it_p = carrier_pending_acks.find(fd);
+        if (it_p != carrier_pending_acks.end()) {
+          uint64_t rtt_ns = 0;
+          const uint64_t recv_time = now_ns();
+          auto& q = it_p->second;
+          while (!q.empty() && q.front().first <= acked_id) {
+            rtt_ns = recv_time - q.front().second;
+            q.pop_front();
+          }
+          if (rtt_ns != 0)
+            s.last_rtt_ns = rtt_ns;
+        }
+        continue;
+      }
       if (h->packet_kind == PacketKind::PONG) {
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
         continue;
@@ -430,6 +456,7 @@ int run_client(const Args& args) {
           }
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+          carrier_pending_acks.erase(fd);
           it = carriers.erase(it);
           goto next;
         }
@@ -553,12 +580,14 @@ int run_client(const Args& args) {
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
+            carrier_pending_acks.erase(fd);
           }
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
+          carrier_pending_acks.erase(fd);
         }
       }
     }
