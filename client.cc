@@ -1,4 +1,5 @@
 #include "ssholl.h"
+#include "reed_solomon.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -116,6 +117,14 @@ struct CarrierState {
   bool connecting = true;
 };
 
+// Per-id state when collecting Reed-Solomon shards.
+struct RsPending {
+  unsigned n = 0;
+  unsigned k = 0;
+  size_t block_size = 0;
+  std::map<unsigned, std::vector<uint8_t>> shards;
+};
+
 }  // namespace
 
 int run_client(const Args& args) {
@@ -187,6 +196,7 @@ int run_client(const Args& args) {
 
   std::map<int, CarrierState> carriers;
   std::map<uint64_t, std::vector<uint8_t>> reassembly;
+  std::map<uint64_t, RsPending> rs_pending;
   uint64_t next_deliver_id = 0;
   uint64_t next_send_id = 0;
   std::vector<uint8_t> stdin_buf;
@@ -239,6 +249,23 @@ int run_client(const Args& args) {
     s.write_buf.insert(s.write_buf.end(), data, data + len);
     if (!same_id)
       next_send_id++;
+  };
+
+  // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
+  auto queue_rs_shard_to_carrier = [&](int fd, unsigned n, unsigned k, uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    CarrierState& s = it->second;
+    PacketHeader h{};
+    h.id = next_send_id;
+    h.packet_kind = PacketKind::REED_SOLOMON;
+    uint16_t size = block_size;
+    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
+    s.write_buf.push_back(static_cast<uint8_t>(n));
+    s.write_buf.push_back(static_cast<uint8_t>(k));
+    s.write_buf.push_back(static_cast<uint8_t>(shard_index));
+    s.write_buf.insert(s.write_buf.end(), shard_data, shard_data + block_size);
   };
 
   auto flush_stdout = [&]() {
@@ -322,11 +349,64 @@ int run_client(const Args& args) {
         continue;
       }
       if (h->packet_kind == PacketKind::REED_SOLOMON) {
-        if (s.read_buf.size() < sizeof(PacketHeader) + sizeof(uint16_t)) break;
-        uint16_t rs_size = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
-        size_t total_rs = sizeof(PacketHeader) + sizeof(uint16_t) + 2 + rs_size;
-        if (rs_size > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
+        const size_t rs_fixed = sizeof(PacketHeader) + sizeof(uint16_t) + 3;  // +3 for n, k, shard_index
+        if (s.read_buf.size() < rs_fixed) break;
+        uint16_t block_sz = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
+        const auto* prs = reinterpret_cast<const PacketReedSolomon*>(s.read_buf.data());
+        size_t total_rs = rs_fixed + block_sz;
+        if (block_sz == 0 || block_sz > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
+        uint64_t id = h->id;
+        unsigned n = prs->n, k = prs->k;
+        if (id < next_deliver_id) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        if (n == 0 || k == 0 || k >= n || n > 256) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        RsPending& rp = rs_pending[id];
+        if (rp.k == 0) {
+          rp.n = n;
+          rp.k = k;
+          rp.block_size = block_sz;
+        }
+        if (rp.n != n || rp.k != k || rp.block_size != block_sz) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        unsigned idx = prs->shard_index;
+        if (idx >= n) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        if (!rp.shards.count(idx))
+          rp.shards[idx].assign(prs->data, prs->data + block_sz);
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+        if (rp.shards.size() >= k) {
+          std::vector<const uint8_t*> recv_ptrs(k);
+          std::vector<unsigned> recv_indices(k);
+          unsigned fi = 0;
+          for (auto& [shard_idx, vec] : rp.shards) {
+            if (fi >= k) break;
+            recv_ptrs[fi] = vec.data();
+            recv_indices[fi] = shard_idx;
+            fi++;
+          }
+          if (fi < k) continue;
+          std::vector<std::vector<uint8_t>> out_shards(k, std::vector<uint8_t>(rp.block_size));
+          std::vector<uint8_t*> out_ptrs(k);
+          for (unsigned i = 0; i < k; ++i) out_ptrs[i] = out_shards[i].data();
+          if (reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
+            if (!reassembly.count(id)) {
+              reassembly[id].clear();
+              for (unsigned i = 0; i < k; ++i)
+                reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
+            }
+          }
+          rs_pending.erase(id);
+          deliver_to_stdout();
+        }
         continue;
       }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
@@ -395,17 +475,49 @@ int run_client(const Args& args) {
           }
           stdin_buf.insert(stdin_buf.end(), buf, buf + nr);
         }
-        while (stdin_buf.size() >= max_packet) {
-          size_t chunk = max_packet;
-          if (carriers.empty()) break;
-          auto it = carriers.begin();
-          std::advance(it, next_carrier % carriers.size());
-          queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
-          stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
-          next_carrier++;
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = it->first;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+        while (stdin_buf.size() >= max_packet && !carriers.empty()) {
+          const size_t block_size = max_packet;
+          unsigned k = static_cast<unsigned>(std::min(stdin_buf.size() / block_size, static_cast<size_t>(255)));
+          if (k == 0) break;
+          unsigned m = std::max(1u, static_cast<unsigned>(k * args.config.rs_redundancy + 0.5f));
+          unsigned n = std::min(k + m, 255u);
+          m = n - k;
+          std::vector<const uint8_t*> data_ptrs(k);
+          for (unsigned i = 0; i < k; ++i)
+            data_ptrs[i] = stdin_buf.data() + i * block_size;
+          std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
+          std::vector<uint8_t*> parity_ptrs(m);
+          for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
+          reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
+          size_t num_shards = n;
+          for (size_t i = 0; i < num_shards; ++i) {
+            auto it = carriers.begin();
+            std::advance(it, (next_carrier + i) % carriers.size());
+            const uint8_t* shard = (i < k) ? (stdin_buf.data() + i * block_size) : parity[i - k].data();
+            queue_rs_shard_to_carrier(it->first, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = it->first;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+          }
+          next_send_id++;
+          next_carrier += num_shards;
+          stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
+        }
+        // Send any remainder smaller than one block as SMALL so we don't wait for EOF.
+        if (!stdin_buf.empty() && stdin_buf.size() < max_packet && !carriers.empty()) {
+          size_t chunk = stdin_buf.size();
+          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), args.config.small_packet_redundancy));
+          for (unsigned i = 0; i < n_copies; ++i) {
+            auto it = carriers.begin();
+            std::advance(it, (next_carrier + i) % carriers.size());
+            queue_to_carrier(it->first, stdin_buf.data(), chunk, n_copies > 1);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = it->first;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+          }
+          if (n_copies > 1) next_send_id++;
+          next_carrier += n_copies;
+          stdin_buf.clear();
         }
         // Flush immediately so data reaches kernel (and thus server) in this
         // iteration instead of after processing other events in the batch.
@@ -476,9 +588,9 @@ int run_client(const Args& args) {
     flush_carrier_writes();
     deliver_to_stdout();
 
-    if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty())
+    if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
       running = false;
-    if (carriers.empty() && reassembly.empty() && stdout_buf.empty())
+    if (carriers.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
       running = false;
   }
 

@@ -36,14 +36,15 @@ struct PacketSmall {
   uint8_t data[1];  // variable; actual length is `size`
 };
 
-// Reed–Solomon encoded block: n total shards, k data shards; payload is
-// encoded data. Layout: header + size (of following) + n, k + encoded bytes.
+// Reed–Solomon shard: one packet carries one shard (same id for whole block).
+// Layout: header + size (block_size) + n, k + shard_index + shard data.
 struct PacketReedSolomon {
   PacketHeader header;
-  uint16_t size;
+  uint16_t size;       // block_size (shard length in bytes)
   uint8_t n;
   uint8_t k;
-  uint8_t data[1];  // variable; encoded block
+  uint8_t shard_index; // which shard 0..n-1
+  uint8_t data[1];     // variable; exactly size bytes
 };
 
 // Client -> server: configure redundancy and transmission.

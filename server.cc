@@ -1,4 +1,5 @@
 #include "ssholl.h"
+#include "reed_solomon.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -102,6 +103,14 @@ struct CarrierState {
   size_t write_pos = 0;  // how much of write_buf we've sent
 };
 
+// Per-id state when collecting Reed-Solomon shards.
+struct RsPending {
+  unsigned n = 0;
+  unsigned k = 0;
+  size_t block_size = 0;
+  std::map<unsigned, std::vector<uint8_t>> shards;
+};
+
 // Check socket error (for connect completion).
 int get_so_error(int fd) {
   int err = 0;
@@ -164,10 +173,12 @@ int run_server(const Args& args) {
   bool backend_connected = false;
   std::map<int, CarrierState> carriers;
   std::map<uint64_t, std::vector<uint8_t>> reassembly;
+  std::map<uint64_t, RsPending> rs_pending;
   uint64_t next_deliver_id = 0;
   uint64_t next_send_id = 0;
   std::vector<uint8_t> backend_read_buf;
   const size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
+  unsigned next_carrier_for_rs = 0;
 
   auto connect_backend = [&]() {
     if (backend_fd >= 0) return;
@@ -186,7 +197,7 @@ int run_server(const Args& args) {
       backend_connected = true;
       int one = 1;
       setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-      ev.events = EPOLLIN;
+      ev.events = EPOLLIN | EPOLLOUT;
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     } else if (err != EINPROGRESS && err != 0) {
@@ -228,6 +239,22 @@ int run_server(const Args& args) {
     next_send_id++;
   };
 
+  auto queue_rs_shard_to_carrier = [&](int fd, unsigned n, unsigned k, uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    CarrierState& s = it->second;
+    PacketHeader h{};
+    h.id = next_send_id;
+    h.packet_kind = PacketKind::REED_SOLOMON;
+    uint16_t size = block_size;
+    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
+    s.write_buf.push_back(static_cast<uint8_t>(n));
+    s.write_buf.push_back(static_cast<uint8_t>(k));
+    s.write_buf.push_back(static_cast<uint8_t>(shard_index));
+    s.write_buf.insert(s.write_buf.end(), shard_data, shard_data + block_size);
+  };
+
   auto flush_carrier_writes = [&]() {
     for (auto it = carriers.begin(); it != carriers.end(); ) {
       int fd = it->first;
@@ -267,7 +294,12 @@ int run_server(const Args& args) {
       while (!vec.empty()) {
         ssize_t n = write(backend_fd, vec.data(), vec.size());
         if (n <= 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = backend_fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+            return;
+          }
           break;
         }
         vec.erase(vec.begin(), vec.begin() + n);
@@ -333,11 +365,65 @@ int run_server(const Args& args) {
         continue;
       }
       if (h->packet_kind == PacketKind::REED_SOLOMON) {
-        if (s.read_buf.size() < sizeof(PacketHeader) + sizeof(uint16_t)) break;
-        uint16_t rs_size = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
-        size_t total_rs = sizeof(PacketHeader) + sizeof(uint16_t) + 2 + rs_size;  // +2 for n,k
-        if (rs_size > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
+        const size_t rs_fixed = sizeof(PacketHeader) + sizeof(uint16_t) + 3;  // +3 for n, k, shard_index
+        if (s.read_buf.size() < rs_fixed) break;
+        uint16_t block_sz = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
+        const auto* prs = reinterpret_cast<const PacketReedSolomon*>(s.read_buf.data());
+        size_t total_rs = rs_fixed + block_sz;
+        if (block_sz == 0 || block_sz > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
+        uint64_t id = h->id;
+        unsigned n = prs->n, k = prs->k;
+        if (id < next_deliver_id) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        if (n == 0 || k == 0 || k >= n || n > 256) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        RsPending& rp = rs_pending[id];
+        if (rp.k == 0) {
+          rp.n = n;
+          rp.k = k;
+          rp.block_size = block_sz;
+        }
+        if (rp.n != n || rp.k != k || rp.block_size != block_sz) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        unsigned idx = prs->shard_index;
+        if (idx >= n) {
+          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+          continue;
+        }
+        if (!rp.shards.count(idx))
+          rp.shards[idx].assign(prs->data, prs->data + block_sz);
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
+        if (rp.shards.size() >= k) {
+          std::vector<const uint8_t*> recv_ptrs(k);
+          std::vector<unsigned> recv_indices(k);
+          unsigned fi = 0;
+          for (auto& [shard_idx, vec] : rp.shards) {
+            if (fi >= k) break;
+            recv_ptrs[fi] = vec.data();
+            recv_indices[fi] = shard_idx;
+            fi++;
+          }
+          if (fi < k) continue;
+          std::vector<std::vector<uint8_t>> out_shards(k, std::vector<uint8_t>(rp.block_size));
+          std::vector<uint8_t*> out_ptrs(k);
+          for (unsigned i = 0; i < k; ++i) out_ptrs[i] = out_shards[i].data();
+          if (reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
+            if (!reassembly.count(id)) {
+              reassembly[id].clear();
+              for (unsigned i = 0; i < k; ++i)
+                reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
+            }
+          }
+          rs_pending.erase(id);
+          connect_backend();
+          deliver_pending_to_backend();
+        }
         continue;
       }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
@@ -391,6 +477,9 @@ int run_server(const Args& args) {
           }
           backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
         }
+        if (e & EPOLLOUT) {
+          deliver_pending_to_backend();
+        }
         if (e & (EPOLLERR | EPOLLHUP)) {
           running = false;
           break;
@@ -416,10 +505,44 @@ int run_server(const Args& args) {
     }
 
     ensure_backend_connected();
-    if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty()) {
-      size_t chunk = std::min(backend_read_buf.size(), max_packet);
-      queue_data_to_carriers(backend_read_buf.data(), chunk);
-      backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+    if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
+      const size_t block_size = max_packet;
+      if (backend_read_buf.size() >= block_size) {
+        unsigned k = static_cast<unsigned>(std::min(backend_read_buf.size() / block_size, static_cast<size_t>(255)));
+        if (k >= 1) {
+          unsigned m = std::max(1u, static_cast<unsigned>(k * args.config.rs_redundancy + 0.5f));
+          unsigned n = std::min(k + m, 255u);
+          m = n - k;
+          std::vector<const uint8_t*> data_ptrs(k);
+          for (unsigned i = 0; i < k; ++i)
+            data_ptrs[i] = backend_read_buf.data() + i * block_size;
+          std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
+          std::vector<uint8_t*> parity_ptrs(m);
+          for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
+          reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
+          std::vector<int> carrier_fds;
+          for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
+          for (size_t i = 0; i < n; ++i) {
+            int fd = carrier_fds[(next_carrier_for_rs + i) % carrier_fds.size()];
+            const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
+            queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+          }
+          next_carrier_for_rs += n;
+          next_send_id++;
+          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
+        } else {
+          size_t chunk = std::min(backend_read_buf.size(), block_size);
+          queue_data_to_carriers(backend_read_buf.data(), chunk);
+          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+        }
+      } else {
+        size_t chunk = backend_read_buf.size();
+        queue_data_to_carriers(backend_read_buf.data(), chunk);
+        backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+      }
     }
     deliver_pending_to_backend();
     flush_carrier_writes();

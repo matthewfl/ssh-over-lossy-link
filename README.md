@@ -103,9 +103,10 @@ struct __attribute__((__packed__))  packet_small : packet_header {
 };
 
 struct __attribute__((__packed__)) packet_reed_solomon : packet_header {
-    uint16_t size;
-    uint8_t n, k; // Reed–Solomon: n = total symbols, k = data symbols
-    uint8_t data[]; // encoded data
+    uint16_t size;       // block_size (shard length in bytes)
+    uint8_t n, k;        // Reed–Solomon: n = total shards, k = data shards
+    uint8_t shard_index;  // which shard 0..n-1 (one packet = one shard)
+    uint8_t data[];      // shard payload, exactly size bytes
 };
 struct __attribute__((__packed__)) packet_config : packet_header {
     // client -> server: configure redundancy and transmission settings
