@@ -228,6 +228,8 @@ int run_client(const Args& args) {
   const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;         // 1s -> aggressive ramp
   const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;      // 80ms -> decrease redundancy
   const uint64_t backpressure_write_threshold = 150 * max_packet;  // total queued bytes
+  float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
+  unsigned last_sent_small_packet_redundancy = 0;
 
   struct epoll_event ev{};
 
@@ -274,6 +276,22 @@ int run_client(const Args& args) {
     s.write_buf.insert(s.write_buf.end(), data, data + len);
     if (!same_id)
       next_send_id++;
+  };
+
+  // Queue SET_CONFIG to one carrier (client -> server). Used by auto mode to sync server redundancy.
+  auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    CarrierState& s = it->second;
+    PacketConfig pc{};
+    pc.header.id = 0;
+    pc.header.packet_kind = PacketKind::SET_CONFIG;
+    pc.packet_size = pkt_size;
+    pc.small_packet_redundancy = small_red;
+    pc.max_delay_ms = max_delay_ms;
+    pc.reed_solomon_redundancy = rs_red;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&pc);
+    s.write_buf.insert(s.write_buf.end(), p, p + sizeof pc);
   };
 
   // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
@@ -674,6 +692,21 @@ int run_client(const Args& args) {
           effective_rs_redundancy = std::max(0.2f, effective_rs_redundancy - 0.05f);
           effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
         }
+      }
+
+      // When auto-adapt changes effective redundancy, push config to server so server→client uses same settings.
+      if (effective_rs_redundancy != last_sent_rs_redundancy || effective_small_packet_redundancy != last_sent_small_packet_redundancy) {
+        last_sent_rs_redundancy = effective_rs_redundancy;
+        last_sent_small_packet_redundancy = effective_small_packet_redundancy;
+        int fd = carriers.begin()->first;
+        queue_config_to_carrier(fd,
+                               static_cast<uint16_t>(args.config.packet_size),
+                               static_cast<uint16_t>(effective_small_packet_redundancy),
+                               args.config.max_delay_ms,
+                               effective_rs_redundancy);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
       }
 
       uint64_t add_interval = add_carrier_interval_ns;

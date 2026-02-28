@@ -177,7 +177,9 @@ int run_server(const Args& args) {
   uint64_t next_deliver_id = 0;
   uint64_t next_send_id = 0;
   std::vector<uint8_t> backend_read_buf;
-  const size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
+  size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
+  float runtime_rs_redundancy = args.config.rs_redundancy;
+  unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
   unsigned next_carrier_for_rs = 0;
 
   auto connect_backend = [&]() {
@@ -372,10 +374,15 @@ int run_server(const Args& args) {
         continue;
       }
       if (h->packet_kind == PacketKind::SET_CONFIG) {
-        if (s.read_buf.size() >= sizeof(PacketConfig))
-          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketConfig));
-        else
-          break;
+        if (s.read_buf.size() < sizeof(PacketConfig)) break;
+        const auto* pc = reinterpret_cast<const PacketConfig*>(s.read_buf.data());
+        max_packet = std::min(static_cast<size_t>(pc->packet_size), MAX_PACKET_PAYLOAD);
+        if (max_packet == 0) max_packet = 800;
+        runtime_small_packet_redundancy = pc->small_packet_redundancy;
+        if (runtime_small_packet_redundancy == 0) runtime_small_packet_redundancy = 1;
+        runtime_rs_redundancy = pc->reed_solomon_redundancy;
+        if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.2f;
+        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketConfig));
         continue;
       }
       if (h->packet_kind == PacketKind::START_CONNECTION) {
@@ -546,7 +553,7 @@ int run_server(const Args& args) {
       if (backend_read_buf.size() >= block_size) {
         unsigned k = static_cast<unsigned>(std::min(backend_read_buf.size() / block_size, static_cast<size_t>(255)));
         if (k >= 1) {
-          unsigned m = std::max(1u, static_cast<unsigned>(k * args.config.rs_redundancy + 0.5f));
+          unsigned m = std::max(1u, static_cast<unsigned>(k * runtime_rs_redundancy + 0.5f));
           unsigned n = std::min(k + m, 255u);
           m = n - k;
           std::vector<const uint8_t*> data_ptrs(k);
