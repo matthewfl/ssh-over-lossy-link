@@ -20,8 +20,6 @@ const struct option LONG_OPTS[] = {
   { "rs-redundancy",       required_argument, nullptr, 'R' },
   { "max-delay",            required_argument, nullptr, 'd' },
   { "server",               no_argument,       nullptr, 'S' },
-  { "carrier-cmd",         required_argument, nullptr, 'C' },
-  { "server-socket",       required_argument, nullptr, 'L' },
   { "help",                 no_argument,       nullptr, 'h' },
   { nullptr, 0, nullptr, 0 },
 };
@@ -73,15 +71,13 @@ void usage(const char* program_name) {
     << "  --rs-redundancy N             Extra Reed–Solomon packets as fraction. Default: 0.2\n"
     << "  --max-delay N                 Max delay (ms) waiting for buffer for RS. Default: 1\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
-    << "  --carrier-cmd CMD             Use CMD for each carrier (env: CARRIER_LOCAL, CARRIER_REMOTE). For testing.\n"
-    << "  --server-socket PATH          Use PATH as server socket; do not launch via ssh (use with --carrier-cmd).\n"
     << "  --help                        Show this help\n";
 }
 
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:SC:L:h", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:Sh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -113,12 +109,6 @@ bool parse_args(int argc, char* argv[], Args& out) {
           break;
         case 'S':
           out.server_mode = true;
-          break;
-        case 'C':
-          out.carrier_cmd = optarg;
-          break;
-        case 'L':
-          out.server_socket = optarg;
           break;
         case 'h':
           usage(argv[0]);
@@ -159,11 +149,6 @@ bool parse_args(int argc, char* argv[], Args& out) {
       out.remote_port = parse_port(argv[optind++]);
     if (optind < argc) {
       std::cerr << "ssh-oll: unexpected argument\n";
-      usage(argv[0]);
-      return false;
-    }
-    if (!out.server_socket.empty() && out.carrier_cmd.empty()) {
-      std::cerr << "ssh-oll: --server-socket requires --carrier-cmd\n";
       usage(argv[0]);
       return false;
     }
