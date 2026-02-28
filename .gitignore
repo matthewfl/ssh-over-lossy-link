@@ -2,3 +2,6 @@
 *.a
 test_reed_solomon
 ssh-oll
+proxy.log
+client_err.txt
+.test-proxy-socket

@@ -34,6 +34,7 @@ def parse_args():
     ap.add_argument("--drop-rate", type=float, default=0, help="Per-connection drop probability 0..1 (default 0)")
     ap.add_argument("--run-client", action="store_true", help="Spawn client, send random data, measure latency")
     ap.add_argument("--client-cmd", default=None, help="Command to run as client (default: ssh-oll with socat)")
+    ap.add_argument("--port", type=int, default=0, help="TCP port to listen on (default 0 = random)")
     return ap.parse_args()
 
 
@@ -106,10 +107,10 @@ def run_pair(
         pass
 
 
-def listen_tcp() -> tuple[socket.socket, int]:
+def listen_tcp(port: int = 0) -> tuple[socket.socket, int]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
+    sock.bind(("127.0.0.1", port))
     port = sock.getsockname()[1]
     sock.listen(8)
     return sock, port
@@ -139,7 +140,7 @@ def connect_to_server(server_socket_path: str, n: int) -> list[socket.socket]:
 def main() -> int:
     args = parse_args()
 
-    tcp_listen, tcp_port = listen_tcp()
+    tcp_listen, tcp_port = listen_tcp(args.port)
     unix_listen = listen_unix(args.unix_path)
 
     print(f"TCP port: {tcp_port}", file=sys.stderr)
@@ -173,14 +174,21 @@ def main() -> int:
         import subprocess
         cmd = args.client_cmd
         if cmd is None:
+            ssh_oll = os.environ.get("SSH_OLL", "ssh-oll")
             cmd = [
-                "ssh-oll",
+                ssh_oll,
                 "--carrier-cmd", "socat UNIX-LISTEN:$CARRIER_LOCAL,reuseaddr,fork UNIX-CONNECT:$CARRIER_REMOTE",
                 "--server-socket", args.unix_path,
                 "--connections", str(args.connections),
                 "localhost",
             ]
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                cwd=os.path.dirname(ssh_oll) or os.getcwd(),
+            )
         else:
             env = os.environ.copy()
             env["CARRIER_REMOTE"] = args.unix_path
@@ -188,7 +196,7 @@ def main() -> int:
 
     print(f"Waiting for {args.connections} client connection(s) on {args.unix_path} ...", file=sys.stderr)
     while len(client_conns) < args.connections:
-        unix_listen.settimeout(30.0)
+        unix_listen.settimeout(15.0)
         try:
             conn, _ = unix_listen.accept()
             client_conns.append(conn)
@@ -241,23 +249,29 @@ def main() -> int:
                 proc.stdin.write(header + payload)
                 proc.stdin.flush()
                 sent += 1
-                # Read back from TCP (server writes reassembled stream here)
+                # Read full chunk from TCP so we stay aligned (server writes reassembled stream)
                 data = b""
-                while len(data) < 8:
-                    got = server_tcp.recv(8 - len(data))
+                while len(data) < chunk_size:
+                    got = server_tcp.recv(chunk_size - len(data))
                     if not got:
                         break
                     data += got
                 if len(data) >= 8:
-                    ts_recv = struct.unpack("<Q", data[:8])[0]
-                    latencies.append((time.perf_counter_ns() - ts_recv) / 1e6)
+                    ts_sent_ns = struct.unpack("<Q", data[:8])[0]
+                    now_ns = time.perf_counter_ns()
+                    lat_ms = (now_ns - ts_sent_ns) / 1e6
+                    if 0 <= lat_ms <= 60000:
+                        latencies.append(lat_ms)
             proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
         for t in threads:
             t.join(timeout=1.0)
         if latencies:
-            print(f"One-way latency (ms): min={min(latencies):.2f} max={max(latencies):.2f} avg={sum(latencies)/len(latencies):.2f}")
+            n = len(latencies)
+            print(f"One-way latency (ms): min={min(latencies):.2f} max={max(latencies):.2f} avg={sum(latencies)/n:.2f} (n={n} valid)")
+        else:
+            print("One-way latency: no valid samples (stream may be reordered or delayed)")
         try:
             proc.terminate()
             proc.wait(timeout=2)
