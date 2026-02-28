@@ -94,6 +94,9 @@ void usage(const char* program_name);
 // Run server: Unix socket, epoll, forward carriers to TCP. Returns exit code.
 int run_server(const Args& args);
 
+// Run client: launch server, open N carriers, multiplex stdin/stdout. Returns exit code.
+int run_client(const Args& args);
+
 }  // namespace ssholl
 
 #endif /* SSH_OLL_SSHOLL_H */

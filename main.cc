@@ -163,20 +163,11 @@ bool parse_args(int argc, char* argv[], Args& out) {
 // Entry point: parse args, then run client or server.
 // -----------------------------------------------------------------------------
 
-static int run_client(const ssholl::Args& args) {
-  (void)args;
-  // TODO: connect to lossy host, spawn server, open carrier connections, multiplex stdin/stdout
-  std::cerr << "ssh-oll client (stub): host=" << args.lossy_ssh_host
-            << " remote=" << args.remote_hostname << ":" << args.remote_port
-            << " connections=" << args.config.connections << "\n";
-  return 0;
-}
-
 int main(int argc, char* argv[]) {
   ssholl::Args args;
   if (!ssholl::parse_args(argc, argv, args))
     return 1;
   if (args.server_mode)
     return ssholl::run_server(args);
-  return run_client(args);
+  return ssholl::run_client(args);
 }
