@@ -11,6 +11,9 @@ Test script for ssh-oll development.
 - Runs ssh-oll client with --unix-socket-connection <proxy> so the client talks via the proxy.
 - Measures latency: client stdin -> TCP (and TCP -> client stdout).
 
+  With --continuous: sends data continuously in both directions with varying payload sizes,
+  printing the latency (ms) of each packet. Run until --continuous-duration expires or Ctrl+C.
+
 Usage:
   ./test_ssh_oll.py [options]
 
@@ -158,6 +161,94 @@ def proxy_connection(client_conn, server_socket_path, delay_spec):
     server_conn.close()
 
 
+def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
+    """Run continuous bidirectional send with varying sizes, print latency per packet."""
+    stop_event = threading.Event()
+    min_size = max(args.continuous_min_size, 1)
+    max_size = max(args.continuous_max_size, min_size)
+    # Short timeout so recv() returns periodically and threads can check stop_event
+    tcp_conn.settimeout(1.0)
+
+    def client_to_tcp():
+        while not stop_event.is_set():
+            size = random.randint(min_size, max_size)
+            payload = os.urandom(size)
+            try:
+                t0 = time.perf_counter()
+                client_proc.stdin.write(payload)
+                client_proc.stdin.flush()
+                received = b""
+                while len(received) < len(payload) and not stop_event.is_set():
+                    try:
+                        chunk = tcp_conn.recv(len(payload) - len(received))
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    received += chunk
+                t1 = time.perf_counter()
+                if len(received) >= len(payload):
+                    print(f"client→TCP   size={size:5d}   latency_ms={1000.0 * (t1 - t0):.2f}")
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
+    def tcp_to_client():
+        while not stop_event.is_set():
+            size = random.randint(min_size, max_size)
+            payload = os.urandom(size)
+            try:
+                t0 = time.perf_counter()
+                tcp_conn.sendall(payload)
+                received = b""
+                while len(received) < len(payload) and not stop_event.is_set():
+                    chunk = client_proc.stdout.read(len(payload) - len(received))
+                    if not chunk:
+                        break
+                    received += chunk
+                t1 = time.perf_counter()
+                if len(received) >= len(payload):
+                    print(f"TCP→client   size={size:5d}   latency_ms={1000.0 * (t1 - t0):.2f}")
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
+    t1 = threading.Thread(target=client_to_tcp, daemon=True)
+    t2 = threading.Thread(target=tcp_to_client, daemon=True)
+    t1.start()
+    t2.start()
+
+    try:
+        if args.continuous_duration is not None:
+            time.sleep(args.continuous_duration)
+        else:
+            while True:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    stop_event.set()
+
+    t1.join(timeout=2.0)
+    t2.join(timeout=2.0)
+
+    try:
+        client_proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        client_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        client_proc.kill()
+
+    stop_proxy.set()
+    try:
+        tcp_conn.close()
+    except OSError:
+        pass
+    try:
+        tcp_listen.close()
+    except OSError:
+        pass
+
+
 def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event):
     """Accept on proxy_path, for each connection relay to server_socket_path with latency."""
     listen_sock = unix_listen(proxy_path)
@@ -252,6 +343,30 @@ def main():
         "--proxy-socket",
         default=None,
         help="Path for proxy Unix socket. Default: /tmp/ssh-oll-test-script.<random>",
+    )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Continuous mode: send data in both directions with varying sizes, print latency per packet. Stop with Ctrl+C or --continuous-duration.",
+    )
+    parser.add_argument(
+        "--continuous-duration",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="In --continuous mode, run for this many seconds then exit. Default: run until Ctrl+C.",
+    )
+    parser.add_argument(
+        "--continuous-min-size",
+        type=int,
+        default=64,
+        help="In --continuous mode, minimum payload size in bytes. Default 64",
+    )
+    parser.add_argument(
+        "--continuous-max-size",
+        type=int,
+        default=4096,
+        help="In --continuous mode, maximum payload size in bytes. Default 4096",
     )
     args = parser.parse_args()
 
@@ -370,6 +485,16 @@ def main():
     _got = b""
     while len(_got) < len(_warm):
         _got += client_proc.stdout.read(len(_warm) - len(_got))
+
+    if args.continuous:
+        _run_continuous(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+        )
+        return 0
 
     for _ in range(args.iterations):
         # Measurement 1: client stdin -> TCP (client sends, we read on TCP)
