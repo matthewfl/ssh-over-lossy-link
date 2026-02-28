@@ -117,9 +117,9 @@ struct CarrierState {
   std::vector<uint8_t> write_buf;
   size_t write_pos = 0;
   bool connecting = true;
-  uint64_t last_rtt_ns = 0;       // last measured RTT for this link (from ACK)
-  uint64_t last_activity_ns = 0;  // last time we received any data (for health timeout)
-  uint64_t last_ping_ns = 0;       // last time we sent a PING (for health check)
+  uint64_t last_rtt_ns = 0;        // last measured RTT for this link (from ACK)
+  uint64_t last_activity_ns = 0;  // last time we received any data (for stall detection)
+  uint64_t last_write_ns = 0;      // last time we successfully wrote to this carrier (for write-stall detection)
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -240,9 +240,9 @@ int run_client(const Args& args) {
   const uint64_t backpressure_write_threshold = 150 * max_packet;  // total queued bytes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
-  const uint64_t ping_interval_ns = 2 * 1000000000ULL;   // 2s between PINGs
-  const uint64_t carrier_timeout_ns = 5 * 1000000000ULL; // 5s without activity -> treat as dead
-  const uint64_t resend_trigger_ns = 2 * 1000000000ULL;  // 2s without activity + un-acked -> resend
+  const uint64_t carrier_timeout_ns = 5 * 1000000000ULL;   // no read/ACK for this long -> treat as dead
+  const uint64_t resend_trigger_ns = 2 * 1000000000ULL;     // no activity + un-acked for this long -> close and redistribute
+  const uint64_t write_stall_timeout_ns = 5 * 1000000000ULL;  // write_buf non-empty and no write progress -> dead
   const uint64_t extra_parity_interval_ns = 2 * 1000000000ULL;  // 2s between sending extra RS parity for stalled blocks
 
   struct epoll_event ev{};
@@ -261,7 +261,7 @@ int run_client(const Args& args) {
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
       carriers[fd].connecting = true;
       carriers[fd].last_activity_ns = initial_now;
-      carriers[fd].last_ping_ns = initial_now;
+      carriers[fd].last_write_ns = initial_now;
     } else
       close(fd);
   }
@@ -298,18 +298,6 @@ int run_client(const Args& args) {
       next_send_id++;
   };
 
-  // Queue PING to one carrier (client -> server). Server replies with PONG for health check.
-  auto queue_ping_to_carrier = [&](int fd) {
-    auto it = carriers.find(fd);
-    if (it == carriers.end()) return;
-    CarrierState& s = it->second;
-    PacketHeader h{};
-    h.id = 0;
-    h.packet_kind = PacketKind::PING;
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(&h);
-    s.write_buf.insert(s.write_buf.end(), p, p + sizeof h);
-  };
-
   // Queue SET_CONFIG to one carrier (client -> server). Used by auto mode to sync server redundancy.
   auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red) {
     auto it = carriers.find(fd);
@@ -326,7 +314,7 @@ int run_client(const Args& args) {
     s.write_buf.insert(s.write_buf.end(), p, p + sizeof pc);
   };
 
-  // Add one new carrier (Unix or SSH). Sets last_activity_ns/last_ping_ns so health check doesn't kill it. Returns true if added.
+  // Add one new carrier (Unix or SSH). Sets last_activity_ns/last_write_ns so health check doesn't kill it. Returns true if added.
   auto try_add_one_carrier = [&]() -> bool {
     if (carriers.size() >= max_connections) return false;
     const uint64_t now = now_ns();
@@ -338,7 +326,7 @@ int run_client(const Args& args) {
       if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) { close(fd); return false; }
       carriers[fd].connecting = true;
       carriers[fd].last_activity_ns = now;
-      carriers[fd].last_ping_ns = now;
+      carriers[fd].last_write_ns = now;
       return true;
     }
     if (!pending_carrier_paths.empty() || next_carrier_index >= max_connections) return false;
@@ -355,6 +343,36 @@ int run_client(const Args& args) {
     pending_carrier_paths.push_back(path);
     next_carrier_index++;
     return true;
+  };
+
+  // Close carrier fd and redistribute its un-acked packets to other carriers so data can still be delivered.
+  auto close_carrier_and_redistribute = [&](int fd) {
+    std::vector<int> other_fds;
+    for (const auto& [cfd, _] : carriers)
+      if (cfd != fd) other_fds.push_back(cfd);
+    auto it_su = sent_unacked.find(fd);
+    if (!other_fds.empty() && it_su != sent_unacked.end() && !it_su->second.empty()) {
+      const uint64_t t = now_ns();
+      for (size_t i = 0; i < it_su->second.size(); ++i) {
+        const std::vector<uint8_t>& pkt = it_su->second[i];
+        if (pkt.size() < sizeof(PacketHeader)) continue;
+        uint64_t id = reinterpret_cast<const PacketHeader*>(pkt.data())->id;
+        int fd2 = other_fds[i % other_fds.size()];
+        auto it_c = carriers.find(fd2);
+        if (it_c == carriers.end()) continue;
+        it_c->second.write_buf.insert(it_c->second.write_buf.end(), pkt.begin(), pkt.end());
+        sent_unacked[fd2].push_back(pkt);
+        carrier_pending_acks[fd2].emplace_back(id, t);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = fd2;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd2, &ev);
+      }
+    }
+    close(fd);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+    carriers.erase(fd);
+    carrier_pending_acks.erase(fd);
+    sent_unacked.erase(fd);
   };
 
   // Queue one Reed-Solomon shard to one carrier. Use id_for_shard for extra-parity (resend) or next_send_id for new blocks.
@@ -556,6 +574,7 @@ int run_client(const Args& args) {
   };
 
   auto flush_carrier_writes = [&]() {
+    const uint64_t now = now_ns();
     for (auto it = carriers.begin(); it != carriers.end(); ) {
       int fd = it->first;
       CarrierState& s = it->second;
@@ -569,15 +588,15 @@ int run_client(const Args& args) {
             epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
             break;
           }
-          close(fd);
-          epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-          carrier_pending_acks.erase(fd);
-          sent_unacked.erase(fd);
-          it = carriers.erase(it);
+          auto next_it = it;
+          ++next_it;
+          close_carrier_and_redistribute(fd);
+          it = next_it;
           try_add_one_carrier();
           goto next;
         }
         s.write_pos += n;
+        s.last_write_ns = now;
       }
       if (s.write_pos >= s.write_buf.size()) {
         s.write_buf.clear();
@@ -695,31 +714,19 @@ int run_client(const Args& args) {
           if (err == 0)
             it->second.connecting = false;
           else if (err != EINPROGRESS && err != 0) {
-            close(fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            carriers.erase(it);
-            carrier_pending_acks.erase(fd);
-            sent_unacked.erase(fd);
+            close_carrier_and_redistribute(fd);
             try_add_one_carrier();
             continue;
           }
         }
         if (e & EPOLLIN) {
           if (!process_carrier_read(fd, it->second)) {
-            close(fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            carriers.erase(it);
-            carrier_pending_acks.erase(fd);
-            sent_unacked.erase(fd);
+            close_carrier_and_redistribute(fd);
             try_add_one_carrier();
           }
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
-          close(fd);
-          epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-          carriers.erase(it);
-          carrier_pending_acks.erase(fd);
-          sent_unacked.erase(fd);
+          close_carrier_and_redistribute(fd);
           try_add_one_carrier();
         }
       }
@@ -762,53 +769,38 @@ int run_client(const Args& args) {
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
           carriers[fd].connecting = true;
           carriers[fd].last_activity_ns = loop_now;
-          carriers[fd].last_ping_ns = loop_now;
+          carriers[fd].last_write_ns = loop_now;
         } else
           close(fd);
       }
       it = pending_carrier_paths.erase(it);
     }
 
-    // Health check: PING periodically; close carriers with no activity within timeout and replace them
+    // Health check: close carriers that have stopped working (no read/ACK, or write not draining).
+    // No PING/PONG needed — we detect stall from lack of activity (ACKs/data) or write progress.
     std::vector<int> carriers_to_close;
     for (const auto& [cfd, st] : carriers) {
       if (st.connecting) continue;
       if (loop_now - st.last_activity_ns > carrier_timeout_ns)
         carriers_to_close.push_back(cfd);
-      else if (loop_now - st.last_ping_ns >= ping_interval_ns) {
-        queue_ping_to_carrier(cfd);
-        carriers[cfd].last_ping_ns = loop_now;
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+      else {
+        auto it_su = sent_unacked.find(cfd);
+        bool has_unacked = (it_su != sent_unacked.end() && !it_su->second.empty());
+        if (has_unacked && (loop_now - st.last_activity_ns > resend_trigger_ns))
+          carriers_to_close.push_back(cfd);  // no activity + un-acked: close and redistribute
+        else if (!st.write_buf.empty() && (loop_now - st.last_write_ns > write_stall_timeout_ns))
+          carriers_to_close.push_back(cfd);  // write buffer not draining
       }
     }
     for (int fd : carriers_to_close) {
-      close(fd);
-      epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-      carriers.erase(fd);
-      carrier_pending_acks.erase(fd);
-      sent_unacked.erase(fd);
+      if (carriers.count(fd) == 0) continue;  // already closed in this loop
+      close_carrier_and_redistribute(fd);
       try_add_one_carrier();
     }
 
-    // Resend un-acked data on carriers that have stalled (no activity but have un-acked packets)
+    // Extra Reed-Solomon parity for un-acked large blocks: send additional error-correction shards
+    // so the server can decode even if some original shards were lost or stalled.
     if (!carriers.empty()) {
-      for (auto& [cfd, st] : carriers) {
-        if (st.connecting) continue;
-        auto it_su = sent_unacked.find(cfd);
-        if (it_su == sent_unacked.end() || it_su->second.empty()) continue;
-        if (loop_now - st.last_activity_ns < resend_trigger_ns) continue;
-        if (!st.write_buf.empty()) continue;  // avoid unbounded growth when link is dead
-        for (std::vector<uint8_t>& pkt : it_su->second) {
-          st.write_buf.insert(st.write_buf.end(), pkt.begin(), pkt.end());
-        }
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-      }
-      // Extra Reed-Solomon parity for un-acked large blocks: send additional error-correction shards
-      // so the server can decode even if some original shards were lost or stalled.
       for (auto& [id, rbp] : rs_block_pending) {
         if (loop_now - rbp.last_extra_parity_ns < extra_parity_interval_ns) continue;
         if (rbp.data_shards.size() != rbp.k) continue;
