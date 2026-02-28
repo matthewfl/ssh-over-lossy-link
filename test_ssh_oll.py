@@ -161,6 +161,30 @@ def proxy_connection(client_conn, server_socket_path, delay_spec):
     server_conn.close()
 
 
+def _bucket_label(size, bucket_size=500):
+    """Return label like '0-500', '500-1000' for the given size."""
+    lo = (size // bucket_size) * bucket_size
+    hi = lo + bucket_size
+    return (lo, hi, f"{lo}-{hi}")
+
+
+def _print_size_bucket_summary(results, bucket_size=500):
+    """Print latency summary grouped by packet size buckets."""
+    if not results:
+        return
+    from collections import defaultdict
+    buckets = defaultdict(list)  # (lo, hi) -> [latency_ms, ...]
+    for size, lat in results:
+        lo, hi, _ = _bucket_label(size, bucket_size)
+        buckets[(lo, hi)].append(lat)
+    print("\nSummary by packet size (latency ms):")
+    for (lo, hi) in sorted(buckets.keys()):
+        label = f"{lo}-{hi}"
+        L = buckets[(lo, hi)]
+        avg = sum(L) / len(L)
+        print(f"  {label:>12} bytes: n={len(L):4d}  min={min(L):.2f}  max={max(L):.2f}  avg={avg:.2f}")
+
+
 def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     """Run continuous bidirectional send with varying sizes, print latency per packet."""
     stop_event = threading.Event()
@@ -168,6 +192,9 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     max_size = max(args.continuous_max_size, min_size)
     # Short timeout so recv() returns periodically and threads can check stop_event
     tcp_conn.settimeout(1.0)
+
+    results = []
+    results_lock = threading.Lock()
 
     def client_to_tcp():
         while not stop_event.is_set():
@@ -188,7 +215,10 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                     received += chunk
                 t1 = time.perf_counter()
                 if len(received) >= len(payload):
-                    print(f"client→TCP   size={size:5d}   latency_ms={1000.0 * (t1 - t0):.2f}")
+                    lat_ms = 1000.0 * (t1 - t0)
+                    with results_lock:
+                        results.append((size, lat_ms))
+                    print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
@@ -207,7 +237,10 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                     received += chunk
                 t1 = time.perf_counter()
                 if len(received) >= len(payload):
-                    print(f"TCP→client   size={size:5d}   latency_ms={1000.0 * (t1 - t0):.2f}")
+                    lat_ms = 1000.0 * (t1 - t0)
+                    with results_lock:
+                        results.append((size, lat_ms))
+                    print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
@@ -228,6 +261,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
     t1.join(timeout=2.0)
     t2.join(timeout=2.0)
+
+    _print_size_bucket_summary(results)
 
     try:
         client_proc.stdin.close()
