@@ -117,10 +117,6 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 
 ```
 
-## Testing on a lossy link
-
-You can simulate packet loss and delay using Linux `tc` (traffic control) and the `netem` qdisc. The script `test.sh` in the repo demonstrates one way to set up a lossy environment and run an ssh-oll connection through it. Run it from the project root; it will print the `tc` commands and optionally apply them (requires root for `tc`). See `./test.sh --help` for options.
-
 ## License
 
 MIT. See [LICENSE](LICENSE) in this repository.
