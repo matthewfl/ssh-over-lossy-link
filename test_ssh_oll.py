@@ -74,8 +74,10 @@ def _relay_reader(sock_from, queue, stop_event):
         queue.put((b"", None))  # EOF sentinel
 
 
-def _relay_sender(sock_to, q, delay_spec, stop_event):
-    """Pop chunks from queue, apply delay_spec, send to sock_to. Runs until EOF sentinel."""
+def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kill_callback=None):
+    """Pop chunks from queue, apply delay_spec, send to sock_to. Runs until EOF sentinel.
+    If death_probability > 0 and kill_callback is set, each chunk has that probability of killing the connection.
+    """
     try:
         while not stop_event.is_set():
             try:
@@ -84,6 +86,9 @@ def _relay_sender(sock_to, q, delay_spec, stop_event):
                 continue
             if not data:
                 break
+            if death_probability > 0 and kill_callback is not None and random.random() < death_probability:
+                kill_callback()
+                return
             delay = delay_spec() if callable(delay_spec) else delay_spec
             if delay > 0:
                 time.sleep(delay)
@@ -97,13 +102,18 @@ def _relay_sender(sock_to, q, delay_spec, stop_event):
             pass
 
 
-def _relay_zero_latency(sock_from, sock_to):
-    """Direct relay with no delay: read from sock_from, write to sock_to. Stops on EOF/error."""
+def _relay_zero_latency(sock_from, sock_to, death_probability=0.0, kill_callback=None):
+    """Direct relay with no delay: read from sock_from, write to sock_to. Stops on EOF/error.
+    If death_probability > 0 and kill_callback is set, each chunk has that probability of killing the connection.
+    """
     try:
         while True:
             data = sock_from.recv(65536)
             if not data:
                 break
+            if death_probability > 0 and kill_callback is not None and random.random() < death_probability:
+                kill_callback()
+                return
             sock_to.sendall(data)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
@@ -114,28 +124,35 @@ def _relay_zero_latency(sock_from, sock_to):
             pass
 
 
-def relay_with_latency(sock_from, sock_to, delay_spec):
+def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, kill_callback=None):
     """Read from sock_from, optionally delay, write to sock_to. Stops on EOF/error.
 
     When delay_spec is 0 (constant), uses a direct relay. Otherwise uses a queue and
     sender thread so we keep reading while delaying (avoids blocking the peer).
     delay_spec: float (constant seconds) or callable() -> float per chunk (randomize mode).
+    death_probability: per-chunk probability of killing the connection (0 = disabled).
+    kill_callback: called when connection is killed (should close both sockets).
     """
     # Zero latency: direct relay, no queue (fast path that matches original working behavior)
     if not callable(delay_spec) and delay_spec == 0:
-        _relay_zero_latency(sock_from, sock_to)
+        _relay_zero_latency(sock_from, sock_to, death_probability, kill_callback)
         return
     q = queue.Queue()
     stop = threading.Event()
     reader = threading.Thread(target=_relay_reader, args=(sock_from, q, stop), daemon=True)
-    sender = threading.Thread(target=_relay_sender, args=(sock_to, q, delay_spec, stop), daemon=True)
+    sender = threading.Thread(
+        target=_relay_sender,
+        args=(sock_to, q, delay_spec, stop),
+        kwargs={"death_probability": death_probability, "kill_callback": kill_callback},
+        daemon=True,
+    )
     reader.start()
     sender.start()
     reader.join()
     sender.join()
 
 
-def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None, initial_connection_latency_sec=0.0):
+def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
     """Connect to server socket and relay client_conn <-> server in both directions with optional latency."""
     try:
         server_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -147,15 +164,29 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
         return
     if initial_connection_latency_sec > 0:
         time.sleep(initial_connection_latency_sec)
+
+    def kill_connection():
+        try:
+            client_conn.close()
+        except OSError:
+            pass
+        try:
+            server_conn.close()
+        except OSError:
+            pass
+
+    relay_kw = {"death_probability": connection_death_probability, "kill_callback": kill_connection}
     try:
         t1 = threading.Thread(
             target=relay_with_latency,
             args=(client_conn, server_conn, delay_spec),
+            kwargs=relay_kw,
             daemon=True,
         )
         t2 = threading.Thread(
             target=relay_with_latency,
             args=(server_conn, client_conn, delay_spec),
+            kwargs=relay_kw,
             daemon=True,
         )
         t1.start()
@@ -295,12 +326,13 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         pass
 
 
-def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0):
+def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
     """Accept on proxy_path, for each connection relay to server_socket_path with latency.
 
     If connection_callback is not None, it is called with "opened" when a new connection
     is accepted and with "closed" when a connection ends (so the script can print connection events).
     initial_connection_latency_sec: delay before relaying any data on a new connection (e.g. to simulate SSH auth).
+    connection_death_probability: per-packet probability (0–1) that a connection is killed (stops relaying, simulates dead link).
     """
     listen_sock = unix_listen(proxy_path)
     listen_sock.settimeout(0.5)
@@ -315,7 +347,14 @@ def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, co
             on_close = (lambda: connection_callback("closed")) if connection_callback else None
             t = threading.Thread(
                 target=proxy_connection,
-                args=(conn, server_socket_path, delay_spec, on_close, initial_connection_latency_sec),
+                args=(
+                    conn,
+                    server_socket_path,
+                    delay_spec,
+                    on_close,
+                    initial_connection_latency_sec,
+                    connection_death_probability,
+                ),
                 daemon=True,
             )
             t.start()
@@ -404,6 +443,13 @@ def main():
         default=2.0,
         metavar="SECONDS",
         help="Delay in seconds before any data can be sent on a new carrier connection (simulates SSH auth; e.g. 2 for ~2s). Default 0",
+    )
+    parser.add_argument(
+        "--connection-death-probability",
+        type=float,
+        default=0.0,
+        metavar="P",
+        help="Per-packet probability (0–1) that a carrier connection is killed (stops relaying; simulates link dying before failure is detected). Default 0. E.g. 0.01 for 1%%",
     )
     parser.add_argument(
         "--continuous",
@@ -496,9 +542,18 @@ def main():
                 print(f"Connection closed (total {n})", flush=True)
 
     initial_latency_sec = max(0.0, args.initial_connection_latency)
+    death_prob = max(0.0, min(1.0, args.connection_death_probability))
     proxy_thread = threading.Thread(
         target=proxy_accept_loop,
-        args=(proxy_path, server_socket_path, delay_spec, stop_proxy, connection_callback, initial_latency_sec),
+        args=(
+            proxy_path,
+            server_socket_path,
+            delay_spec,
+            stop_proxy,
+            connection_callback,
+            initial_latency_sec,
+            death_prob,
+        ),
         daemon=True,
     )
     proxy_thread.start()
