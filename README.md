@@ -53,6 +53,8 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --rs-redundancy [N]           Number of extra packets when using Reed–Solomon, as a fraction.  Default 0.2
 --max-delay [N]               Max delay in ms for sending data while waiting for buffer to fill for Reed–Solomon.  Default 1ms
 --server                      Start the server instance of ssh-oll.  Default off (client mode).
+--carrier-cmd [CMD]           Use CMD for each carrier (env: CARRIER_LOCAL, CARRIER_REMOTE). For local testing without SSH.
+--server-socket [PATH]         Use PATH as server socket; do not launch server via SSH (requires --carrier-cmd).
 ```
 
 
@@ -117,9 +119,28 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 
 ```
 
-## Testing on a lossy link
+## Testing
 
-You can simulate packet loss and delay using Linux `tc` (traffic control) and the `netem` qdisc. The script `test.sh` in the repo demonstrates one way to set up a lossy environment and run an ssh-oll connection through it. Run it from the project root; it will print the `tc` commands and optionally apply them (requires root for `tc`). See `./test.sh --help` for options.
+### Local testing with the Python proxy (no SSH or tc)
+
+The script `test_latency_proxy.py` sits between the ssh-oll client and server. It does not parse packets: it forwards bytes between the client’s carrier connections and the server’s carrier connections, and can inject latency and drop connections. The server’s “backend” TCP connection goes to the script (so no real SSH/sshd). You can optionally have the script run the client and measure one-way latency.
+
+1. **Start the proxy**: run `./test_latency_proxy.py` (optionally `--latency-ms 50` or `--drop-rate 0.1`). It prints a TCP port and a Unix path (e.g. `/tmp/ssh-oll-test-script`). When prompted, paste the server socket path (you’ll get it in step 2).
+
+2. **Start the server** (in another terminal): run `./ssh-oll --server 127.0.0.1 <TCP port from step 1>`. The server connects to the proxy as its backend and prints its Unix socket path (e.g. `/tmp/ssh-oll-server.abc123def`). Paste that path into the proxy’s prompt if you didn’t use `--server-socket`.
+
+3. **Start the client** (or use `--run-client`): either run the client yourself so its carriers connect to the proxy’s Unix path:
+   ```bash
+   ./ssh-oll --carrier-cmd 'socat UNIX-LISTEN:$CARRIER_LOCAL,reuseaddr,fork UNIX-CONNECT:$CARRIER_REMOTE' \
+     --server-socket /tmp/ssh-oll-test-script --connections 4 localhost
+   ```
+   or run the proxy with `--run-client` so it spawns the client, sends timestamped random data, and reports one-way latency over the TCP connection.
+
+**Proxy options:** `--server-socket PATH` (or prompt), `--unix-path`, `--connections`, `--latency-ms`, `--drop-rate`, `--run-client`.
+
+### Lossy link with tc
+
+You can simulate packet loss and delay using Linux `tc` and the `netem` qdisc. The script `test.sh` demonstrates one way to set up a lossy environment. See `./test.sh --help` for options.
 
 ## License
 

@@ -79,9 +79,11 @@ struct Config {
 struct Args {
   Config config;
   bool server_mode = false;
-  std::string lossy_ssh_host;   // required in client mode
+  std::string lossy_ssh_host;   // required in client mode (use e.g. "localhost" when --server-socket)
   std::string remote_hostname = "localhost";
   uint16_t remote_port = 22;
+  std::string carrier_cmd;      // if set, run this instead of ssh for each carrier; env CARRIER_LOCAL, CARRIER_REMOTE
+  std::string server_socket;    // if set (with carrier_cmd), use this path instead of launching server via ssh
 };
 
 // Parse argc/argv into Args. Returns true on success; otherwise prints usage

@@ -1,6 +1,7 @@
 #include "ssholl.h"
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -119,10 +120,15 @@ struct CarrierState {
 }  // namespace
 
 int run_client(const Args& args) {
-  std::string socket_path = launch_server(args);
-  if (socket_path.empty()) {
-    std::fprintf(stderr, "ssh-oll: failed to launch server on %s\n", args.lossy_ssh_host.c_str());
-    return 1;
+  std::string socket_path;
+  if (!args.server_socket.empty()) {
+    socket_path = args.server_socket;
+  } else {
+    socket_path = launch_server(args);
+    if (socket_path.empty()) {
+      std::fprintf(stderr, "ssh-oll: failed to launch server on %s\n", args.lossy_ssh_host.c_str());
+      return 1;
+    }
   }
 
   std::string client_dir = make_client_dir();
@@ -132,25 +138,45 @@ int run_client(const Args& args) {
   }
 
   const unsigned N = args.config.connections;
-  std::vector<pid_t> ssh_pids;
-  ssh_pids.reserve(N);
+  std::vector<pid_t> carrier_pids;
+  carrier_pids.reserve(N);
 
-  for (unsigned i = 0; i < N; ++i) {
-    std::string local_path = client_dir + "/" + std::to_string(i);
-    pid_t pid = fork();
-    if (pid < 0) {
-      std::perror("ssh-oll: fork");
-      for (pid_t p : ssh_pids) kill(p, SIGTERM);
-      rmdir(client_dir.c_str());
-      return 1;
+  if (!args.carrier_cmd.empty()) {
+    for (unsigned i = 0; i < N; ++i) {
+      std::string local_path = client_dir + "/" + std::to_string(i);
+      pid_t pid = fork();
+      if (pid < 0) {
+        std::perror("ssh-oll: fork");
+        for (pid_t p : carrier_pids) kill(p, SIGTERM);
+        rmdir(client_dir.c_str());
+        return 1;
+      }
+      if (pid == 0) {
+        setenv("CARRIER_LOCAL", local_path.c_str(), 1);
+        setenv("CARRIER_REMOTE", socket_path.c_str(), 1);
+        execl("/bin/sh", "sh", "-c", args.carrier_cmd.c_str(), nullptr);
+        _exit(127);
+      }
+      carrier_pids.push_back(pid);
     }
-    if (pid == 0) {
-      std::string spec = local_path + ":" + socket_path;
-      const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
-      execvp("ssh", const_cast<char* const*>(argv));
-      _exit(127);
+  } else {
+    for (unsigned i = 0; i < N; ++i) {
+      std::string local_path = client_dir + "/" + std::to_string(i);
+      pid_t pid = fork();
+      if (pid < 0) {
+        std::perror("ssh-oll: fork");
+        for (pid_t p : carrier_pids) kill(p, SIGTERM);
+        rmdir(client_dir.c_str());
+        return 1;
+      }
+      if (pid == 0) {
+        std::string spec = local_path + ":" + socket_path;
+        const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+        execvp("ssh", const_cast<char* const*>(argv));
+        _exit(127);
+      }
+      carrier_pids.push_back(pid);
     }
-    ssh_pids.push_back(pid);
   }
 
   // Wait for SSH to create sockets and accept connections.
@@ -167,7 +193,7 @@ int run_client(const Args& args) {
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
     std::perror("ssh-oll: epoll_create1");
-    for (pid_t p : ssh_pids) kill(p, SIGTERM);
+    for (pid_t p : carrier_pids) kill(p, SIGTERM);
     rmdir(client_dir.c_str());
     return 1;
   }
@@ -206,7 +232,7 @@ int run_client(const Args& args) {
   if (carriers.empty()) {
     std::fprintf(stderr, "ssh-oll: could not connect any carrier to server\n");
     close(epfd);
-    for (pid_t p : ssh_pids) kill(p, SIGTERM);
+    for (pid_t p : carrier_pids) kill(p, SIGTERM);
     rmdir(client_dir.c_str());
     return 1;
   }
@@ -452,7 +478,7 @@ int run_client(const Args& args) {
   for (auto& [fd, _] : carriers)
     close(fd);
   close(epfd);
-  for (pid_t p : ssh_pids)
+  for (pid_t p : carrier_pids)
     kill(p, SIGTERM);
   for (unsigned i = 0; i < N; ++i)
     unlink((client_dir + "/" + std::to_string(i)).c_str());
