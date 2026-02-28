@@ -1,0 +1,96 @@
+#ifndef SSH_OLL_SSHOLL_H
+#define SSH_OLL_SSHOLL_H
+
+#include <cstdint>
+#include <string>
+
+namespace ssholl {
+
+// -----------------------------------------------------------------------------
+// Wire protocol: packet kinds and packet layouts (must match README).
+// All multi-byte fields are stored in natural byte order (implementation
+// can swap for wire if needed). Structs are packed for wire representation.
+// -----------------------------------------------------------------------------
+
+enum class PacketKind : uint8_t {
+  PING = 0,               // client -> server; server replies with PONG
+  PONG = 1,               // server -> client; response to PING
+  SMALL = 2,
+  REED_SOLOMON = 3,
+  SET_CONFIG = 4,         // client -> server: adjust redundancy / packet size
+  START_CONNECTION = 5,   // new carrier joins; associate carrier with stream
+};
+
+#pragma pack(push, 1)
+
+struct PacketHeader {
+  uint64_t id;
+  PacketKind packet_kind;
+};
+
+// Small packet: header + size + payload. Payload length is `size` bytes and
+// follows immediately after this struct in the buffer.
+struct PacketSmall {
+  PacketHeader header;
+  uint16_t size;
+  uint8_t data[1];  // variable; actual length is `size`
+};
+
+// Reed–Solomon encoded block: n total shards, k data shards; payload is
+// encoded data. Layout: header + size (of following) + n, k + encoded bytes.
+struct PacketReedSolomon {
+  PacketHeader header;
+  uint16_t size;
+  uint8_t n;
+  uint8_t k;
+  uint8_t data[1];  // variable; encoded block
+};
+
+// Client -> server: configure redundancy and transmission.
+struct PacketConfig {
+  PacketHeader header;
+  uint16_t packet_size;
+  uint16_t small_packet_redundancy;
+  float max_delay_ms;
+  float reed_solomon_redundancy;
+};
+
+#pragma pack(pop)
+
+// -----------------------------------------------------------------------------
+// Runtime configuration (from CLI and PACKET_SET_CONFIG).
+// -----------------------------------------------------------------------------
+
+struct Config {
+  bool auto_adapt = true;
+  std::string path_on_server = "ssh-oll";
+  unsigned connections = 10;
+  unsigned max_connections = 200;
+  unsigned packet_size = 800;
+  unsigned small_packet_redundancy = 2;
+  float rs_redundancy = 0.2f;
+  float max_delay_ms = 1.0f;
+};
+
+// -----------------------------------------------------------------------------
+// Parsed command-line arguments.
+// -----------------------------------------------------------------------------
+
+struct Args {
+  Config config;
+  bool server_mode = false;
+  std::string lossy_ssh_host;   // required in client mode
+  std::string remote_hostname = "localhost";
+  uint16_t remote_port = 22;
+};
+
+// Parse argc/argv into Args. Returns true on success; otherwise prints usage
+// to stderr and returns false.
+bool parse_args(int argc, char* argv[], Args& out);
+
+// Print usage to stderr.
+void usage(const char* program_name);
+
+}  // namespace ssholl
+
+#endif /* SSH_OLL_SSHOLL_H */

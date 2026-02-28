@@ -10,7 +10,7 @@ LIBREED_SOLOMON = libreed_solomon.a
 
 .PHONY: all clean install
 
-all: $(LIBREED_SOLOMON) test_reed_solomon
+all: $(LIBREED_SOLOMON) test_reed_solomon ssh-oll
 
 $(LIBREED_SOLOMON): $(REED_SOLOMON_OBJ)
 	$(AR) rcs $@ $^
@@ -21,9 +21,13 @@ reed_solomon.o: reed_solomon.cc reed_solomon.h
 test_reed_solomon: test_reed_solomon.cc $(LIBREED_SOLOMON)
 	$(CXX) $(CXXFLAGS) -o $@ test_reed_solomon.cc $(LIBREED_SOLOMON) $(LDFLAGS_STATIC)
 
+ssh-oll: main.cc ssholl.h
+	$(CXX) $(CXXFLAGS) -o $@ main.cc $(LDFLAGS_STATIC)
+
 clean:
-	rm -f $(REED_SOLOMON_OBJ) $(LIBREED_SOLOMON) test_reed_solomon
+	rm -f $(REED_SOLOMON_OBJ) $(LIBREED_SOLOMON) test_reed_solomon ssh-oll
 
 install: all
-	# Future: install ssh-oll binary and optionally libreed_solomon.a / headers
-	@echo "Install target TBD when ssh-oll binary is added."
+	install -d $(DESTDIR)/usr/local/bin
+	install -m 755 ssh-oll $(DESTDIR)/usr/local/bin
+	@echo "Installed ssh-oll to $(DESTDIR)/usr/local/bin"
