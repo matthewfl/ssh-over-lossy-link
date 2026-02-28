@@ -183,6 +183,9 @@ int run_client(const Args& args) {
   }
 
   const unsigned N = args.config.connections;
+  const unsigned max_connections = args.config.max_connections;
+  unsigned next_carrier_index = N;  // next socket index when adding carriers (SSH mode)
+  std::vector<std::string> pending_carrier_paths;  // SSH mode: paths we're waiting to connect to
 
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
@@ -211,6 +214,20 @@ int run_client(const Args& args) {
     return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
   };
   std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
+
+  // Auto-adapt state: effective redundancy and RTT sampling
+  float effective_rs_redundancy = args.config.auto_adapt ? std::max(args.config.rs_redundancy, 0.6f) : args.config.rs_redundancy;
+  unsigned effective_small_packet_redundancy = args.config.auto_adapt ? std::max(args.config.small_packet_redundancy, 6u) : args.config.small_packet_redundancy;
+  std::deque<uint64_t> recent_rtt_ns;
+  const size_t max_recent_rtt = 100;
+  const uint64_t adapt_interval_ns = 300 * 1000000ULL;   // 300ms
+  const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
+  uint64_t last_adapt_ns = 0;
+  uint64_t last_add_carrier_ns = 0;
+  const uint64_t high_rtt_threshold_ns = 200 * 1000000ULL;   // 200ms -> increase redundancy / add carriers
+  const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;         // 1s -> aggressive ramp
+  const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;      // 80ms -> decrease redundancy
+  const uint64_t backpressure_write_threshold = 150 * max_packet;  // total queued bytes
 
   struct epoll_event ev{};
 
@@ -344,8 +361,13 @@ int run_client(const Args& args) {
             rtt_ns = recv_time - q.front().second;
             q.pop_front();
           }
-          if (rtt_ns != 0)
+          if (rtt_ns != 0) {
             s.last_rtt_ns = rtt_ns;
+            if (args.config.auto_adapt) {
+              recent_rtt_ns.push_back(rtt_ns);
+              while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
+            }
+          }
         }
         continue;
       }
@@ -506,7 +528,8 @@ int run_client(const Args& args) {
           const size_t block_size = max_packet;
           unsigned k = static_cast<unsigned>(std::min(stdin_buf.size() / block_size, static_cast<size_t>(255)));
           if (k == 0) break;
-          unsigned m = std::max(1u, static_cast<unsigned>(k * args.config.rs_redundancy + 0.5f));
+          float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
+          unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
           unsigned n = std::min(k + m, 255u);
           m = n - k;
           std::vector<const uint8_t*> data_ptrs(k);
@@ -533,7 +556,8 @@ int run_client(const Args& args) {
         // Send any remainder smaller than one block as SMALL so we don't wait for EOF.
         if (!stdin_buf.empty() && stdin_buf.size() < max_packet && !carriers.empty()) {
           size_t chunk = stdin_buf.size();
-          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), args.config.small_packet_redundancy));
+          unsigned small_red = args.config.auto_adapt ? effective_small_packet_redundancy : args.config.small_packet_redundancy;
+          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), small_red));
           for (unsigned i = 0; i < n_copies; ++i) {
             auto it = carriers.begin();
             std::advance(it, (next_carrier + i) % carriers.size());
@@ -596,8 +620,9 @@ int run_client(const Args& args) {
       while (!stdin_buf.empty()) {
         size_t chunk = std::min(stdin_buf.size(), max_packet);
         const bool small_packet = (chunk < max_packet);
+        unsigned small_red = args.config.auto_adapt ? effective_small_packet_redundancy : args.config.small_packet_redundancy;
         const unsigned n_copies = small_packet
-            ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), args.config.small_packet_redundancy))
+            ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), small_red))
             : 1u;
         for (unsigned i = 0; i < n_copies; ++i) {
           auto it = carriers.begin();
@@ -617,6 +642,90 @@ int run_client(const Args& args) {
     flush_carrier_writes();
     deliver_to_stdout();
 
+    // Try to complete pending SSH carrier connections
+    for (auto it = pending_carrier_paths.begin(); it != pending_carrier_paths.end(); ) {
+      if (access(it->c_str(), F_OK) != 0) { ++it; continue; }
+      int fd = connect_unix(*it);
+      if (fd >= 0) {
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+          carriers[fd].connecting = true;
+        else
+          close(fd);
+      }
+      it = pending_carrier_paths.erase(it);
+    }
+
+    // Auto-adapt: adjust redundancy from recent RTT and add carriers when needed
+    if (args.config.auto_adapt && !carriers.empty()) {
+      const uint64_t now = now_ns();
+
+      if (now - last_adapt_ns >= adapt_interval_ns && !recent_rtt_ns.empty()) {
+        last_adapt_ns = now;
+        uint64_t max_rtt = 0;
+        for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
+        if (max_rtt > high_rtt_threshold_ns) {
+          float inc = (max_rtt > very_high_rtt_ns) ? 0.25f : 0.15f;
+          effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + inc);
+          unsigned inc_small = (max_rtt > very_high_rtt_ns) ? 3u : 2u;
+          effective_small_packet_redundancy = std::min(20u, effective_small_packet_redundancy + inc_small);
+        } else if (max_rtt < low_rtt_threshold_ns) {
+          effective_rs_redundancy = std::max(0.2f, effective_rs_redundancy - 0.05f);
+          effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
+        }
+      }
+
+      uint64_t add_interval = add_carrier_interval_ns;
+      if (!recent_rtt_ns.empty()) {
+        uint64_t max_rtt_check = 0;
+        for (uint64_t r : recent_rtt_ns) if (r > max_rtt_check) max_rtt_check = r;
+        if (max_rtt_check > very_high_rtt_ns) add_interval = 50 * 1000000ULL;  // 50ms when RTT very high
+      }
+      if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
+        size_t total_write = 0;
+        uint64_t max_carrier_rtt = 0;
+        for (const auto& [cfd, st] : carriers) {
+          (void)cfd;
+          total_write += st.write_buf.size();
+          if (st.last_rtt_ns > max_carrier_rtt) max_carrier_rtt = st.last_rtt_ns;
+        }
+        uint64_t max_rtt = max_carrier_rtt;
+        if (!recent_rtt_ns.empty()) {
+          for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
+        }
+        bool need_more = (total_write > backpressure_write_threshold) || (max_rtt > high_rtt_threshold_ns);
+        if (need_more) {
+          last_add_carrier_ns = now;
+          if (!args.unix_socket_connection.empty()) {
+            int fd = connect_unix(socket_path);
+            if (fd >= 0) {
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = fd;
+              if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+                carriers[fd].connecting = true;
+              else
+                close(fd);
+            }
+          } else if (pending_carrier_paths.empty() && next_carrier_index < max_connections) {
+            std::string path = client_dir + "/" + std::to_string(next_carrier_index);
+            pid_t pid = fork();
+            if (pid == 0) {
+              std::string spec = path + ":" + socket_path;
+              const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+              execvp("ssh", const_cast<char* const*>(argv));
+              _exit(127);
+            }
+            if (pid > 0) {
+              ssh_pids.push_back(pid);
+              pending_carrier_paths.push_back(path);
+              next_carrier_index++;
+            }
+          }
+        }
+      }
+    }
+
     if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
       running = false;
     if (carriers.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
@@ -631,7 +740,7 @@ int run_client(const Args& args) {
   } else {
     for (pid_t p : ssh_pids)
       kill(p, SIGTERM);
-    for (unsigned i = 0; i < N; ++i)
+    for (unsigned i = 0; i < next_carrier_index; ++i)
       unlink((client_dir + "/" + std::to_string(i)).c_str());
     rmdir(client_dir.c_str());
   }
