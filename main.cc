@@ -172,19 +172,11 @@ static int run_client(const ssholl::Args& args) {
   return 0;
 }
 
-static int run_server(const ssholl::Args& args) {
-  (void)args;
-  // TODO: create Unix socket, accept carriers, connect to args.remote_hostname:args.remote_port, reassemble stream
-  std::cerr << "ssh-oll server (stub): connect to " << args.remote_hostname
-            << ":" << args.remote_port << "\n";
-  return 0;
-}
-
 int main(int argc, char* argv[]) {
   ssholl::Args args;
   if (!ssholl::parse_args(argc, argv, args))
     return 1;
   if (args.server_mode)
-    return run_server(args);
+    return ssholl::run_server(args);
   return run_client(args);
 }

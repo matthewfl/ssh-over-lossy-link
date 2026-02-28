@@ -91,6 +91,9 @@ bool parse_args(int argc, char* argv[], Args& out);
 // Print usage to stderr.
 void usage(const char* program_name);
 
+// Run server: Unix socket, epoll, forward carriers to TCP. Returns exit code.
+int run_server(const Args& args);
+
 }  // namespace ssholl
 
 #endif /* SSH_OLL_SSHOLL_H */

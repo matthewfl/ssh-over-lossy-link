@@ -21,11 +21,17 @@ reed_solomon.o: reed_solomon.cc reed_solomon.h
 test_reed_solomon: test_reed_solomon.cc $(LIBREED_SOLOMON)
 	$(CXX) $(CXXFLAGS) -o $@ test_reed_solomon.cc $(LIBREED_SOLOMON) $(LDFLAGS_STATIC)
 
-ssh-oll: main.cc ssholl.h
-	$(CXX) $(CXXFLAGS) -o $@ main.cc $(LDFLAGS_STATIC)
+ssh-oll: main.o server.o ssholl.h
+	$(CXX) $(CXXFLAGS) -o $@ main.o server.o $(LDFLAGS_STATIC)
+
+main.o: main.cc ssholl.h
+	$(CXX) $(CXXFLAGS) -c -o $@ main.cc
+
+server.o: server.cc ssholl.h
+	$(CXX) $(CXXFLAGS) -c -o $@ server.cc
 
 clean:
-	rm -f $(REED_SOLOMON_OBJ) $(LIBREED_SOLOMON) test_reed_solomon ssh-oll
+	rm -f $(REED_SOLOMON_OBJ) $(LIBREED_SOLOMON) test_reed_solomon ssh-oll main.o server.o
 
 install: all
 	install -d $(DESTDIR)/usr/local/bin
