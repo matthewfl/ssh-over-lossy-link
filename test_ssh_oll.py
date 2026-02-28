@@ -135,30 +135,41 @@ def relay_with_latency(sock_from, sock_to, delay_spec):
     sender.join()
 
 
-def proxy_connection(client_conn, server_socket_path, delay_spec):
+def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None, initial_connection_latency_sec=0.0):
     """Connect to server socket and relay client_conn <-> server in both directions with optional latency."""
     try:
         server_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_conn.connect(server_socket_path)
     except Exception:
         client_conn.close()
+        if on_close:
+            on_close()
         return
-    t1 = threading.Thread(
-        target=relay_with_latency,
-        args=(client_conn, server_conn, delay_spec),
-        daemon=True,
-    )
-    t2 = threading.Thread(
-        target=relay_with_latency,
-        args=(server_conn, client_conn, delay_spec),
-        daemon=True,
-    )
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
-    client_conn.close()
-    server_conn.close()
+    if initial_connection_latency_sec > 0:
+        time.sleep(initial_connection_latency_sec)
+    try:
+        t1 = threading.Thread(
+            target=relay_with_latency,
+            args=(client_conn, server_conn, delay_spec),
+            daemon=True,
+        )
+        t2 = threading.Thread(
+            target=relay_with_latency,
+            args=(server_conn, client_conn, delay_spec),
+            daemon=True,
+        )
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    finally:
+        try:
+            client_conn.close()
+            server_conn.close()
+        except OSError:
+            pass
+        if on_close:
+            on_close()
 
 
 def _bucket_label(size, bucket_size=500):
@@ -284,8 +295,13 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         pass
 
 
-def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event):
-    """Accept on proxy_path, for each connection relay to server_socket_path with latency."""
+def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0):
+    """Accept on proxy_path, for each connection relay to server_socket_path with latency.
+
+    If connection_callback is not None, it is called with "opened" when a new connection
+    is accepted and with "closed" when a connection ends (so the script can print connection events).
+    initial_connection_latency_sec: delay before relaying any data on a new connection (e.g. to simulate SSH auth).
+    """
     listen_sock = unix_listen(proxy_path)
     listen_sock.settimeout(0.5)
     try:
@@ -294,9 +310,12 @@ def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event):
                 conn, _ = listen_sock.accept()
             except socket.timeout:
                 continue
+            if connection_callback:
+                connection_callback("opened")
+            on_close = (lambda: connection_callback("closed")) if connection_callback else None
             t = threading.Thread(
                 target=proxy_connection,
-                args=(conn, server_socket_path, delay_spec),
+                args=(conn, server_socket_path, delay_spec, on_close, initial_connection_latency_sec),
                 daemon=True,
             )
             t.start()
@@ -380,6 +399,13 @@ def main():
         help="Path for proxy Unix socket. Default: /tmp/ssh-oll-test-script.<random>",
     )
     parser.add_argument(
+        "--initial-connection-latency",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="Delay in seconds before any data can be sent on a new carrier connection (simulates SSH auth; e.g. 2 for ~2s). Default 0",
+    )
+    parser.add_argument(
         "--continuous",
         action="store_true",
         help="Continuous mode: send data in both directions with varying sizes, print latency per packet. Stop with Ctrl+C or --continuous-duration.",
@@ -452,9 +478,27 @@ def main():
 
     # 3. Start proxy (client -> proxy -> server) with optional latency
     stop_proxy = threading.Event()
+    connection_callback = None
+    if args.continuous:
+        connection_count = [0]
+        connection_lock = threading.Lock()
+
+        def connection_callback(event):
+            with connection_lock:
+                if event == "opened":
+                    connection_count[0] += 1
+                else:
+                    connection_count[0] -= 1
+                n = connection_count[0]
+            if event == "opened":
+                print(f"Connection opened (total {n})", flush=True)
+            else:
+                print(f"Connection closed (total {n})", flush=True)
+
+    initial_latency_sec = max(0.0, args.initial_connection_latency)
     proxy_thread = threading.Thread(
         target=proxy_accept_loop,
-        args=(proxy_path, server_socket_path, delay_spec, stop_proxy),
+        args=(proxy_path, server_socket_path, delay_spec, stop_proxy, connection_callback, initial_latency_sec),
         daemon=True,
     )
     proxy_thread.start()
