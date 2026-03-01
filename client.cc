@@ -218,7 +218,12 @@ int run_client(const Args& args) {
   const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
-  const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;  // used for per-carrier outlier detection
+  // Only reap a carrier via RTT-outlier if its RTT is both much worse than its peers (5×
+  // median) AND absolutely very slow (5 s).  A 3×/1 s threshold is too aggressive: with
+  // natural link latency variance (e.g., 100–2000 ms random) the slowest carrier always
+  // looks like an outlier even when it is healthy, causing unnecessary churn that drops
+  // in-flight RS shards and creates multi-second stalls.
+  const uint64_t very_high_rtt_ns = 5000 * 1000000ULL;
   // Fraction-slow thresholds (mirrors server.cc constants).
   static constexpr float kFractionSlowIncreaseFast   = 0.05f;
   static constexpr float kFractionSlowIncreaseMedium = 0.01f;
@@ -780,29 +785,9 @@ int run_client(const Args& args) {
           std::vector<uint64_t> sorted = rtt_samples;
           std::sort(sorted.begin(), sorted.end());
           uint64_t median_rtt = sorted[sorted.size() / 2];
-          rtt_outlier = (max_carrier_rtt > 3 * median_rtt);
+          rtt_outlier = (max_carrier_rtt > 5 * median_rtt);
         }
       }
-
-      // Fraction-slow: measure how many recent RTTs are significantly above the fast-path
-      // floor. When fraction_slow is high, extra carriers help by providing more independent
-      // paths for Reed-Solomon to exploit — even if no single carrier is a clear outlier.
-      // Cap fraction_slow-based carrier additions at min_carriers_floor*3 so we don't
-      // open an unbounded number of carriers for a uniformly slow link.
-      float fraction_slow_global = 0.0f;
-      if (recent_rtt_ns.size() >= kMinSamplesForAdapt) {
-        std::vector<uint64_t> sorted_g(recent_rtt_ns.begin(), recent_rtt_ns.end());
-        std::sort(sorted_g.begin(), sorted_g.end());
-        uint64_t min_rtt_g = sorted_g[std::max(size_t{0}, sorted_g.size() / 10)];
-        if (min_rtt_g > 1000000ULL && min_rtt_g < 30000000000ULL) {
-          uint64_t slow_thr_g = min_rtt_g * 2;
-          size_t n_slow_g = 0;
-          for (uint64_t r : recent_rtt_ns) if (r > slow_thr_g) n_slow_g++;
-          fraction_slow_global = static_cast<float>(n_slow_g) / static_cast<float>(recent_rtt_ns.size());
-        }
-      }
-      bool link_needs_more_paths = (fraction_slow_global > kFractionSlowIncreaseMedium
-                                    && carriers.size() < min_carriers_floor * 3u);
 
       // Carrier addition: when a carrier is stalled (clear RTT outlier), allow an add after
       // reap_check_interval_ns so the reap logic has time to run before we add another.
@@ -815,7 +800,12 @@ int run_client(const Args& args) {
         add_interval = reap_check_interval_ns;  // at most one add per reap cycle when replacing a stall
 
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
-        bool need_more = (total_write > backpressure_write_threshold) || (rtt_outlier && within_carrier_cap) || link_needs_more_paths;
+        // Add a carrier for backpressure (write queues filling) or to replace a clear
+        // RTT outlier.  Fraction-slow alone is NOT a trigger: with natural latency
+        // variance every link looks "slow" relative to its fastest samples, which
+        // would cause the connection count to balloon to min_carriers_floor*3 and
+        // create RS-shard churn that stalls data delivery.
+        bool need_more = (total_write > backpressure_write_threshold) || (rtt_outlier && within_carrier_cap);
         if (need_more) {
           last_add_carrier_ns = now;
           if (!args.unix_socket_connection.empty()) {
@@ -867,7 +857,7 @@ int run_client(const Args& args) {
           uint64_t worst_rtt = 0;
           for (auto& [fd, st] : carriers)
             if (st.last_rtt_ns > worst_rtt) { worst_rtt = st.last_rtt_ns; worst_fd = fd; }
-          if (worst_fd >= 0 && worst_rtt > 3 * median_rtt && worst_rtt > very_high_rtt_ns &&
+          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_rtt_ns &&
               carriers.size() > min_carriers_floor) {
             remove_carrier(worst_fd);
           }
@@ -942,16 +932,22 @@ int run_client(const Args& args) {
           && now_p - last_retransmit_check_ns >= 500000000ULL) {
         last_retransmit_check_ns = now_p;
         static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;  // 3 s
-        // Pick a non-connecting carrier for retransmit.
-        int rfd = -1;
+        // Collect all ready (non-connecting) carriers for round-robin retransmit.
+        // Spreading shards across multiple carriers means no single carrier failure
+        // can wipe out a retransmit attempt.
+        std::vector<int> rt_carriers;
         for (auto& [cfd, cs] : carriers)
-          if (!cs.connecting) { rfd = cfd; break; }
-        if (rfd >= 0) {
+          if (!cs.connecting) rt_carriers.push_back(cfd);
+        if (!rt_carriers.empty()) {
+          unsigned rt_idx = 0;  // round-robin index across rt_carriers
           for (auto& [uid, ui] : unacked_sends) {
             if (ui.send_ns == 0 || now_p - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
-            auto& rcs = carriers[rfd];
             if (ui.is_small) {
-              packet_io::append_small(rcs.write_buf, uid, ui.data.data(), ui.data.size());
+              int cfd = rt_carriers[rt_idx % rt_carriers.size()];
+              packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
+              ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+              rt_idx++;
             } else {
               std::vector<const uint8_t*> dptrs(ui.k);
               for (unsigned si = 0; si < ui.k; ++si)
@@ -961,18 +957,24 @@ int run_client(const Args& args) {
               std::vector<uint8_t*> pptrs2(m2);
               for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
               reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
+              std::set<int> touched;
               for (unsigned si = 0; si < ui.n; ++si) {
+                int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
                 const uint8_t* shard = (si < ui.k)
                     ? (ui.data.data() + si * ui.block_size)
                     : par2[si - ui.k].data();
-                packet_io::append_rs_shard(rcs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
+                packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
+                                           ui.n, ui.k, ui.block_size, si, shard);
+                touched.insert(cfd);
               }
+              for (int cfd : touched) {
+                ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+                epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+              }
+              rt_idx += ui.n;
             }
             // Reset send_ns so we don't retransmit this group again for another 3 s.
             ui.send_ns = now_p;
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = rfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, rfd, &ev);
           }
         }
       }

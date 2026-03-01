@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 #include <sys/epoll.h>
@@ -566,31 +567,46 @@ int run_server(const Args& args) {
         && now_ns_val - last_retransmit_check_ns >= 500000000ULL) {
       last_retransmit_check_ns = now_ns_val;
       static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;
-      // Pick one non-busy carrier for retransmit.
-      int rfd = carriers.begin()->first;
-      for (auto& [uid, ui] : unacked_data) {
-        if (ui.send_ns == 0 || now_ns_val - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
-        auto& rcs = carriers[rfd];
-        if (ui.is_small) {
-          packet_io::append_small(rcs.write_buf, uid, ui.data.data(), ui.data.size());
-        } else {
-          std::vector<const uint8_t*> dptrs(ui.k);
-          for (unsigned si = 0; si < ui.k; ++si) dptrs[si] = ui.data.data() + si * ui.block_size;
-          unsigned rm = ui.n - ui.k;
-          std::vector<std::vector<uint8_t>> rpar(rm, std::vector<uint8_t>(ui.block_size));
-          std::vector<uint8_t*> rpptrs(rm);
-          for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
-          reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
-          for (unsigned si = 0; si < ui.n; ++si) {
-            const uint8_t* shard = (si < ui.k)
-                ? (ui.data.data() + si * ui.block_size) : rpar[si - ui.k].data();
-            packet_io::append_rs_shard(rcs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
+      // Collect ready carriers; distribute shards round-robin across all of them so
+      // that no single carrier failure can wipe out a retransmit attempt.
+      std::vector<int> rt_carriers;
+      for (auto& [cfd, cs] : carriers)
+        if (!cs.connecting) rt_carriers.push_back(cfd);
+      if (!rt_carriers.empty()) {
+        unsigned rt_idx = 0;
+        for (auto& [uid, ui] : unacked_data) {
+          if (ui.send_ns == 0 || now_ns_val - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
+          if (ui.is_small) {
+            int cfd = rt_carriers[rt_idx % rt_carriers.size()];
+            packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
+            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            rt_idx++;
+          } else {
+            std::vector<const uint8_t*> dptrs(ui.k);
+            for (unsigned si = 0; si < ui.k; ++si) dptrs[si] = ui.data.data() + si * ui.block_size;
+            unsigned rm = ui.n - ui.k;
+            std::vector<std::vector<uint8_t>> rpar(rm, std::vector<uint8_t>(ui.block_size));
+            std::vector<uint8_t*> rpptrs(rm);
+            for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
+            reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
+            std::set<int> touched;
+            for (unsigned si = 0; si < ui.n; ++si) {
+              int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
+              const uint8_t* shard = (si < ui.k)
+                  ? (ui.data.data() + si * ui.block_size) : rpar[si - ui.k].data();
+              packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
+                                         ui.n, ui.k, ui.block_size, si, shard);
+              touched.insert(cfd);
+            }
+            for (int cfd : touched) {
+              ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            }
+            rt_idx += ui.n;
           }
+          ui.send_ns = now_ns_val;  // throttle: don't retransmit again for 3 s
         }
-        ui.send_ns = now_ns_val;  // throttle: don't retransmit again for 3 s
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = rfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, rfd, &ev);
       }
     }
 

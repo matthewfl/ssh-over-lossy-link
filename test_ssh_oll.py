@@ -282,8 +282,12 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         with _stall_lock:
             _stall_events.append((direction, duration_s))
 
+    # Track last-printed stall duration per direction to avoid printing every second.
+    _last_stall_print = {"client→TCP": 0.0, "TCP→client": 0.0}
+
     def _watchdog():
-        """Print a line whenever a direction has been blocked longer than STALL_THRESHOLD_S."""
+        """Print when a direction has been blocked longer than STALL_THRESHOLD_S.
+        Re-prints only after the stall grows by at least 5 more seconds."""
         while not stop_event.is_set():
             time.sleep(1.0)
             now = time.perf_counter()
@@ -291,14 +295,16 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 t_c2t = _inflight_c2t[0]
                 t_t2c = _inflight_t2c[0]
             parts = []
-            if t_c2t is not None:
-                elapsed = now - t_c2t
-                if elapsed >= STALL_THRESHOLD_S:
-                    parts.append(f"client→TCP stalled {elapsed:.1f}s")
-            if t_t2c is not None:
-                elapsed = now - t_t2c
-                if elapsed >= STALL_THRESHOLD_S:
-                    parts.append(f"TCP→client stalled {elapsed:.1f}s")
+            for label, t_start in (("client→TCP", t_c2t), ("TCP→client", t_t2c)):
+                if t_start is not None:
+                    elapsed = now - t_start
+                    if elapsed >= STALL_THRESHOLD_S:
+                        last = _last_stall_print[label]
+                        if elapsed >= last + 5.0:
+                            _last_stall_print[label] = elapsed
+                            parts.append(f"{label} stalled {elapsed:.1f}s")
+                else:
+                    _last_stall_print[label] = 0.0  # reset when stall clears
             if parts:
                 print(f"[stall] {', '.join(parts)}", flush=True)
 
@@ -326,6 +332,7 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 t1 = time.perf_counter()
                 with _inflight_lock:
                     _inflight_c2t[0] = None
+                dur = t1 - t0
                 if len(received) >= len(payload):
                     recv_exact = received[:len(payload)]
                     if len(recv_exact) != len(payload) or recv_exact != payload:
@@ -335,12 +342,15 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                             )
                         print(f"client→TCP   size={size:5d}   VALIDATION FAILED", flush=True)
                     else:
-                        lat_ms = 1000.0 * (t1 - t0)
+                        lat_ms = 1000.0 * dur
                         with results_lock:
                             results.append((size, lat_ms))
                         print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
-                        if t1 - t0 >= STALL_THRESHOLD_S:
-                            _record_stall("client→TCP", t1 - t0)
+                        if dur >= STALL_THRESHOLD_S:
+                            _record_stall("client→TCP", dur)
+                elif dur >= STALL_THRESHOLD_S:
+                    # Measurement interrupted by stop_event while stalled — record it.
+                    _record_stall("client→TCP", dur)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 with _inflight_lock:
                     _inflight_c2t[0] = None
@@ -364,6 +374,7 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 t1 = time.perf_counter()
                 with _inflight_lock:
                     _inflight_t2c[0] = None
+                dur = t1 - t0
                 if len(received) >= len(payload):
                     recv_exact = received[:len(payload)]
                     if len(recv_exact) != len(payload) or recv_exact != payload:
@@ -373,12 +384,15 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                             )
                         print(f"TCP→client   size={size:5d}   VALIDATION FAILED", flush=True)
                     else:
-                        lat_ms = 1000.0 * (t1 - t0)
+                        lat_ms = 1000.0 * dur
                         with results_lock:
                             results.append((size, lat_ms))
                         print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
-                        if t1 - t0 >= STALL_THRESHOLD_S:
-                            _record_stall("TCP→client", t1 - t0)
+                        if dur >= STALL_THRESHOLD_S:
+                            _record_stall("TCP→client", dur)
+                elif dur >= STALL_THRESHOLD_S:
+                    # Measurement interrupted by stop_event while stalled — record it.
+                    _record_stall("TCP→client", dur)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 with _inflight_lock:
                     _inflight_t2c[0] = None
