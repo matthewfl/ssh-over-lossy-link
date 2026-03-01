@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 #include <sys/epoll.h>
@@ -363,11 +364,59 @@ int run_client(const Args& args) {
       else ++it;
   };
 
+  // Maps each carrier fd to its SSH directory index (SSH mode only); used to recycle
+  // index slots when a carrier dies so we never exhaust max_connections permanently.
+  std::map<int, unsigned> fd_to_ssh_index;
+  if (args.unix_socket_connection.empty()) {
+    // Populate for the initial N carriers (they were connected just above).
+    unsigned idx = 0;
+    for (auto& [fd, _] : carriers) fd_to_ssh_index[fd] = idx++;
+  }
+
+  // Centralised carrier removal: closes the fd, removes from epoll, cleans up maps.
+  // Also returns the SSH index slot to the free pool (SSH mode).
+  auto remove_carrier = [&](int fd) {
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+    close(fd);
+    carriers.erase(fd);
+    carrier_pending_acks.erase(fd);
+    if (!args.unix_socket_connection.empty()) return;  // Unix-socket mode: nothing to recycle
+    // SSH mode: mark index slot as free by erasing from the map.
+    fd_to_ssh_index.erase(fd);
+  };
+
+  // Find a free SSH directory index in [0, max_connections) that is neither currently
+  // connected nor waiting to connect.  Returns max_connections when none is available.
+  auto find_free_ssh_index = [&]() -> unsigned {
+    std::set<unsigned> in_use;
+    for (auto& [fd, idx] : fd_to_ssh_index) in_use.insert(idx);
+    for (auto& path : pending_carrier_paths) {
+      // Path is client_dir + "/" + index
+      std::string prefix = client_dir + "/";
+      if (path.size() > prefix.size())
+        in_use.insert(static_cast<unsigned>(std::stoul(path.substr(prefix.size()))));
+    }
+    for (unsigned i = 0; i < max_connections; ++i)
+      if (!in_use.count(i)) return i;
+    return max_connections;
+  };
+
   std::vector<struct epoll_event> events(64);
   bool running = true;
 
   while (running) {
-    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), -1);
+    // When we are below the minimum carrier floor, use a short timeout so we
+    // retry the reconnect path promptly without waiting for an external event.
+    int epoll_timeout_ms = -1;
+    if (carriers.size() < min_carriers_floor) {
+      uint64_t elapsed = now_ns() - last_add_carrier_ns;
+      uint64_t floor_interval = carriers.empty() ? 50000000ULL : add_carrier_interval_ns;
+      if (elapsed >= floor_interval)
+        epoll_timeout_ms = 0;
+      else
+        epoll_timeout_ms = static_cast<int>((floor_interval - elapsed) / 1000000ULL + 1);
+    }
+    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), epoll_timeout_ms);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
@@ -459,25 +508,16 @@ int run_client(const Args& args) {
           if (err == 0)
             it->second.connecting = false;
           else if (err != EINPROGRESS && err != 0) {
-            close(fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            carriers.erase(it);
+            remove_carrier(fd);
             continue;
           }
         }
         if (e & EPOLLIN) {
-          if (!process_carrier_read(fd, it->second)) {
-            close(fd);
-            epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-            carriers.erase(it);
-            carrier_pending_acks.erase(fd);
-          }
+          if (!process_carrier_read(fd, it->second))
+            remove_carrier(fd);
         }
-        if (e & (EPOLLERR | EPOLLHUP)) {
-          close(fd);
-          epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-          carriers.erase(it);
-          carrier_pending_acks.erase(fd);
+        if (carriers.count(fd) && (e & (EPOLLERR | EPOLLHUP))) {
+          remove_carrier(fd);
         }
       }
     }
@@ -515,10 +555,15 @@ int run_client(const Args& args) {
       if (fd >= 0) {
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = fd;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
           carriers[fd].connecting = true;
-        else
+          // Record SSH index for later recycling.
+          std::string prefix = client_dir + "/";
+          if (it->size() > prefix.size())
+            fd_to_ssh_index[fd] = static_cast<unsigned>(std::stoul(it->substr(prefix.size())));
+        } else {
           close(fd);
+        }
       }
       it = pending_carrier_paths.erase(it);
     }
@@ -653,19 +698,22 @@ int run_client(const Args& args) {
               else
                 close(fd);
             }
-          } else if (pending_carrier_paths.empty() && next_carrier_index < max_connections) {
-            std::string path = client_dir + "/" + std::to_string(next_carrier_index);
-            pid_t pid = fork();
-            if (pid == 0) {
-              std::string spec = path + ":" + socket_path;
-              const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
-              execvp("ssh", const_cast<char* const*>(argv));
-              _exit(127);
-            }
-            if (pid > 0) {
-              ssh_pids.push_back(pid);
-              pending_carrier_paths.push_back(path);
-              next_carrier_index++;
+          } else if (pending_carrier_paths.empty()) {
+            unsigned free_idx = find_free_ssh_index();
+            if (free_idx < max_connections) {
+              std::string path = client_dir + "/" + std::to_string(free_idx);
+              pid_t pid = fork();
+              if (pid == 0) {
+                std::string spec = path + ":" + socket_path;
+                const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+                execvp("ssh", const_cast<char* const*>(argv));
+                _exit(127);
+              }
+              if (pid > 0) {
+                ssh_pids.push_back(pid);
+                pending_carrier_paths.push_back(path);
+                if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
+              }
             }
           }
         }
@@ -691,10 +739,7 @@ int run_client(const Args& args) {
             if (st.last_rtt_ns > worst_rtt) { worst_rtt = st.last_rtt_ns; worst_fd = fd; }
           if (worst_fd >= 0 && worst_rtt > 3 * median_rtt && worst_rtt > very_high_rtt_ns &&
               carriers.size() > min_carriers_floor) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, worst_fd, nullptr);
-            close(worst_fd);
-            carriers.erase(worst_fd);
-            carrier_pending_acks.erase(worst_fd);
+            remove_carrier(worst_fd);
           }
         }
 
@@ -710,20 +755,81 @@ int run_client(const Args& args) {
                 to_reap.push_back(fd);
             for (int fd : to_reap) {
               if (carriers.size() <= min_carriers_floor) break;
-              epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-              close(fd);
-              carriers.erase(fd);
-              carrier_pending_acks.erase(fd);
+              remove_carrier(fd);
             }
           }
         }
       }
     }
 
+    // ── Unconditional floor maintenance ─────────────────────────────────────
+    // Always try to keep at least min_carriers_floor connections alive,
+    // regardless of auto_adapt mode.  This also handles the case where ALL
+    // carriers have died: the auto_adapt block above is skipped when
+    // carriers.empty(), so we need a separate path here.
+    {
+      const uint64_t now_f = now_ns();
+      // Use a faster re-add interval when critically low on carriers.
+      const uint64_t floor_interval = carriers.empty()
+                                        ? 50000000ULL          // 50 ms when all are gone
+                                        : add_carrier_interval_ns;  // 100 ms otherwise
+      if (carriers.size() < min_carriers_floor
+          && now_f - last_add_carrier_ns >= floor_interval) {
+        last_add_carrier_ns = now_f;
+        if (!args.unix_socket_connection.empty()) {
+          // Unix-socket mode: just dial a fresh connection.
+          if (carriers.size() < max_connections) {
+            int fd = connect_unix(socket_path);
+            if (fd >= 0) {
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = fd;
+              if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+                carriers[fd].connecting = true;
+              else
+                close(fd);
+            }
+          }
+        } else if (pending_carrier_paths.empty()) {
+          // SSH mode: reuse a free index so we never permanently exhaust slots.
+          unsigned free_idx = find_free_ssh_index();
+          if (free_idx < max_connections) {
+            std::string path = client_dir + "/" + std::to_string(free_idx);
+            pid_t pid = fork();
+            if (pid == 0) {
+              std::string spec = path + ":" + socket_path;
+              const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+                                     "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+              execvp("ssh", const_cast<char* const*>(argv));
+              _exit(127);
+            }
+            if (pid > 0) {
+              ssh_pids.push_back(pid);
+              pending_carrier_paths.push_back(path);
+              if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
+            }
+          }
+        }
+      }
+    }
+
+    // ── Exit conditions ──────────────────────────────────────────────────────
+    // Normal completion: stdin done and nothing left in flight.
     if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
       running = false;
-    if (carriers.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
-      running = false;
+    // Fatal: no carriers AND we cannot reconnect AND nothing in flight.
+    // In unix-socket mode we can always reconnect, so we never exit here.
+    // In SSH mode we give up only when every index is occupied or being tried.
+    if (carriers.empty() && pending_carrier_paths.empty()
+        && reassembly.empty() && stdout_buf.empty() && rs_pending.empty()) {
+      bool can_reconnect;
+      if (!args.unix_socket_connection.empty()) {
+        can_reconnect = true;  // server socket is always there; keep retrying
+      } else {
+        can_reconnect = (find_free_ssh_index() < max_connections);
+      }
+      if (!can_reconnect)
+        running = false;
+    }
   }
 
   for (auto& [fd, _] : carriers)
