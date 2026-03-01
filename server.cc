@@ -180,6 +180,7 @@ int run_server(const Args& args) {
   const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;
   unsigned next_carrier_for_rs = 0;
   size_t next_carrier_for_small = 0;  // round-robin for small-packet redundancy
+  size_t next_ack_carrier = 0;        // round-robin for sending ACK to client (one carrier only)
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
   auto now_ns = []() {
@@ -309,7 +310,11 @@ int run_server(const Args& args) {
         ev.data.fd = backend_fd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
       }
-      for (auto& [cfd, _] : carriers) {
+      if (!carriers.empty()) {
+        auto it = carriers.begin();
+        std::advance(it, next_ack_carrier % carriers.size());
+        next_ack_carrier++;
+        int cfd = it->first;
         queue_ack_to_carrier(cfd, acked_id);
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = cfd;
