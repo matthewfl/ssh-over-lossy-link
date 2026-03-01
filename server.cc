@@ -3,6 +3,7 @@
 #include "reed_solomon.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <csignal>
 #include <cstring>
@@ -171,6 +172,16 @@ int run_server(const Args& args) {
   unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
   unsigned next_carrier_for_rs = 0;
 
+  // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
+  auto now_ns = []() {
+    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+  };
+  std::map<uint64_t, uint64_t> ack_send_time_ns;  // id -> when we sent it (for server→client RTT)
+  std::deque<uint64_t> server_recent_rtt_ns;
+  const size_t max_server_recent_rtt = 50;
+  const uint64_t metrics_interval_ns = 400 * 1000000ULL;  // 400ms
+  uint64_t last_metrics_ns = 0;
+
   auto connect_backend = [&]() {
     if (backend_fd >= 0) return;
     backend_fd = connect_tcp(args.remote_hostname, args.remote_port);
@@ -208,6 +219,7 @@ int run_server(const Args& args) {
 
   auto queue_data_to_carriers = [&](const uint8_t* data, size_t len) {
     if (len == 0) return;
+    ack_send_time_ns[next_send_id] = now_ns();
     for (auto& [fd, state] : carriers) {
       (void)fd;
       packet_io::append_small(state.write_buf, next_send_id, data, len);
@@ -229,6 +241,15 @@ int run_server(const Args& args) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
     packet_io::append_ack(it->second.write_buf, acked_id);
+  };
+
+  auto queue_server_metrics_to_carrier = [&](int fd, uint64_t max_rtt_ns) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    packet_io::append_server_metrics(it->second.write_buf, max_rtt_ns);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
 
   // Delivered data is queued here; we write to backend and ACK when a chunk is fully written.
@@ -274,7 +295,18 @@ int run_server(const Args& args) {
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     }
   };
-  recv_cb.on_ping = [&](int fd, uint64_t id) { send_pong(fd, id); };
+  recv_cb.on_ping = [&](int fd, uint64_t id) { send_pong(fd, id); };  // client may still send PING for health
+  recv_cb.on_ack = [&](int /*fd*/, uint64_t acked_id) {
+    auto it = ack_send_time_ns.find(acked_id);
+    if (it != ack_send_time_ns.end()) {
+      uint64_t rtt = now_ns() - it->second;
+      server_recent_rtt_ns.push_back(rtt);
+      while (server_recent_rtt_ns.size() > max_server_recent_rtt) server_recent_rtt_ns.pop_front();
+    }
+    for (auto it_m = ack_send_time_ns.begin(); it_m != ack_send_time_ns.end(); )
+      if (it_m->first <= acked_id) it_m = ack_send_time_ns.erase(it_m);
+      else ++it_m;
+  };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
     max_packet = std::min(static_cast<size_t>(pc.packet_size), MAX_PACKET_PAYLOAD);
     if (max_packet == 0) max_packet = 800;
@@ -369,6 +401,16 @@ int run_server(const Args& args) {
       }
     }
 
+    const uint64_t now_ns_val = now_ns();
+    // Report observed link quality (from ACKs received from client) so client can adapt.
+    if (!carriers.empty() && !server_recent_rtt_ns.empty() && now_ns_val - last_metrics_ns >= metrics_interval_ns) {
+      last_metrics_ns = now_ns_val;
+      uint64_t max_rtt = 0;
+      for (uint64_t r : server_recent_rtt_ns) if (r > max_rtt) max_rtt = r;
+      int fd = carriers.begin()->first;
+      queue_server_metrics_to_carrier(fd, max_rtt);
+    }
+
     ensure_backend_connected();
     if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
       const size_t block_size = max_packet;
@@ -396,6 +438,7 @@ int run_server(const Args& args) {
             epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
           }
           next_carrier_for_rs += n;
+          ack_send_time_ns[next_send_id] = now_ns();
           next_send_id++;
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
         } else {

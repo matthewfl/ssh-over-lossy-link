@@ -217,6 +217,8 @@ int run_client(const Args& args) {
   const uint64_t backpressure_write_threshold = 150 * max_packet;  // total queued bytes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
+  uint64_t server_reported_max_rtt_ns = 0;  // server→client path RTT from SERVER_METRICS
+  size_t next_ack_carrier = 0;  // round-robin for sending ACK to server when we deliver data
 
   struct epoll_event ev{};
 
@@ -290,8 +292,20 @@ int run_client(const Args& args) {
   };
 
   packet_io::ReceiveCallbacks recv_cb;
-  recv_cb.on_deliver = [&](uint64_t, const uint8_t* data, size_t len) {
+  recv_cb.on_deliver = [&](uint64_t id, const uint8_t* data, size_t len) {
     stdout_buf.insert(stdout_buf.end(), data, data + len);
+    // Send ACK to server so it can measure server→client RTT (bidirectional ACK monitoring).
+    if (carriers.empty()) return;
+    auto it = carriers.begin();
+    std::advance(it, next_ack_carrier % carriers.size());
+    next_ack_carrier++;
+    packet_io::append_ack(it->second.write_buf, id);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = it->first;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+  };
+  recv_cb.on_server_metrics = [&](uint64_t max_rtt_ns) {
+    server_reported_max_rtt_ns = max_rtt_ns;
   };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it_p = carrier_pending_acks.find(fd);
@@ -497,9 +511,9 @@ int run_client(const Args& args) {
     if (args.config.auto_adapt && !carriers.empty()) {
       const uint64_t now = now_ns();
 
-      if (now - last_adapt_ns >= adapt_interval_ns && !recent_rtt_ns.empty()) {
+      if (now - last_adapt_ns >= adapt_interval_ns && (!recent_rtt_ns.empty() || server_reported_max_rtt_ns != 0)) {
         last_adapt_ns = now;
-        uint64_t max_rtt = 0;
+        uint64_t max_rtt = server_reported_max_rtt_ns;
         for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
         if (max_rtt > high_rtt_threshold_ns) {
           float inc = (max_rtt > very_high_rtt_ns) ? 0.25f : 0.15f;
@@ -528,11 +542,9 @@ int run_client(const Args& args) {
       }
 
       uint64_t add_interval = add_carrier_interval_ns;
-      if (!recent_rtt_ns.empty()) {
-        uint64_t max_rtt_check = 0;
-        for (uint64_t r : recent_rtt_ns) if (r > max_rtt_check) max_rtt_check = r;
-        if (max_rtt_check > very_high_rtt_ns) add_interval = 50 * 1000000ULL;  // 50ms when RTT very high
-      }
+      uint64_t max_rtt_for_interval = server_reported_max_rtt_ns;
+      for (uint64_t r : recent_rtt_ns) if (r > max_rtt_for_interval) max_rtt_for_interval = r;
+      if (max_rtt_for_interval > very_high_rtt_ns) add_interval = 50 * 1000000ULL;  // 50ms when RTT very high
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
         size_t total_write = 0;
         uint64_t max_carrier_rtt = 0;
@@ -541,7 +553,7 @@ int run_client(const Args& args) {
           total_write += st.write_buf.size();
           if (st.last_rtt_ns > max_carrier_rtt) max_carrier_rtt = st.last_rtt_ns;
         }
-        uint64_t max_rtt = max_carrier_rtt;
+        uint64_t max_rtt = std::max(max_carrier_rtt, server_reported_max_rtt_ns);
         if (!recent_rtt_ns.empty()) {
           for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
         }

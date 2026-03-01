@@ -37,12 +37,16 @@ struct RsPending {
 struct ReceiveCallbacks {
   // Delivered contiguous data (id, data, len). Server writes to backend and queues ACK; client writes to stdout.
   std::function<void(uint64_t id, const uint8_t* data, size_t len)> on_deliver;
-  // Client -> server PING; server should send PONG.
+  // Client -> server PING; server should send PONG. Server -> client PING; client should send PONG.
   std::function<void(int fd, uint64_t id)> on_ping;
+  // PONG received (response to our PING). Caller may record RTT (e.g. server measures server→client path).
+  std::function<void(int fd, uint64_t id)> on_pong;
   // Server -> client ACK; client may record RTT.
   std::function<void(int fd, uint64_t acked_id)> on_ack;
   // Client -> server SET_CONFIG; server should apply config.
   std::function<void(const PacketConfig&)> on_set_config;
+  // Server -> client SERVER_METRICS; client uses for adapt (e.g. max RTT observed by server).
+  std::function<void(uint64_t max_rtt_ns)> on_server_metrics;
 };
 
 // Process bytes from carrier read_buf: parse SMALL/REED_SOLOMON, update reassembly/rs_pending,
@@ -65,6 +69,8 @@ void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t sma
                   float max_delay_ms, float reed_solomon_redundancy);
 void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
 void append_pong(std::vector<uint8_t>& out, uint64_t id);
+void append_ping(std::vector<uint8_t>& out, uint64_t id);
+void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).

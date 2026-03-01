@@ -25,7 +25,9 @@ bool process_carrier_read(
       continue;
     }
     if (h->packet_kind == PacketKind::PONG) {
+      uint64_t id = h->id;
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      if (callbacks.on_pong) callbacks.on_pong(fd, id);
       continue;
     }
     if (h->packet_kind == PacketKind::ACK) {
@@ -66,6 +68,13 @@ bool process_carrier_read(
     }
     if (h->packet_kind == PacketKind::START_CONNECTION) {
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      continue;
+    }
+    if (h->packet_kind == PacketKind::SERVER_METRICS) {
+      if (s.read_buf.size() < sizeof(PacketServerMetrics)) break;
+      const auto* pm = reinterpret_cast<const PacketServerMetrics*>(s.read_buf.data());
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerMetrics));
+      if (callbacks.on_server_metrics) callbacks.on_server_metrics(pm->max_rtt_ns);
       continue;
     }
     if (h->packet_kind == PacketKind::REED_SOLOMON) {
@@ -189,6 +198,22 @@ void append_pong(std::vector<uint8_t>& out, uint64_t id) {
   h.id = id;
   h.packet_kind = PacketKind::PONG;
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+}
+
+void append_ping(std::vector<uint8_t>& out, uint64_t id) {
+  PacketHeader h{};
+  h.id = id;
+  h.packet_kind = PacketKind::PING;
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+}
+
+void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns) {
+  PacketServerMetrics pm{};
+  pm.header.id = 0;
+  pm.header.packet_kind = PacketKind::SERVER_METRICS;
+  pm.max_rtt_ns = max_rtt_ns;
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(&pm);
+  out.insert(out.end(), p, p + sizeof pm);
 }
 
 void flush_carrier_writes(

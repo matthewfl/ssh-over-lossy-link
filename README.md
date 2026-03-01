@@ -59,7 +59,7 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 
 ## How it works
 
-When `ssh-oll` is started, it opens a connection to the SSH host to launch the server using `ssh lossy-ssh-host "ssh-oll --server localhost 22"`. The server creates a Unix socket such as `/tmp/ssh-oll-server.abc123def` with permissions so only the current user can access it, prints the socket path, then daemonizes and closes the initial SSH connection. The client then opens multiple carrier connections with commands like `ssh -L /tmp/ssh-oll-client.hgi456789/0:/tmp/ssh-oll-server.abc123def lossy-ssh-host`, and so on for each carrier. The client can open up to `--max-connections` sessions; by default the count is adapted automatically based on observed packet loss. The client manages connections and monitors health using PING packets; the server replies with PONG. Both client and server are single-threaded, using epoll to manage connections and subprocesses.
+When `ssh-oll` is started, it opens a connection to the SSH host to launch the server using `ssh lossy-ssh-host "ssh-oll --server localhost 22"`. The server creates a Unix socket such as `/tmp/ssh-oll-server.abc123def` with permissions so only the current user can access it, prints the socket path, then daemonizes and closes the initial SSH connection. The client then opens multiple carrier connections with commands like `ssh -L /tmp/ssh-oll-client.hgi456789/0:/tmp/ssh-oll-server.abc123def lossy-ssh-host`, and so on for each carrier. The client can open up to `--max-connections` sessions; by default the count is adapted automatically based on observed packet loss. Both sides monitor link latency using ACKs in both directions: the server sends ACK when it has delivered data to the backend (client→server path); the client sends ACK when it has delivered data to stdout (server→client path). Each side measures RTT from the ACKs it receives. The server reports its observed RTT to the client via SERVER_METRICS so the client can use max(client RTT, server RTT) when auto-adapting redundancy and carrier count. Both client and server are single-threaded, using epoll to manage connections and subprocesses.
 
 **Lifecycle and cleanup:** The server exits when the inner SSH session to localhost:22 (or the configured host/port) ends. On exit it removes its Unix socket. Each session uses a unique random suffix in the socket path (e.g. `abc123def`), so multiple ssh-oll clients can use the same host concurrently.
 
@@ -91,7 +91,8 @@ enum packet_kind_e : uint8_t {
     PACKET_REED_SOLOMON = 3,
     PACKET_SET_CONFIG = 4,        // client -> server; adjust redundancy / packet size etc.
     PACKET_START_CONNECTION = 5,  // sent when a new carrier joins; used to associate the carrier with the logical stream
-    PACKET_ACK = 6,               // server -> client; cumulative ack: all data up to and including header.id has been delivered (for latency measurement)
+    PACKET_ACK = 6,               // both directions; cumulative ack: all data up to and including header.id delivered (for latency measurement)
+    PACKET_SERVER_METRICS = 7,    // server -> client; max RTT observed by server (server→client path) for client adapt
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -118,9 +119,13 @@ struct __attribute__((__packed__)) packet_config : packet_header {
     // other fields as needed
 };
 
-// PACKET_ACK: header only. header.id = acked_id (all data with id <= acked_id has been
-// delivered to the backend). Server sends on all carriers for efficiency; client uses
-// ACKs received per carrier to measure per-link RTT (round-trip time) for latency.
+// PACKET_ACK: header only. header.id = acked_id (all data with id <= acked_id delivered).
+// Server sends ACK when it has written to the backend (client measures client→server RTT).
+// Client sends ACK when it has written to stdout (server measures server→client RTT).
+// Both sides use received ACKs for latency monitoring.
+
+// PACKET_SERVER_METRICS: server -> client. struct { packet_header; uint64_t max_rtt_ns; }
+// Server sends periodically so the client can use max(client RTT, server RTT) when adapting.
 
 ```
 

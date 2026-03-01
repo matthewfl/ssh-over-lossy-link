@@ -20,6 +20,7 @@ enum class PacketKind : uint8_t {
   SET_CONFIG = 4,         // client -> server: adjust redundancy / packet size
   START_CONNECTION = 5,   // new carrier joins; associate carrier with stream
   ACK = 6,                // server -> client; cumulative ack: all data up to id delivered
+  SERVER_METRICS = 7,     // server -> client; observed link quality (max RTT etc.) for client adapt
 };
 
 #pragma pack(push, 1)
@@ -55,6 +56,12 @@ struct PacketConfig {
   uint16_t small_packet_redundancy;
   float max_delay_ms;
   float reed_solomon_redundancy;
+};
+
+// Server -> client: link quality observed by server (server→client path RTT) so client can adapt.
+struct PacketServerMetrics {
+  PacketHeader header;
+  uint64_t max_rtt_ns;
 };
 
 #pragma pack(pop)
