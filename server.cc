@@ -12,9 +12,11 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <sys/un.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -149,6 +151,24 @@ int run_server(const Args& args) {
   }
 
   struct epoll_event ev{};
+  // Timer to coalesce backend reads so multiple TCP segments are batched before we
+  // process and send to carriers, giving symmetric min latency with client→TCP.
+  constexpr long BACKEND_COALESCE_MS = 5;
+  constexpr size_t BACKEND_COALESCE_MIN_BYTES = 800;  // wait for more if we have less
+  int backend_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  if (backend_timer_fd < 0) {
+    close(epfd);
+    unlink(socket_path.c_str());
+    return 1;
+  }
+  ev.events = EPOLLIN;
+  ev.data.fd = backend_timer_fd;
+  if (epoll_ctl(epfd, EPOLL_CTL_ADD, backend_timer_fd, &ev) < 0) {
+    close(backend_timer_fd);
+    close(epfd);
+    unlink(socket_path.c_str());
+    return 1;
+  }
   ev.events = EPOLLIN;
   ev.data.fd = listen_fd;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) < 0) {
@@ -166,6 +186,8 @@ int run_server(const Args& args) {
   uint64_t next_deliver_id = 0;
   uint64_t next_send_id = 0;
   std::vector<uint8_t> backend_read_buf;
+  bool backend_timer_armed = false;
+  int backend_coalesce_retries = 0;
   size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   float runtime_rs_redundancy = args.config.rs_redundancy;
   unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
@@ -223,6 +245,23 @@ int run_server(const Args& args) {
 
   auto flush_carrier_writes = [&]() {
     packet_io::flush_carrier_writes(carriers, epfd, ev);
+  };
+
+  // Flush until all carrier write_bufs are sent (don't yield with partial data, which
+  // would cause two 50ms proxy delays on the server→client link).
+  auto flush_carrier_writes_until_done = [&]() {
+    flush_carrier_writes();
+    for (int round = 0; round < 50; ++round) {
+      bool any_pending = false;
+      for (const auto& [_, s] : carriers) {
+        if (s.write_pos < s.write_buf.size()) { any_pending = true; break; }
+      }
+      if (!any_pending) break;
+      struct epoll_event evs[64];
+      int n = epoll_wait(epfd, evs, 64, 100);
+      if (n <= 0) break;
+      flush_carrier_writes();
+    }
   };
 
   auto queue_ack_to_carrier = [&](int fd, uint64_t acked_id) {
@@ -307,6 +346,8 @@ int run_server(const Args& args) {
             break;
           }
           set_nonblocking(client);
+          const int sndbuf = 65536;
+          setsockopt(client, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
           ev.events = EPOLLIN;
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
@@ -325,12 +366,40 @@ int run_server(const Args& args) {
         if (!backend_connected) continue;
         if (e & EPOLLIN) {
           uint8_t buf[READ_BUF_SIZE];
-          ssize_t nr = read(backend_fd, buf, sizeof buf);
-          if (nr <= 0) {
-            if (nr == 0) running = false;
-            break;
+          while (true) {
+            ssize_t nr = read(backend_fd, buf, sizeof buf);
+            if (nr <= 0) {
+              if (nr == 0) running = false;
+              else if (errno != EAGAIN && errno != EWOULDBLOCK) running = false;
+              break;
+            }
+            backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
           }
-          backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
+          // Wait briefly for a following segment so we batch into one send (avoids two
+          // 50ms proxy delays on server→client). Poll with 25ms timeout then drain again.
+          struct pollfd pfd = { backend_fd, POLLIN, 0 };
+          int pr = poll(&pfd, 1, 25);
+          if (pr > 0 && (pfd.revents & POLLIN)) {
+            while (true) {
+              ssize_t nr = read(backend_fd, buf, sizeof buf);
+              if (nr <= 0) {
+                if (nr == 0) running = false;
+                else if (errno != EAGAIN && errno != EWOULDBLOCK) running = false;
+                break;
+              }
+              backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
+            }
+          }
+          // Arm coalesce timer only if not already armed (process once after first segment).
+          if (!backend_read_buf.empty() && !backend_timer_armed) {
+            backend_timer_armed = true;
+            struct itimerspec ts{};
+            ts.it_value.tv_sec = 0;
+            ts.it_value.tv_nsec = BACKEND_COALESCE_MS * 1000000L;
+            ts.it_interval.tv_sec = 0;
+            ts.it_interval.tv_nsec = 0;
+            timerfd_settime(backend_timer_fd, 0, &ts, nullptr);
+          }
         }
         if (e & EPOLLOUT) {
           flush_backend_pending();
@@ -338,6 +407,78 @@ int run_server(const Args& args) {
         if (e & (EPOLLERR | EPOLLHUP)) {
           running = false;
           break;
+        }
+        continue;
+      }
+
+      if (fd == backend_timer_fd) {
+        uint64_t count = 0;
+        if (read(backend_timer_fd, &count, sizeof count) >= 0) { /* consume */ }
+        if (backend_fd >= 0 && backend_connected) {
+          uint8_t buf[READ_BUF_SIZE];
+          while (true) {
+            ssize_t nr = read(backend_fd, buf, sizeof buf);
+            if (nr <= 0) {
+              if (nr == 0) running = false;
+              else if (errno != EAGAIN && errno != EWOULDBLOCK) running = false;
+              break;
+            }
+            backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
+          }
+        }
+        if (backend_read_buf.size() > 0 && backend_read_buf.size() < BACKEND_COALESCE_MIN_BYTES &&
+            backend_read_buf.size() >= max_packet && backend_coalesce_retries < 10) {
+          backend_timer_armed = true;
+          backend_coalesce_retries++;
+          struct itimerspec ts{};
+          ts.it_value.tv_sec = 0;
+          ts.it_value.tv_nsec = 5 * 1000000L;
+          ts.it_interval.tv_sec = 0;
+          ts.it_interval.tv_nsec = 0;
+          timerfd_settime(backend_timer_fd, 0, &ts, nullptr);
+          continue;
+        }
+        backend_timer_armed = false;
+        backend_coalesce_retries = 0;
+        if (!backend_read_buf.empty() && !carriers.empty()) {
+          const size_t block_size = max_packet;
+          if (backend_read_buf.size() >= block_size) {
+            unsigned k = static_cast<unsigned>(std::min(backend_read_buf.size() / block_size, static_cast<size_t>(255)));
+            if (k >= 1) {
+              unsigned m = std::max(1u, static_cast<unsigned>(k * runtime_rs_redundancy + 0.5f));
+              unsigned n = std::min(k + m, 255u);
+              m = n - k;
+              std::vector<const uint8_t*> data_ptrs(k);
+              for (unsigned i = 0; i < k; ++i)
+                data_ptrs[i] = backend_read_buf.data() + i * block_size;
+              std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
+              std::vector<uint8_t*> parity_ptrs(m);
+              for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
+              reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
+              std::vector<int> carrier_fds;
+              for (auto& [cfd, _] : carriers) carrier_fds.push_back(cfd);
+              for (size_t i = 0; i < n; ++i) {
+                int cfd = carrier_fds[(next_carrier_for_rs + i) % carrier_fds.size()];
+                const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
+                queue_rs_shard_to_carrier(cfd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
+                ev.events = EPOLLIN | EPOLLOUT;
+                ev.data.fd = cfd;
+                epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+              }
+              next_carrier_for_rs += n;
+              next_send_id++;
+              backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
+            } else {
+              size_t chunk = std::min(backend_read_buf.size(), block_size);
+              queue_data_to_carriers(backend_read_buf.data(), chunk);
+              backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+            }
+          } else {
+            size_t chunk = backend_read_buf.size();
+            queue_data_to_carriers(backend_read_buf.data(), chunk);
+            backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+          }
+          flush_carrier_writes_until_done();
         }
         continue;
       }
@@ -360,45 +501,6 @@ int run_server(const Args& args) {
     }
 
     ensure_backend_connected();
-    if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
-      const size_t block_size = max_packet;
-      if (backend_read_buf.size() >= block_size) {
-        unsigned k = static_cast<unsigned>(std::min(backend_read_buf.size() / block_size, static_cast<size_t>(255)));
-        if (k >= 1) {
-          unsigned m = std::max(1u, static_cast<unsigned>(k * runtime_rs_redundancy + 0.5f));
-          unsigned n = std::min(k + m, 255u);
-          m = n - k;
-          std::vector<const uint8_t*> data_ptrs(k);
-          for (unsigned i = 0; i < k; ++i)
-            data_ptrs[i] = backend_read_buf.data() + i * block_size;
-          std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
-          std::vector<uint8_t*> parity_ptrs(m);
-          for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
-          reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
-          std::vector<int> carrier_fds;
-          for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
-          for (size_t i = 0; i < n; ++i) {
-            int fd = carrier_fds[(next_carrier_for_rs + i) % carrier_fds.size()];
-            const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
-            queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = fd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-          }
-          next_carrier_for_rs += n;
-          next_send_id++;
-          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
-        } else {
-          size_t chunk = std::min(backend_read_buf.size(), block_size);
-          queue_data_to_carriers(backend_read_buf.data(), chunk);
-          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
-        }
-      } else {
-        size_t chunk = backend_read_buf.size();
-        queue_data_to_carriers(backend_read_buf.data(), chunk);
-        backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
-      }
-    }
     flush_backend_pending();
     flush_carrier_writes();
   }
@@ -406,6 +508,7 @@ int run_server(const Args& args) {
   for (auto& [fd, _] : carriers)
     close(fd);
   if (backend_fd >= 0) close(backend_fd);
+  if (backend_timer_fd >= 0) close(backend_timer_fd);
   close(listen_fd);
   unlink(socket_path.c_str());
   close(epfd);
