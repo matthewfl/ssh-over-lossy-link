@@ -220,7 +220,10 @@ int run_client(const Args& args) {
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t server_reported_max_rtt_ns = 0;  // server→client path RTT from SERVER_METRICS
-  size_t next_ack_carrier = 0;  // round-robin for sending ACK to server when we deliver data
+  // min carriers to keep during reaping (never drop below the initial configured count)
+  const unsigned min_carriers_floor = std::max(2u, args.config.connections);
+  uint64_t last_reap_ns = 0;
+  const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
 
   struct epoll_event ev{};
 
@@ -294,20 +297,21 @@ int run_client(const Args& args) {
   };
 
   packet_io::ReceiveCallbacks recv_cb;
-  recv_cb.on_deliver = [&](uint64_t id, const uint8_t* data, size_t len) {
+  recv_cb.on_deliver = [&](int cfd, uint64_t id, const uint8_t* data, size_t len) {
     stdout_buf.insert(stdout_buf.end(), data, data + len);
-    // Send ACK to server so it can measure server→client RTT (bidirectional ACK monitoring).
+    // ACK on the completing carrier so the server gets per-carrier RTT measurements.
+    // Fall back to any carrier if completing_fd was already closed.
     if (carriers.empty()) return;
-    auto it = carriers.begin();
-    std::advance(it, next_ack_carrier % carriers.size());
-    next_ack_carrier++;
-    packet_io::append_ack(it->second.write_buf, id);
+    if (!carriers.count(cfd)) cfd = carriers.begin()->first;
+    packet_io::append_ack(carriers[cfd].write_buf, id);
     ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = it->first;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+    ev.data.fd = cfd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
   };
   recv_cb.on_server_metrics = [&](uint64_t max_rtt_ns) {
-    server_reported_max_rtt_ns = max_rtt_ns;
+    // Sanity check: discard obviously-garbage values (> 10s means something is wrong).
+    if (max_rtt_ns < 10000000000ULL)
+      server_reported_max_rtt_ns = max_rtt_ns;
   };
   recv_cb.on_server_config = [&](const PacketServerConfig& psc) {
     has_server_config = true;
@@ -568,23 +572,44 @@ int run_client(const Args& args) {
     if (args.config.auto_adapt && !carriers.empty()) {
       const uint64_t now = now_ns();
 
+      // Compute per-carrier stats for both carrier-add and reaping decisions.
+      size_t total_write = 0;
+      std::vector<uint64_t> rtt_samples;
+      for (const auto& [cfd, st] : carriers) {
+        (void)cfd;
+        total_write += st.write_buf.size();
+        if (st.last_rtt_ns > 0) rtt_samples.push_back(st.last_rtt_ns);
+      }
+      uint64_t max_carrier_rtt = rtt_samples.empty() ? 0 :
+          *std::max_element(rtt_samples.begin(), rtt_samples.end());
+
+      // RTT outlier: a carrier is stalled when its RTT is both extremely high in absolute terms
+      // AND much worse than its peers (3× median). With a single carrier, skip the peer comparison.
+      bool rtt_outlier = false;
+      if (max_carrier_rtt > very_high_rtt_ns) {
+        if (rtt_samples.size() <= 1) {
+          rtt_outlier = true;
+        } else {
+          std::vector<uint64_t> sorted = rtt_samples;
+          std::sort(sorted.begin(), sorted.end());
+          uint64_t median_rtt = sorted[sorted.size() / 2];
+          rtt_outlier = (max_carrier_rtt > 3 * median_rtt);
+        }
+      }
+
+      // Carrier addition: when a carrier is stalled (clear RTT outlier), allow an add after
+      // reap_check_interval_ns so the reap logic has time to run before we add another.
+      // For backpressure (write buffers full) use the normal 100ms add interval.
+      // We deliberately do NOT trigger carrier addition based on server_reported_max_rtt_ns
+      // alone: that is a global signal (all carriers share it) and cannot distinguish one
+      // stalled carrier from general congestion. High server-side RTT is handled by the
+      // server increasing RS redundancy; the client only adds carriers for per-carrier stalls.
       uint64_t add_interval = add_carrier_interval_ns;
-      uint64_t max_rtt_for_interval = server_reported_max_rtt_ns;
-      for (uint64_t r : recent_rtt_ns) if (r > max_rtt_for_interval) max_rtt_for_interval = r;
-      if (max_rtt_for_interval > very_high_rtt_ns) add_interval = 50 * 1000000ULL;  // 50ms when RTT very high
+      if (rtt_outlier)
+        add_interval = reap_check_interval_ns;  // at most one add per reap cycle when replacing a stall
+
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
-        size_t total_write = 0;
-        uint64_t max_carrier_rtt = 0;
-        for (const auto& [cfd, st] : carriers) {
-          (void)cfd;
-          total_write += st.write_buf.size();
-          if (st.last_rtt_ns > max_carrier_rtt) max_carrier_rtt = st.last_rtt_ns;
-        }
-        uint64_t max_rtt = std::max(max_carrier_rtt, server_reported_max_rtt_ns);
-        if (!recent_rtt_ns.empty()) {
-          for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
-        }
-        bool need_more = (total_write > backpressure_write_threshold) || (max_rtt > high_rtt_threshold_ns);
+        bool need_more = (total_write > backpressure_write_threshold) || rtt_outlier;
         if (need_more) {
           last_add_carrier_ns = now;
           if (!args.unix_socket_connection.empty()) {
@@ -610,6 +635,54 @@ int run_client(const Args& args) {
               ssh_pids.push_back(pid);
               pending_carrier_paths.push_back(path);
               next_carrier_index++;
+            }
+          }
+        }
+      }
+
+      // Carrier reaping: periodically close carriers that are clearly worse than their peers.
+      // Two criteria (either triggers a reap):
+      //   1. RTT outlier: last_rtt_ns > 3× median AND > 1s (stalled on client→server path).
+      //   2. Silence: no shard received from server in 10s while other carriers are active
+      //      (stalled on server→client path).
+      if (carriers.size() > min_carriers_floor && now - last_reap_ns >= reap_check_interval_ns) {
+        last_reap_ns = now;
+
+        // RTT-based reap: find worst carrier and reap if it's a clear outlier.
+        if (rtt_samples.size() >= 2) {
+          std::vector<uint64_t> sorted = rtt_samples;
+          std::sort(sorted.begin(), sorted.end());
+          uint64_t median_rtt = sorted[sorted.size() / 2];
+          // Find carrier with worst RTT.
+          int worst_fd = -1;
+          uint64_t worst_rtt = 0;
+          for (auto& [fd, st] : carriers)
+            if (st.last_rtt_ns > worst_rtt) { worst_rtt = st.last_rtt_ns; worst_fd = fd; }
+          if (worst_fd >= 0 && worst_rtt > 3 * median_rtt && worst_rtt > very_high_rtt_ns &&
+              carriers.size() > min_carriers_floor) {
+            epoll_ctl(epfd, EPOLL_CTL_DEL, worst_fd, nullptr);
+            close(worst_fd);
+            carriers.erase(worst_fd);
+            carrier_pending_acks.erase(worst_fd);
+          }
+        }
+
+        // Silence-based reap: carrier hasn't received a shard from server in 10s while others have.
+        if (carriers.size() > min_carriers_floor) {
+          uint64_t latest_recv = 0;
+          for (auto& [fd, st] : carriers)
+            if (st.last_recv_ns > latest_recv) latest_recv = st.last_recv_ns;
+          if (latest_recv + 5000000000ULL > now) {  // active server→client traffic in last 5s
+            std::vector<int> to_reap;
+            for (auto& [fd, st] : carriers)
+              if (st.last_recv_ns > 0 && st.last_recv_ns + 10000000000ULL < now)
+                to_reap.push_back(fd);
+            for (int fd : to_reap) {
+              if (carriers.size() <= min_carriers_floor) break;
+              epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+              close(fd);
+              carriers.erase(fd);
+              carrier_pending_acks.erase(fd);
             }
           }
         }

@@ -2,6 +2,7 @@
 #include "reed_solomon.h"
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -17,6 +18,10 @@ bool process_carrier_read(
   std::map<uint64_t, RsPending>& rs_pending,
   uint64_t& next_deliver_id,
   const ReceiveCallbacks& callbacks) {
+  auto now_ns = []() -> uint64_t {
+    return static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+  };
   while (s.read_buf.size() >= sizeof(PacketHeader)) {
     const auto* h = reinterpret_cast<const PacketHeader*>(s.read_buf.data());
     if (h->packet_kind == PacketKind::PING) {
@@ -47,13 +52,15 @@ bool process_carrier_read(
       size_t total = sizeof(PacketHeader) + sizeof(uint16_t) + size;
       if (s.read_buf.size() < total) break;
       uint64_t id = h->id;
-      if (id >= next_deliver_id && !reassembly.count(id))
+      if (id >= next_deliver_id && !reassembly.count(id)) {
         reassembly[id].assign(p->data, p->data + size);
+        s.last_recv_ns = now_ns();
+      }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total);
       while (reassembly.count(next_deliver_id)) {
         std::vector<uint8_t>& vec = reassembly[next_deliver_id];
         if (callbacks.on_deliver)
-          callbacks.on_deliver(next_deliver_id, vec.data(), vec.size());
+          callbacks.on_deliver(fd, next_deliver_id, vec.data(), vec.size());
         reassembly.erase(next_deliver_id);
         next_deliver_id++;
       }
@@ -116,8 +123,10 @@ bool process_carrier_read(
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
         continue;
       }
-      if (!rp.shards.count(idx))
+      if (!rp.shards.count(idx)) {
         rp.shards[idx].assign(prs->data, prs->data + block_sz);
+        s.last_recv_ns = now_ns();
+      }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
       if (rp.shards.size() >= static_cast<size_t>(k)) {
         std::vector<const uint8_t*> recv_ptrs(k);
@@ -144,7 +153,7 @@ bool process_carrier_read(
         while (reassembly.count(next_deliver_id)) {
           std::vector<uint8_t>& vec = reassembly[next_deliver_id];
           if (callbacks.on_deliver)
-            callbacks.on_deliver(next_deliver_id, vec.data(), vec.size());
+            callbacks.on_deliver(fd, next_deliver_id, vec.data(), vec.size());
           reassembly.erase(next_deliver_id);
           next_deliver_id++;
         }

@@ -170,17 +170,16 @@ int run_server(const Args& args) {
   size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   float runtime_rs_redundancy = args.config.rs_redundancy;
   unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
-  bool runtime_auto_adapt = true;  // from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
+  bool runtime_auto_adapt = false;  // set from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
   float last_sent_rs_redundancy = -1.0f;
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
   const uint64_t adapt_interval_ns = 300 * 1000000ULL;
-  const uint64_t high_rtt_threshold_ns = 200 * 1000000ULL;
+
   const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;
   const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;
   unsigned next_carrier_for_rs = 0;
   size_t next_carrier_for_small = 0;  // round-robin for small-packet redundancy
-  size_t next_ack_carrier = 0;        // round-robin for sending ACK to client (one carrier only)
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
   auto now_ns = []() {
@@ -287,12 +286,14 @@ int run_server(const Args& args) {
   };
 
   // Delivered data is queued here; we write to backend and ACK when a chunk is fully written.
-  std::deque<std::pair<uint64_t, std::vector<uint8_t>>> backend_pending;
+  // completing_fd is the carrier that triggered delivery — ACK goes back there for per-carrier RTT measurement.
+  struct BackendItem { uint64_t id; std::vector<uint8_t> data; int completing_fd; };
+  std::deque<BackendItem> backend_pending;
 
   auto flush_backend_pending = [&]() {
     if (backend_fd < 0 || !backend_connected || backend_pending.empty()) return;
     auto& front = backend_pending.front();
-    ssize_t n = write(backend_fd, front.second.data(), front.second.size());
+    ssize_t n = write(backend_fd, front.data.data(), front.data.size());
     if (n <= 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         ev.events = EPOLLIN | EPOLLOUT;
@@ -301,20 +302,20 @@ int run_server(const Args& args) {
       }
       return;
     }
-    front.second.erase(front.second.begin(), front.second.begin() + n);
-    if (front.second.empty()) {
-      uint64_t acked_id = front.first;
+    front.data.erase(front.data.begin(), front.data.begin() + n);
+    if (front.data.empty()) {
+      uint64_t acked_id = front.id;
+      int cfd = front.completing_fd;
       backend_pending.pop_front();
       if (backend_pending.empty()) {
         ev.events = EPOLLIN;
         ev.data.fd = backend_fd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
       }
+      // ACK on the completing carrier: gives the client accurate per-carrier RTT with no extra packets.
+      // Fall back to any available carrier if completing_fd was already closed.
       if (!carriers.empty()) {
-        auto it = carriers.begin();
-        std::advance(it, next_ack_carrier % carriers.size());
-        next_ack_carrier++;
-        int cfd = it->first;
+        if (!carriers.count(cfd)) cfd = carriers.begin()->first;
         queue_ack_to_carrier(cfd, acked_id);
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = cfd;
@@ -324,8 +325,8 @@ int run_server(const Args& args) {
   };
 
   packet_io::ReceiveCallbacks recv_cb;
-  recv_cb.on_deliver = [&](uint64_t id, const uint8_t* data, size_t len) {
-    backend_pending.push_back({id, std::vector<uint8_t>(data, data + len)});
+  recv_cb.on_deliver = [&](int cfd, uint64_t id, const uint8_t* data, size_t len) {
+    backend_pending.push_back({id, std::vector<uint8_t>(data, data + len), cfd});
     connect_backend();
     if (backend_fd >= 0 && backend_connected) {
       ev.events = EPOLLIN | EPOLLOUT;
@@ -338,8 +339,11 @@ int run_server(const Args& args) {
     auto it = ack_send_time_ns.find(acked_id);
     if (it != ack_send_time_ns.end()) {
       uint64_t rtt = now_ns() - it->second;
-      server_recent_rtt_ns.push_back(rtt);
-      while (server_recent_rtt_ns.size() > max_server_recent_rtt) server_recent_rtt_ns.pop_front();
+      // Sanity check: discard clearly-bogus values (> 60s); wrap-around produces ~1.8e19 ns.
+      if (rtt < 60000000000ULL) {
+        server_recent_rtt_ns.push_back(rtt);
+        while (server_recent_rtt_ns.size() > max_server_recent_rtt) server_recent_rtt_ns.pop_front();
+      }
     }
     for (auto it_m = ack_send_time_ns.begin(); it_m != ack_send_time_ns.end(); )
       if (it_m->first <= acked_id) it_m = ack_send_time_ns.erase(it_m);
@@ -452,11 +456,11 @@ int run_server(const Args& args) {
       last_adapt_ns = now_ns_val;
       uint64_t max_rtt = 0;
       for (uint64_t r : server_recent_rtt_ns) if (r > max_rtt) max_rtt = r;
-      if (max_rtt > high_rtt_threshold_ns) {
-        float inc = (max_rtt > very_high_rtt_ns) ? 0.25f : 0.15f;
-        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + inc);
-        unsigned inc_small = (max_rtt > very_high_rtt_ns) ? 3u : 2u;
-        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + inc_small);
+      // Only increase redundancy when RTT indicates a genuine TCP stall (> 1s), not just high latency.
+      // A link with 200ms one-way delay has ~400ms RTT permanently; we shouldn't ramp for that.
+      if (max_rtt > very_high_rtt_ns) {
+        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.25f);
+        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 3u);
       } else if (max_rtt < low_rtt_threshold_ns) {
         runtime_rs_redundancy = std::max(0.2f, runtime_rs_redundancy - 0.05f);
         runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);

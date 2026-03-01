@@ -16,13 +16,14 @@ namespace packet_io {
 const size_t MAX_PACKET_PAYLOAD = 65536;
 const size_t READ_BUF_SIZE = 65536;
 
-// Per-carrier connection state. Client may set connecting and last_rtt_ns.
+// Per-carrier connection state.
 struct CarrierState {
   std::vector<uint8_t> read_buf;
   std::vector<uint8_t> write_buf;
   size_t write_pos = 0;
-  bool connecting = false;   // client: true until connect() completes
-  uint64_t last_rtt_ns = 0;  // client: last RTT from ACK
+  bool connecting = false;    // client: true until connect() completes
+  uint64_t last_rtt_ns = 0;   // last RTT measured via ACK on this carrier
+  uint64_t last_recv_ns = 0;  // last time any data shard arrived on this carrier
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -35,8 +36,9 @@ struct RsPending {
 
 // Callbacks used when processing received packets. Set only the ones you need.
 struct ReceiveCallbacks {
-  // Delivered contiguous data (id, data, len). Server writes to backend and queues ACK; client writes to stdout.
-  std::function<void(uint64_t id, const uint8_t* data, size_t len)> on_deliver;
+  // Delivered contiguous data. completing_fd is the carrier whose shard triggered delivery (use for ACK).
+  // Server writes to backend and queues ACK on completing_fd; client writes to stdout and ACKs on completing_fd.
+  std::function<void(int completing_fd, uint64_t id, const uint8_t* data, size_t len)> on_deliver;
   // Client -> server PING; server should send PONG. Server -> client PING; client should send PONG.
   std::function<void(int fd, uint64_t id)> on_ping;
   // PONG received (response to our PING). Caller may record RTT (e.g. server measures server→client path).
