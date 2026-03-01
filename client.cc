@@ -1,4 +1,5 @@
 #include "ssholl.h"
+#include "packet_io.h"
 #include "reed_solomon.h"
 #include <algorithm>
 #include <cerrno>
@@ -22,8 +23,10 @@ namespace ssholl {
 
 namespace {
 
-const size_t MAX_PACKET_PAYLOAD = 65536;
-const size_t READ_BUF_SIZE = 65536;
+using packet_io::CarrierState;
+using packet_io::RsPending;
+using packet_io::MAX_PACKET_PAYLOAD;
+using packet_io::READ_BUF_SIZE;
 
 void set_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -111,22 +114,6 @@ int get_so_error(int fd) {
   socklen_t len = sizeof err;
   return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 ? err : -1;
 }
-
-struct CarrierState {
-  std::vector<uint8_t> read_buf;
-  std::vector<uint8_t> write_buf;
-  size_t write_pos = 0;
-  bool connecting = true;
-  uint64_t last_rtt_ns = 0;  // last measured RTT for this link (from ACK)
-};
-
-// Per-id state when collecting Reed-Solomon shards.
-struct RsPending {
-  unsigned n = 0;
-  unsigned k = 0;
-  size_t block_size = 0;
-  std::map<unsigned, std::vector<uint8_t>> shards;
-};
 
 }  // namespace
 
@@ -266,14 +253,7 @@ int run_client(const Args& args) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
     carrier_pending_acks[fd].emplace_back(next_send_id, now_ns());
-    CarrierState& s = it->second;
-    PacketHeader h{};
-    h.id = next_send_id;
-    h.packet_kind = PacketKind::SMALL;
-    uint16_t size = static_cast<uint16_t>(len);
-    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
-    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
-    s.write_buf.insert(s.write_buf.end(), data, data + len);
+    packet_io::append_small(it->second.write_buf, next_send_id, data, len);
     if (!same_id)
       next_send_id++;
   };
@@ -282,16 +262,7 @@ int run_client(const Args& args) {
   auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
-    CarrierState& s = it->second;
-    PacketConfig pc{};
-    pc.header.id = 0;
-    pc.header.packet_kind = PacketKind::SET_CONFIG;
-    pc.packet_size = pkt_size;
-    pc.small_packet_redundancy = small_red;
-    pc.max_delay_ms = max_delay_ms;
-    pc.reed_solomon_redundancy = rs_red;
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(&pc);
-    s.write_buf.insert(s.write_buf.end(), p, p + sizeof pc);
+    packet_io::append_config(it->second.write_buf, pkt_size, small_red, max_delay_ms, rs_red);
   };
 
   // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
@@ -299,58 +270,45 @@ int run_client(const Args& args) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
     carrier_pending_acks[fd].emplace_back(next_send_id, now_ns());
-    CarrierState& s = it->second;
-    PacketHeader h{};
-    h.id = next_send_id;
-    h.packet_kind = PacketKind::REED_SOLOMON;
-    uint16_t size = block_size;
-    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
-    s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
-    s.write_buf.push_back(static_cast<uint8_t>(n));
-    s.write_buf.push_back(static_cast<uint8_t>(k));
-    s.write_buf.push_back(static_cast<uint8_t>(shard_index));
-    s.write_buf.insert(s.write_buf.end(), shard_data, shard_data + block_size);
+    packet_io::append_rs_shard(it->second.write_buf, next_send_id, n, k, block_size, shard_index, shard_data);
   };
 
   auto flush_stdout = [&]() {
     while (!stdout_buf.empty()) {
       ssize_t n = write(STDOUT_FILENO, stdout_buf.data(), stdout_buf.size());
       if (n <= 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          ev.events = EPOLLOUT;
+          ev.data.fd = STDOUT_FILENO;
+          epoll_ctl(epfd, EPOLL_CTL_ADD, STDOUT_FILENO, &ev);
+          return;
+        }
         break;
       }
       stdout_buf.erase(stdout_buf.begin(), stdout_buf.begin() + n);
     }
   };
 
-  auto deliver_to_stdout = [&]() {
-    while (reassembly.count(next_deliver_id)) {
-      std::vector<uint8_t>& vec = reassembly[next_deliver_id];
-      while (!vec.empty()) {
-        if (stdout_buf.empty()) {
-          ssize_t n = write(STDOUT_FILENO, vec.data(), vec.size());
-          if (n <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              stdout_buf.insert(stdout_buf.end(), vec.begin(), vec.end());
-              vec.clear();
-              ev.events = EPOLLOUT;
-              ev.data.fd = STDOUT_FILENO;
-              epoll_ctl(epfd, EPOLL_CTL_ADD, STDOUT_FILENO, &ev);
-              reassembly.erase(next_deliver_id);
-              next_deliver_id++;
-              return;
-            }
-            break;
-          }
-          vec.erase(vec.begin(), vec.begin() + n);
-        } else {
-          flush_stdout();
-          if (!stdout_buf.empty()) return;
-        }
-      }
-      if (vec.empty()) {
-        reassembly.erase(next_deliver_id);
-        next_deliver_id++;
+  packet_io::ReceiveCallbacks recv_cb;
+  recv_cb.on_deliver = [&](uint64_t, const uint8_t* data, size_t len) {
+    stdout_buf.insert(stdout_buf.end(), data, data + len);
+  };
+  recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
+    auto it_p = carrier_pending_acks.find(fd);
+    if (it_p == carrier_pending_acks.end()) return;
+    uint64_t rtt_ns = 0;
+    const uint64_t recv_time = now_ns();
+    auto& q = it_p->second;
+    while (!q.empty() && q.front().first <= acked_id) {
+      rtt_ns = recv_time - q.front().second;
+      q.pop_front();
+    }
+    if (rtt_ns != 0) {
+      auto it_c = carriers.find(fd);
+      if (it_c != carriers.end()) it_c->second.last_rtt_ns = rtt_ns;
+      if (args.config.auto_adapt) {
+        recent_rtt_ns.push_back(rtt_ns);
+        while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
       }
     }
   };
@@ -364,154 +322,14 @@ int run_client(const Args& args) {
       return true;
     }
     s.read_buf.insert(s.read_buf.end(), buf, buf + n);
-
-    while (s.read_buf.size() >= sizeof(PacketHeader)) {
-      const auto* h = reinterpret_cast<const PacketHeader*>(s.read_buf.data());
-      if (h->packet_kind == PacketKind::ACK) {
-        uint64_t acked_id = h->id;
-        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
-        auto it_p = carrier_pending_acks.find(fd);
-        if (it_p != carrier_pending_acks.end()) {
-          uint64_t rtt_ns = 0;
-          const uint64_t recv_time = now_ns();
-          auto& q = it_p->second;
-          while (!q.empty() && q.front().first <= acked_id) {
-            rtt_ns = recv_time - q.front().second;
-            q.pop_front();
-          }
-          if (rtt_ns != 0) {
-            s.last_rtt_ns = rtt_ns;
-            if (args.config.auto_adapt) {
-              recent_rtt_ns.push_back(rtt_ns);
-              while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
-            }
-          }
-        }
-        continue;
-      }
-      if (h->packet_kind == PacketKind::PONG) {
-        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
-        continue;
-      }
-      if (h->packet_kind == PacketKind::SMALL) {
-        if (s.read_buf.size() < sizeof(PacketSmall)) break;
-        const auto* p = reinterpret_cast<const PacketSmall*>(s.read_buf.data());
-        uint16_t size = p->size;
-        if (size > MAX_PACKET_PAYLOAD) {
-          s.read_buf.clear();
-          break;
-        }
-        size_t total = sizeof(PacketHeader) + sizeof(uint16_t) + size;
-        if (s.read_buf.size() < total) break;
-        uint64_t id = h->id;
-        if (id >= next_deliver_id && !reassembly.count(id))
-          reassembly[id].assign(p->data, p->data + size);
-        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total);
-        deliver_to_stdout();
-        continue;
-      }
-      if (h->packet_kind == PacketKind::SET_CONFIG || h->packet_kind == PacketKind::START_CONNECTION) {
-        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
-        continue;
-      }
-      if (h->packet_kind == PacketKind::REED_SOLOMON) {
-        const size_t rs_fixed = sizeof(PacketHeader) + sizeof(uint16_t) + 3;  // +3 for n, k, shard_index
-        if (s.read_buf.size() < rs_fixed) break;
-        uint16_t block_sz = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
-        const auto* prs = reinterpret_cast<const PacketReedSolomon*>(s.read_buf.data());
-        size_t total_rs = rs_fixed + block_sz;
-        if (block_sz == 0 || block_sz > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
-        uint64_t id = h->id;
-        unsigned n = prs->n, k = prs->k;
-        if (id < next_deliver_id) {
-          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
-          continue;
-        }
-        if (n == 0 || k == 0 || k >= n || n > 256) {
-          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
-          continue;
-        }
-        RsPending& rp = rs_pending[id];
-        if (rp.k == 0) {
-          rp.n = n;
-          rp.k = k;
-          rp.block_size = block_sz;
-        }
-        if (rp.n != n || rp.k != k || rp.block_size != block_sz) {
-          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
-          continue;
-        }
-        unsigned idx = prs->shard_index;
-        if (idx >= n) {
-          s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
-          continue;
-        }
-        if (!rp.shards.count(idx))
-          rp.shards[idx].assign(prs->data, prs->data + block_sz);
-        s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
-        if (rp.shards.size() >= k) {
-          std::vector<const uint8_t*> recv_ptrs(k);
-          std::vector<unsigned> recv_indices(k);
-          unsigned fi = 0;
-          for (auto& [shard_idx, vec] : rp.shards) {
-            if (fi >= k) break;
-            recv_ptrs[fi] = vec.data();
-            recv_indices[fi] = shard_idx;
-            fi++;
-          }
-          if (fi < k) continue;
-          std::vector<std::vector<uint8_t>> out_shards(k, std::vector<uint8_t>(rp.block_size));
-          std::vector<uint8_t*> out_ptrs(k);
-          for (unsigned i = 0; i < k; ++i) out_ptrs[i] = out_shards[i].data();
-          if (reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
-            if (!reassembly.count(id)) {
-              reassembly[id].clear();
-              for (unsigned i = 0; i < k; ++i)
-                reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
-            }
-          }
-          rs_pending.erase(id);
-          deliver_to_stdout();
-        }
-        continue;
-      }
-      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
-    }
-    return true;
+    return packet_io::process_carrier_read(fd, s, reassembly, rs_pending, next_deliver_id, recv_cb);
   };
 
   auto flush_carrier_writes = [&]() {
-    for (auto it = carriers.begin(); it != carriers.end(); ) {
-      int fd = it->first;
-      CarrierState& s = it->second;
-      if (s.connecting) { ++it; continue; }
-      while (s.write_pos < s.write_buf.size()) {
-        ssize_t n = write(fd, s.write_buf.data() + s.write_pos, s.write_buf.size() - s.write_pos);
-        if (n <= 0) {
-          if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = fd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-            break;
-          }
-          close(fd);
-          epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-          carrier_pending_acks.erase(fd);
-          it = carriers.erase(it);
-          goto next;
-        }
-        s.write_pos += n;
-      }
-      if (s.write_pos >= s.write_buf.size()) {
-        s.write_buf.clear();
-        s.write_pos = 0;
-        ev.events = EPOLLIN;
-        ev.data.fd = fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-      }
-      ++it;
-      next:;
-    }
+    packet_io::flush_carrier_writes(carriers, epfd, ev, [](int, const CarrierState& s) { return s.connecting; });
+    for (auto it = carrier_pending_acks.begin(); it != carrier_pending_acks.end(); )
+      if (carriers.count(it->first) == 0) it = carrier_pending_acks.erase(it);
+      else ++it;
   };
 
   std::vector<struct epoll_event> events(64);
@@ -658,7 +476,7 @@ int run_client(const Args& args) {
     }
 
     flush_carrier_writes();
-    deliver_to_stdout();
+    flush_stdout();
 
     // Try to complete pending SSH carrier connections
     for (auto it = pending_carrier_paths.begin(); it != pending_carrier_paths.end(); ) {
