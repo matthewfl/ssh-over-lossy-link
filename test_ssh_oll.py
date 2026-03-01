@@ -60,28 +60,36 @@ def unix_listen(path):
     return sock
 
 
-def _relay_reader(sock_from, queue, stop_event):
+def _relay_reader(sock_from, queue, stop_event, debug_label=None):
     """Read from sock_from and put chunks in queue. Runs until EOF or stop_event."""
     try:
         while not stop_event.is_set():
             data = sock_from.recv(65536)
             if not data:
                 break
-            queue.put((data, None))
+            ts = time.perf_counter()
+            queue.put((data, ts))
+            if debug_label:
+                import sys
+                print(f"[proxy-debug] {debug_label} read {len(data)} bytes at {ts:.4f}", file=sys.stderr, flush=True)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
     finally:
         queue.put((b"", None))  # EOF sentinel
 
 
-def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kill_callback=None):
+def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kill_callback=None, debug_label=None):
     """Pop chunks from queue, apply delay_spec, send to sock_to. Runs until EOF sentinel.
     If death_probability > 0 and kill_callback is set, each chunk has that probability of killing the connection.
+
+    Delay is applied relative to each chunk's arrival time (read_ts), not relative to when it is
+    dequeued. This prevents head-of-line blocking: a tiny ACK packet that arrives just before a
+    large RS-shard burst will not cause the shards to wait an extra full delay period.
     """
     try:
         while not stop_event.is_set():
             try:
-                data, _ = q.get(timeout=0.5)
+                data, read_ts = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             if not data:
@@ -91,7 +99,18 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
                 return
             delay = delay_spec() if callable(delay_spec) else delay_spec
             if delay > 0:
-                time.sleep(delay)
+                if read_ts is not None:
+                    # Schedule delivery at arrival_time + delay; any queue-wait time is already
+                    # "used up", so we only sleep for the remainder.
+                    sleep_for = (read_ts + delay) - time.perf_counter()
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                else:
+                    time.sleep(delay)
+            if debug_label and read_ts is not None:
+                import sys
+                actual_delay = time.perf_counter() - read_ts
+                print(f"[proxy-debug] {debug_label} sending {len(data)} bytes actual_delay={actual_delay*1000:.1f}ms", file=sys.stderr, flush=True)
             sock_to.sendall(data)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
@@ -124,7 +143,7 @@ def _relay_zero_latency(sock_from, sock_to, death_probability=0.0, kill_callback
             pass
 
 
-def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, kill_callback=None):
+def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, kill_callback=None, debug_label=None):
     """Read from sock_from, optionally delay, write to sock_to. Stops on EOF/error.
 
     When delay_spec is 0 (constant), uses a direct relay. Otherwise uses a queue and
@@ -139,11 +158,11 @@ def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, ki
         return
     q = queue.Queue()
     stop = threading.Event()
-    reader = threading.Thread(target=_relay_reader, args=(sock_from, q, stop), daemon=True)
+    reader = threading.Thread(target=_relay_reader, args=(sock_from, q, stop), kwargs={"debug_label": debug_label}, daemon=True)
     sender = threading.Thread(
         target=_relay_sender,
         args=(sock_to, q, delay_spec, stop),
-        kwargs={"death_probability": death_probability, "kill_callback": kill_callback},
+        kwargs={"death_probability": death_probability, "kill_callback": kill_callback, "debug_label": debug_label},
         daemon=True,
     )
     reader.start()
@@ -175,7 +194,17 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
         except OSError:
             pass
 
+    import threading as _threading
+    _conn_id = getattr(_threading.current_thread(), '_proxy_conn_id', None)
+    if _conn_id is None:
+        import itertools as _it
+        _counter = getattr(proxy_connection, '_counter', None)
+        if _counter is None:
+            proxy_connection._counter = _it.count()
+        _conn_id = next(proxy_connection._counter)
+        _threading.current_thread()._proxy_conn_id = _conn_id
     relay_kw = {"death_probability": connection_death_probability, "kill_callback": kill_connection}
+    debug_s2c = f"s→c conn#{_conn_id}" if _conn_id == 0 else None
     try:
         t1 = threading.Thread(
             target=relay_with_latency,
@@ -186,7 +215,7 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
         t2 = threading.Thread(
             target=relay_with_latency,
             args=(server_conn, client_conn, delay_spec),
-            kwargs=relay_kw,
+            kwargs={**relay_kw, "debug_label": debug_s2c},
             daemon=True,
         )
         t1.start()
@@ -304,10 +333,14 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
+    run_c2t = not getattr(args, 'continuous_tcp_to_client_only', False)
+    run_t2c = not getattr(args, 'continuous_client_to_tcp_only', False)
     t1 = threading.Thread(target=client_to_tcp, daemon=True)
     t2 = threading.Thread(target=tcp_to_client, daemon=True)
-    t1.start()
-    t2.start()
+    if run_c2t:
+        t1.start()
+    if run_t2c:
+        t2.start()
 
     try:
         if args.continuous_duration is not None:
@@ -493,6 +526,12 @@ def main():
         help="In --continuous mode, run for this many seconds then exit. Default: run until Ctrl+C.",
     )
     parser.add_argument(
+        "--extra-client-args",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Extra arguments passed directly to the ssh-oll client process",
+    )
+    parser.add_argument(
         "--continuous-min-size",
         type=int,
         default=64,
@@ -503,6 +542,18 @@ def main():
         type=int,
         default=4096,
         help="In --continuous mode, maximum payload size in bytes. Default 4096",
+    )
+    parser.add_argument(
+        "--continuous-tcp-to-client-only",
+        action="store_true",
+        default=False,
+        help="In --continuous mode, only run the TCP→client direction (suppress client→TCP)",
+    )
+    parser.add_argument(
+        "--continuous-client-to-tcp-only",
+        action="store_true",
+        default=False,
+        help="In --continuous mode, only run the client→TCP direction (suppress TCP→client)",
     )
     args = parser.parse_args()
 
@@ -588,16 +639,19 @@ def main():
     proxy_thread.start()
 
     # 4. Start client with --unix-socket-connection
+    client_cmd = [
+        args.ssh_oll_path,
+        "--unix-socket-connection",
+        proxy_path,
+        "--connections",
+        str(args.connections),
+        "--packet-size",
+        str(min(args.packet_size, args.payload_size)),
+    ]
+    if args.extra_client_args:
+        client_cmd += args.extra_client_args
     client_proc = subprocess.Popen(
-        [
-            args.ssh_oll_path,
-            "--unix-socket-connection",
-            proxy_path,
-            "--connections",
-            str(args.connections),
-            "--packet-size",
-            str(min(args.packet_size, args.payload_size)),
-        ],
+        client_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

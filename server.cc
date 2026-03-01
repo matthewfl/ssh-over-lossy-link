@@ -176,8 +176,12 @@ int run_server(const Args& args) {
   uint64_t last_adapt_ns = 0;
   const uint64_t adapt_interval_ns = 300 * 1000000ULL;
 
-  const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;
-  const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;
+  // Fraction-slow thresholds: what fraction of recent RTT samples are significantly
+  // above the minimum (fast-path floor) before we increase/decrease redundancy.
+  static constexpr float kFractionSlowIncreaseFast   = 0.05f;  // >5% slow → big increase
+  static constexpr float kFractionSlowIncreaseMedium = 0.01f;  // >1% slow → medium increase
+  static constexpr float kFractionSlowDecrease       = 0.002f; // <0.2% slow → decrease
+  static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 samples
   unsigned next_carrier_for_rs = 0;
   size_t next_carrier_for_small = 0;  // round-robin for small-packet redundancy
 
@@ -452,18 +456,33 @@ int run_server(const Args& args) {
 
     const uint64_t now_ns_val = now_ns();
     // When auto_adapt, server manages its own redundancy and informs the client.
-    if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns && !server_recent_rtt_ns.empty()) {
+    if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns
+        && server_recent_rtt_ns.size() >= kMinSamplesForAdapt) {
       last_adapt_ns = now_ns_val;
-      uint64_t max_rtt = 0;
-      for (uint64_t r : server_recent_rtt_ns) if (r > max_rtt) max_rtt = r;
-      // Only increase redundancy when RTT indicates a genuine TCP stall (> 1s), not just high latency.
-      // A link with 200ms one-way delay has ~400ms RTT permanently; we shouldn't ramp for that.
-      if (max_rtt > very_high_rtt_ns) {
-        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.25f);
-        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 3u);
-      } else if (max_rtt < low_rtt_threshold_ns) {
-        runtime_rs_redundancy = std::max(0.2f, runtime_rs_redundancy - 0.05f);
-        runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
+      // Compute min-gap metric: what fraction of recent RTTs are significantly above
+      // the fast-path floor?  The 10th-percentile acts as a robust "minimum achievable
+      // RTT" estimate (insensitive to a few extreme outliers skewing the sample).
+      std::vector<uint64_t> sorted_rtt(server_recent_rtt_ns.begin(), server_recent_rtt_ns.end());
+      std::sort(sorted_rtt.begin(), sorted_rtt.end());
+      size_t p10_idx = std::max(size_t{0}, sorted_rtt.size() / 10);
+      uint64_t min_rtt = sorted_rtt[p10_idx];
+      // Only adapt when min_rtt is in a plausible range (1ms..30s).
+      if (min_rtt > 1000000ULL && min_rtt < 30000000000ULL) {
+        uint64_t slow_thr = min_rtt * 2;  // packets taking >2× the fast floor are "slow"
+        size_t n_slow = 0;
+        for (uint64_t r : server_recent_rtt_ns) if (r > slow_thr) n_slow++;
+        float fraction_slow = static_cast<float>(n_slow) / static_cast<float>(server_recent_rtt_ns.size());
+
+        if (fraction_slow > kFractionSlowIncreaseFast) {
+          runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.5f);
+          runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 3u);
+        } else if (fraction_slow > kFractionSlowIncreaseMedium) {
+          runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.25f);
+          runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 1u);
+        } else if (fraction_slow < kFractionSlowDecrease && sorted_rtt.size() >= 30) {
+          runtime_rs_redundancy = std::max(0.2f, runtime_rs_redundancy - 0.05f);
+          runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
+        }
       }
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
@@ -510,6 +529,14 @@ int run_server(const Args& args) {
           ack_send_time_ns[next_send_id] = now_ns();
           next_send_id++;
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
+          // Send any sub-block_size remainder immediately in the same flush cycle.
+          // Without this the remainder sits in backend_read_buf until the next epoll event
+          // (typically the client's ACK, ~RTT later), stacking an extra delay on top of the
+          // data that was just encoded.
+          if (!backend_read_buf.empty()) {
+            queue_small_to_carriers(backend_read_buf.data(), backend_read_buf.size());
+            backend_read_buf.clear();
+          }
         } else {
           // Chunk < block_size: send as SMALL with small_packet_redundancy copies (no Reed–Solomon).
           size_t chunk = std::min(backend_read_buf.size(), block_size);

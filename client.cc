@@ -213,9 +213,12 @@ int run_client(const Args& args) {
   const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
-  const uint64_t high_rtt_threshold_ns = 200 * 1000000ULL;   // 200ms -> increase redundancy / add carriers
-  const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;         // 1s -> aggressive ramp
-  const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;      // 80ms -> decrease redundancy
+  const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;  // used for per-carrier outlier detection
+  // Fraction-slow thresholds (mirrors server.cc constants).
+  static constexpr float kFractionSlowIncreaseFast   = 0.05f;
+  static constexpr float kFractionSlowIncreaseMedium = 0.01f;
+  static constexpr float kFractionSlowDecrease       = 0.002f;
+  static constexpr size_t kMinSamplesForAdapt = 20;
   uint64_t backpressure_write_threshold = 150 * effective_max_packet;  // updated when effective_max_packet changes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
@@ -539,18 +542,27 @@ int run_client(const Args& args) {
       }
     } else if (!carriers.empty()) {
       const uint64_t now = now_ns();
-      if (now - last_adapt_ns >= adapt_interval_ns && (!recent_rtt_ns.empty() || server_reported_max_rtt_ns != 0)) {
+      if (now - last_adapt_ns >= adapt_interval_ns && recent_rtt_ns.size() >= kMinSamplesForAdapt) {
         last_adapt_ns = now;
-        uint64_t max_rtt = server_reported_max_rtt_ns;
-        for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
-        if (max_rtt > high_rtt_threshold_ns) {
-          float inc = (max_rtt > very_high_rtt_ns) ? 0.25f : 0.15f;
-          effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + inc);
-          unsigned inc_small = (max_rtt > very_high_rtt_ns) ? 3u : 2u;
-          effective_small_packet_redundancy = std::min(20u, effective_small_packet_redundancy + inc_small);
-        } else if (max_rtt < low_rtt_threshold_ns) {
-          effective_rs_redundancy = std::max(0.2f, effective_rs_redundancy - 0.05f);
-          effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
+        std::vector<uint64_t> sorted_rtt(recent_rtt_ns.begin(), recent_rtt_ns.end());
+        std::sort(sorted_rtt.begin(), sorted_rtt.end());
+        size_t p10_idx = std::max(size_t{0}, sorted_rtt.size() / 10);
+        uint64_t min_rtt = sorted_rtt[p10_idx];
+        if (min_rtt > 1000000ULL && min_rtt < 30000000000ULL) {
+          uint64_t slow_thr = min_rtt * 2;
+          size_t n_slow = 0;
+          for (uint64_t r : recent_rtt_ns) if (r > slow_thr) n_slow++;
+          float fraction_slow = static_cast<float>(n_slow) / static_cast<float>(recent_rtt_ns.size());
+          if (fraction_slow > kFractionSlowIncreaseFast) {
+            effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + 0.5f);
+            effective_small_packet_redundancy = std::min(20u, effective_small_packet_redundancy + 3u);
+          } else if (fraction_slow > kFractionSlowIncreaseMedium) {
+            effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + 0.25f);
+            effective_small_packet_redundancy = std::min(20u, effective_small_packet_redundancy + 1u);
+          } else if (fraction_slow < kFractionSlowDecrease && sorted_rtt.size() >= 30) {
+            effective_rs_redundancy = std::max(0.2f, effective_rs_redundancy - 0.05f);
+            effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
+          }
         }
       }
       if (effective_rs_redundancy != last_sent_rs_redundancy || effective_small_packet_redundancy != last_sent_small_packet_redundancy) {
@@ -597,19 +609,38 @@ int run_client(const Args& args) {
         }
       }
 
+      // Fraction-slow: measure how many recent RTTs are significantly above the fast-path
+      // floor. When fraction_slow is high, extra carriers help by providing more independent
+      // paths for Reed-Solomon to exploit — even if no single carrier is a clear outlier.
+      // Cap fraction_slow-based carrier additions at min_carriers_floor*3 so we don't
+      // open an unbounded number of carriers for a uniformly slow link.
+      float fraction_slow_global = 0.0f;
+      if (recent_rtt_ns.size() >= kMinSamplesForAdapt) {
+        std::vector<uint64_t> sorted_g(recent_rtt_ns.begin(), recent_rtt_ns.end());
+        std::sort(sorted_g.begin(), sorted_g.end());
+        uint64_t min_rtt_g = sorted_g[std::max(size_t{0}, sorted_g.size() / 10)];
+        if (min_rtt_g > 1000000ULL && min_rtt_g < 30000000000ULL) {
+          uint64_t slow_thr_g = min_rtt_g * 2;
+          size_t n_slow_g = 0;
+          for (uint64_t r : recent_rtt_ns) if (r > slow_thr_g) n_slow_g++;
+          fraction_slow_global = static_cast<float>(n_slow_g) / static_cast<float>(recent_rtt_ns.size());
+        }
+      }
+      bool link_needs_more_paths = (fraction_slow_global > kFractionSlowIncreaseMedium
+                                    && carriers.size() < min_carriers_floor * 3u);
+
       // Carrier addition: when a carrier is stalled (clear RTT outlier), allow an add after
       // reap_check_interval_ns so the reap logic has time to run before we add another.
-      // For backpressure (write buffers full) use the normal 100ms add interval.
-      // We deliberately do NOT trigger carrier addition based on server_reported_max_rtt_ns
-      // alone: that is a global signal (all carriers share it) and cannot distinguish one
-      // stalled carrier from general congestion. High server-side RTT is handled by the
-      // server increasing RS redundancy; the client only adds carriers for per-carrier stalls.
+      // For backpressure or fraction_slow-based additions use the normal 100ms add interval.
+      // All triggers share the same cap (min_carriers_floor * 3) to prevent unbounded growth:
+      // the reap-and-replace pattern for rtt_outlier works within that budget.
+      bool within_carrier_cap = (carriers.size() < min_carriers_floor * 3u);
       uint64_t add_interval = add_carrier_interval_ns;
-      if (rtt_outlier)
+      if (rtt_outlier && within_carrier_cap)
         add_interval = reap_check_interval_ns;  // at most one add per reap cycle when replacing a stall
 
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
-        bool need_more = (total_write > backpressure_write_threshold) || rtt_outlier;
+        bool need_more = (total_write > backpressure_write_threshold) || (rtt_outlier && within_carrier_cap) || link_needs_more_paths;
         if (need_more) {
           last_add_carrier_ns = now;
           if (!args.unix_socket_connection.empty()) {
