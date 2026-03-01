@@ -42,24 +42,6 @@ def random_suffix(length=8):
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 
-def _tcp_sendall_cork(sock, data):
-    """Send data so the kernel flushes in one segment (avoids 2× min latency on TCP→client).
-    Uses TCP_CORK on Linux so the server (ssh-oll) gets one read(); otherwise partial reads
-    cause two 50ms proxy batches and ~100ms min instead of ~50ms.
-    """
-    cork = getattr(socket, "TCP_CORK", None)
-    if cork is not None:
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, cork, 1)
-            sock.sendall(data)
-            sock.setsockopt(socket.IPPROTO_TCP, cork, 0)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            sock.sendall(data)
-    else:
-        sock.sendall(data)
-
-
 def tcp_server_listen(port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -634,12 +616,6 @@ def main():
         return 1
 
     tcp_conn = tcp_conn_holder["conn"]
-    # Disable Nagle so TCP→client sendall(payload) is delivered in one shot; otherwise
-    # the server may read in two segments and send two batches, doubling min latency (~100ms vs ~50ms).
-    try:
-        tcp_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
-        pass
     # Longer timeout when injecting latency (each chunk is delayed)
     if args.latency_random:
         # Worst case: every chunk gets high delay
@@ -649,25 +625,10 @@ def main():
         recv_timeout = 30.0 + (args.latency_ms * args.payload_size / max(args.packet_size, 1) * 2 / 1000.0)
     tcp_conn.settimeout(max(30.0, recv_timeout))
 
-    # Drain any data that came from the initial burst (so we start clean for measurements).
-    # With latency injection, trigger bytes can arrive late; we must receive at least
-    # trigger_size bytes before sending warmup, otherwise the first N bytes we read
-    # would be trigger data and we'd get a content mismatch.
-    drain_deadline = time.perf_counter() + (recv_timeout * 0.5)  # use same scale as recv_timeout
-    drained = 0
+    # Drain any data that came from the initial burst (so we start clean for measurements)
     try:
-        while drained < trigger_size and time.perf_counter() < drain_deadline:
-            ready = select.select([tcp_conn], [], [], 0.1)[0]
-            if ready:
-                chunk = tcp_conn.recv(65536)
-                if not chunk:
-                    break
-                drained += len(chunk)
         while select.select([tcp_conn], [], [], 0.1)[0]:
-            chunk = tcp_conn.recv(65536)
-            if not chunk:
-                break
-            drained += len(chunk)
+            tcp_conn.recv(65536)
     except (socket.timeout, BlockingIOError):
         pass
 
@@ -696,7 +657,7 @@ def main():
     if not validate_payload(_got, _warm, "client→TCP (warmup)", None):
         print("Warmup client→TCP payload validation failed.", file=sys.stderr)
     _warm = os.urandom(args.payload_size)
-    _tcp_sendall_cork(tcp_conn, _warm)
+    tcp_conn.sendall(_warm)
     _got = b""
     while len(_got) < len(_warm):
         _got += client_proc.stdout.read(len(_warm) - len(_got))
@@ -733,7 +694,7 @@ def main():
         # Measurement 2: TCP -> client stdout (we send on TCP, read from client)
         payload = os.urandom(args.payload_size)
         t0 = time.perf_counter()
-        _tcp_sendall_cork(tcp_conn, payload)
+        tcp_conn.sendall(payload)
         received = b""
         while len(received) < len(payload):
             chunk = client_proc.stdout.read(len(payload) - len(received))
@@ -794,11 +755,6 @@ def main():
             f"  (random latency: {args.latency_random_pct}% of chunks "
             f"{args.latency_random_high_ms} ms, rest {args.latency_random_low_ms} ms)"
         )
-        if latencies_tcp_to_client and min(latencies_tcp_to_client) >= args.latency_random_low_ms * 1.8:
-            print(
-                f"  (TCP→client min can be ~2× the low delay when the test's send arrives "
-                f"in two TCP segments, so the server sends two batches and the proxy applies two delay steps)"
-            )
     elif args.latency_ms:
         print(f"  (injected proxy latency: {args.latency_ms} ms per direction)")
 
