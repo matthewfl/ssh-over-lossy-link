@@ -413,11 +413,10 @@ int run_client(const Args& args) {
           next_carrier += num_shards;
           stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
         }
-        // Send any remainder smaller than one block as SMALL so we don't wait for EOF.
+        // Send any remainder smaller than one block as SMALL (no Reed–Solomon) with small_packet_redundancy copies.
         if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
           size_t chunk = stdin_buf.size();
-          unsigned small_red = args.config.auto_adapt ? effective_small_packet_redundancy : args.config.small_packet_redundancy;
-          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), small_red));
+          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy));
           for (unsigned i = 0; i < n_copies; ++i) {
             auto it = carriers.begin();
             std::advance(it, (next_carrier + i) % carriers.size());
@@ -480,9 +479,9 @@ int run_client(const Args& args) {
       while (!stdin_buf.empty()) {
         size_t chunk = std::min(stdin_buf.size(), effective_max_packet);
         const bool small_packet = (chunk < effective_max_packet);
-        unsigned small_red = args.config.auto_adapt ? effective_small_packet_redundancy : args.config.small_packet_redundancy;
+        // Small: n_copies = effective_small_packet_redundancy (RTT-adjusted). Full block: 1 copy (RS handles redundancy).
         const unsigned n_copies = small_packet
-            ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), small_red))
+            ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy))
             : 1u;
         for (unsigned i = 0; i < n_copies; ++i) {
           auto it = carriers.begin();

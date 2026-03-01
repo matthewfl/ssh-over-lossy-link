@@ -179,6 +179,7 @@ int run_server(const Args& args) {
   const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;
   const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;
   unsigned next_carrier_for_rs = 0;
+  size_t next_carrier_for_small = 0;  // round-robin for small-packet redundancy
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
   auto now_ns = []() {
@@ -225,13 +226,24 @@ int run_server(const Args& args) {
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
 
-  auto queue_data_to_carriers = [&](const uint8_t* data, size_t len) {
-    if (len == 0) return;
+  // Send small chunk (< block_size) to runtime_small_packet_redundancy carriers only (not Reed–Solomon).
+  auto queue_small_to_carriers = [&](const uint8_t* data, size_t len) {
+    if (len == 0 || carriers.empty()) return;
     ack_send_time_ns[next_send_id] = now_ns();
-    for (auto& [fd, state] : carriers) {
-      (void)fd;
-      packet_io::append_small(state.write_buf, next_send_id, data, len);
+    const unsigned n_copies = std::max(1u, std::min(runtime_small_packet_redundancy, static_cast<unsigned>(carriers.size())));
+    std::vector<int> carrier_fds;
+    for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
+    for (unsigned i = 0; i < n_copies; ++i) {
+      int fd = carrier_fds[(next_carrier_for_small + i) % carrier_fds.size()];
+      auto it = carriers.find(fd);
+      if (it != carriers.end()) {
+        packet_io::append_small(it->second.write_buf, next_send_id, data, len);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+      }
     }
+    next_carrier_for_small += n_copies;
     next_send_id++;
   };
 
@@ -490,13 +502,15 @@ int run_server(const Args& args) {
           next_send_id++;
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
         } else {
+          // Chunk < block_size: send as SMALL with small_packet_redundancy copies (no Reed–Solomon).
           size_t chunk = std::min(backend_read_buf.size(), block_size);
-          queue_data_to_carriers(backend_read_buf.data(), chunk);
+          queue_small_to_carriers(backend_read_buf.data(), chunk);
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
         }
       } else {
+        // Buffered data < block_size: SMALL with small_packet_redundancy copies.
         size_t chunk = backend_read_buf.size();
-        queue_data_to_carriers(backend_read_buf.data(), chunk);
+        queue_small_to_carriers(backend_read_buf.data(), chunk);
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
       }
     }
