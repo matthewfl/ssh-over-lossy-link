@@ -247,6 +247,7 @@ int run_client(const Args& args) {
   uint64_t last_ping_check_ns       = 0;
   uint64_t last_rs_drain_ns         = 0;
   uint64_t last_retransmit_check_ns = 0;
+  uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
   struct epoll_event ev{};
 
@@ -884,6 +885,16 @@ int run_client(const Args& args) {
         }
         for (int cfd : to_kill)
           remove_carrier(cfd);
+
+        // Update global receive timestamp from all live carriers.
+        for (auto& [cfd, cs] : carriers)
+          if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
+
+        // Global idle timeout: if nothing has been received from the server for
+        // 1 min 50 s the connection is dead; exit so the SSH client gets a clean EOF.
+        static constexpr uint64_t CLIENT_GLOBAL_IDLE_NS = 110000000000ULL;  // 1 min 50 s
+        if (now_p - last_global_recv_ns > CLIENT_GLOBAL_IDLE_NS)
+          running = false;
       }
 
       // Timeout-based retransmit: if a send has been unACK'd for > 3s AND we have

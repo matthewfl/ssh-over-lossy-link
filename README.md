@@ -59,11 +59,60 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 
 ## How it works
 
-When `ssh-oll` is started, it opens a connection to the SSH host to launch the server using `ssh lossy-ssh-host "ssh-oll --server localhost 22"`. The server creates a Unix socket such as `/tmp/ssh-oll-server.abc123def` with permissions so only the current user can access it, prints the socket path, then daemonizes and closes the initial SSH connection. The client then opens multiple carrier connections with commands like `ssh -L /tmp/ssh-oll-client.hgi456789/0:/tmp/ssh-oll-server.abc123def lossy-ssh-host`, and so on for each carrier. The client can open up to `--max-connections` sessions; by default the count is adapted automatically based on observed packet loss. Both sides monitor link latency using ACKs in both directions: the server sends ACK when it has delivered data to the backend (client→server path); the client sends ACK when it has delivered data to stdout (server→client path). Each side measures RTT from the ACKs it receives. The server reports its observed RTT to the client via SERVER_METRICS so the client can use max(client RTT, server RTT) when deciding to add carriers. The client is the master for the link (carrier count, when to add more). Redundancy is managed automattically when auto mode is on (default) or uses the initial config without any changes when auto mode is off. Both client and server are single-threaded, using epoll to manage connections and subprocesses.
+When `ssh-oll` is started, it opens a connection to the SSH host to launch the server using `ssh lossy-ssh-host "ssh-oll --server localhost 22"`. The server creates a Unix socket such as `/tmp/ssh-oll-server.abc123def` with permissions so only the current user can access it, prints the socket path, then daemonizes and closes the initial SSH connection. The client then opens multiple carrier connections with commands like `ssh -L /tmp/ssh-oll-client.hgi456789/0:/tmp/ssh-oll-server.abc123def lossy-ssh-host`, and so on for each carrier. The client can open up to `--max-connections` sessions; by default the count is adapted automatically based on observed packet loss. Both sides monitor link latency using ACKs in both directions: the server sends ACK when it has delivered data to the backend (client→server path); the client sends ACK when it has delivered data to stdout (server→client path). Each side measures RTT from the ACKs it receives. The server reports its observed RTT to the client via SERVER_METRICS so the client can use max(client RTT, server RTT) when deciding to add carriers. The client is the master for the link (carrier count, when to add more). Redundancy is managed automatically when auto mode is on (default) or uses the initial config without any changes when auto mode is off. Both client and server are single-threaded, using epoll to manage connections and subprocesses.
 
 **Lifecycle and cleanup:** The server exits when the inner SSH session to localhost:22 (or the configured host/port) ends. On exit it removes its Unix socket. Each session uses a unique random suffix in the socket path (e.g. `abc123def`), so multiple ssh-oll clients can use the same host concurrently.
 
-**Failure and reconnection:** If carrier connections drop, the client can open additional carriers (up to `--max-connections`) to keep the logical stream alive.   The client will keep attempting to reconnect as long as its process is alive, and the server will stay alive for several minutes waiting for the client to reconnect in the case that all connections drop.
+**Failure and reconnection:** If carrier connections drop, the client can open additional carriers (up to `--max-connections`) to keep the logical stream alive. The client will keep attempting to reconnect as long as its process is alive, and the server will stay alive for several minutes waiting for the client to reconnect in the case that all connections drop.
+
+### Automatic mode (`--auto`, default on)
+
+Auto mode controls two things: how many carrier connections to maintain, and how much Reed-Solomon redundancy to use.
+
+#### Connection count
+
+A *floor* of `max(2, --connections)` connections is always maintained, in both auto and non-auto mode. The client checks every 50 ms (when zero connections are alive) or 100 ms (otherwise) and opens a new connection if it is below the floor.
+
+In auto mode, extra connections (up to `floor × 3`) are opened when any of the following triggers fires:
+
+| Trigger | Meaning |
+|---------|---------|
+| **Write backlog** | Total queued outgoing bytes across all carriers exceeds 150 × packet_size — the existing carriers can't keep up. |
+| **RTT outlier** | A carrier's measured ACK round-trip time is both above 1 s and more than 3× the median peer RTT — that carrier is stalled while others are fine. |
+| **Fraction-slow** | More than 30 % of the last 200 ACK RTTs are more than 2× the 10th-percentile ("fast-path") RTT, meaning the link is generally congested. |
+
+Conversely, a carrier is *reaped* in auto mode when: the carrier count is above the floor, the carrier's RTT is above 3 s, and it is more than 3× the median peer RTT. The reap check runs every 2 s.
+
+#### Reed-Solomon redundancy
+
+The client keeps a rolling window of the last 200 ACK RTTs. The 10th percentile is treated as the "fast path" baseline for the current link. Any RTT that is more than 2× the baseline is counted as "slow". The redundancy fraction is adjusted every ~500 ms:
+
+| Condition | Action |
+|-----------|--------|
+| > 50 % slow | Increase RS redundancy by +0.5 (aggressive) |
+| > 30 % slow | Increase RS redundancy by +0.25 |
+| < 10 % slow (≥ 30 samples) | Decrease RS redundancy by −0.05 (gradual) |
+
+RS redundancy is clamped to the range [0.2, 2.0]. In `--auto` mode the server manages its own redundancy and reports its chosen value back via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
+
+#### Dead-connection detection
+
+Connections can be detected as dead in three ways:
+
+1. **Immediate error**: `EPOLLHUP`, a failed `read()`, or a failed `write()` (returns `EPIPE`) removes the carrier immediately.
+2. **Keepalive ping**: if a carrier has not *sent* anything for 15 s and its write buffer is empty, a `PING` packet is sent. The peer replies with a `PONG`, which counts as activity.
+3. **Inactivity timeout**: if nothing has been *received* on a carrier for 20 s (after a 5 s post-connect grace period), the carrier is forcibly removed.
+
+The `epoll_wait` timeout is capped at 15 s so the inactivity check always runs even when no I/O events arrive.
+
+#### Retransmission and data recovery
+
+Every RS group and every `SMALL` packet sent is kept in an *unacked buffer* until an `ACK` is received for it. Two retransmit paths exist:
+
+- **On reconnect**: when the last carrier dies and a new one subsequently connects, all unacked data is replayed immediately onto the new carrier.
+- **Periodic timeout**: every 500 ms, any unacked item that was sent more than 3 s ago is resent to a healthy carrier. This recovers from partial loss where some (but not all) carriers died, leaving the remote side's Reed-Solomon groups incomplete.
+
+Finally, as a safety net, incomplete RS groups (waiting for shards) that are older than 10 s are discarded and `next_deliver_id` is advanced past the gap so that later, successfully received data is not blocked indefinitely.
 
 ### Ordering
 

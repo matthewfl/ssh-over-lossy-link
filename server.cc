@@ -211,6 +211,7 @@ int run_server(const Args& args) {
   uint64_t last_ping_check_ns       = 0;
   uint64_t last_rs_drain_ns         = 0;
   uint64_t last_retransmit_check_ns = 0;
+  uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
   auto connect_backend = [&]() {
     if (backend_fd >= 0) return;
@@ -540,6 +541,16 @@ int run_server(const Args& args) {
         if (carriers.empty() && !unacked_data.empty())
           retransmit_needed = true;
       }
+
+      // Update global receive timestamp from all live carriers.
+      for (auto& [cfd, cs] : carriers)
+        if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
+
+      // Global idle timeout: if nothing has been received from any carrier for
+      // 2 minutes the client is gone; exit so the server process doesn't linger.
+      static constexpr uint64_t SERVER_GLOBAL_IDLE_NS = 120000000000ULL;  // 2 min
+      if (now_ns_val - last_global_recv_ns > SERVER_GLOBAL_IDLE_NS)
+        running = false;
     }
 
     // Timeout-based retransmit: re-send any group unACK'd for > 3s to all alive carriers.
