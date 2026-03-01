@@ -117,9 +117,7 @@ struct CarrierState {
   std::vector<uint8_t> write_buf;
   size_t write_pos = 0;
   bool connecting = true;
-  uint64_t last_rtt_ns = 0;       // last measured RTT for this link (from ACK)
-  uint64_t last_activity_ns = 0;  // last time we received any data (for health timeout)
-  uint64_t last_ping_ns = 0;       // last time we sent a PING (for health check)
+  uint64_t last_rtt_ns = 0;  // last measured RTT for this link (from ACK)
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -216,14 +214,6 @@ int run_client(const Args& args) {
     return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
   };
   std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
-  std::map<int, std::deque<std::vector<uint8_t>>> sent_unacked;  // fd -> copies of sent packets (for resend when link stalls)
-  struct RsBlockPending {
-    unsigned k = 0, n = 0;
-    uint16_t block_size = 0;
-    std::vector<std::vector<uint8_t>> data_shards;  // k shards
-    uint64_t last_extra_parity_ns = 0;
-  };
-  std::map<uint64_t, RsBlockPending> rs_block_pending;  // id -> block data for extra parity on stall
 
   // Auto-adapt state: effective redundancy and RTT sampling
   float effective_rs_redundancy = args.config.auto_adapt ? std::max(args.config.rs_redundancy, 0.6f) : args.config.rs_redundancy;
@@ -240,10 +230,6 @@ int run_client(const Args& args) {
   const uint64_t backpressure_write_threshold = 150 * max_packet;  // total queued bytes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
-  const uint64_t ping_interval_ns = 2 * 1000000000ULL;   // 2s between PINGs
-  const uint64_t carrier_timeout_ns = 5 * 1000000000ULL; // 5s without activity -> treat as dead
-  const uint64_t resend_trigger_ns = 2 * 1000000000ULL;  // 2s without activity + un-acked -> resend
-  const uint64_t extra_parity_interval_ns = 2 * 1000000000ULL;  // 2s between sending extra RS parity for stalled blocks
 
   struct epoll_event ev{};
 
@@ -251,18 +237,15 @@ int run_client(const Args& args) {
   ev.data.fd = STDIN_FILENO;
   epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
 
-  const uint64_t initial_now = now_ns();
   for (unsigned i = 0; i < N; ++i) {
     std::string path = args.unix_socket_connection.empty() ? (client_dir + "/" + std::to_string(i)) : socket_path;
     int fd = connect_unix(path);
     if (fd < 0) continue;
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
       carriers[fd].connecting = true;
-      carriers[fd].last_activity_ns = initial_now;
-      carriers[fd].last_ping_ns = initial_now;
-    } else
+    else
       close(fd);
   }
 
@@ -288,26 +271,11 @@ int run_client(const Args& args) {
     h.id = next_send_id;
     h.packet_kind = PacketKind::SMALL;
     uint16_t size = static_cast<uint16_t>(len);
-    size_t packet_len = sizeof h + sizeof size + len;
     s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
     s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
     s.write_buf.insert(s.write_buf.end(), data, data + len);
-    std::vector<uint8_t> copy(s.write_buf.end() - packet_len, s.write_buf.end());
-    sent_unacked[fd].push_back(std::move(copy));
     if (!same_id)
       next_send_id++;
-  };
-
-  // Queue PING to one carrier (client -> server). Server replies with PONG for health check.
-  auto queue_ping_to_carrier = [&](int fd) {
-    auto it = carriers.find(fd);
-    if (it == carriers.end()) return;
-    CarrierState& s = it->second;
-    PacketHeader h{};
-    h.id = 0;
-    h.packet_kind = PacketKind::PING;
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(&h);
-    s.write_buf.insert(s.write_buf.end(), p, p + sizeof h);
   };
 
   // Queue SET_CONFIG to one carrier (client -> server). Used by auto mode to sync server redundancy.
@@ -326,59 +294,22 @@ int run_client(const Args& args) {
     s.write_buf.insert(s.write_buf.end(), p, p + sizeof pc);
   };
 
-  // Add one new carrier (Unix or SSH). Sets last_activity_ns/last_ping_ns so health check doesn't kill it. Returns true if added.
-  auto try_add_one_carrier = [&]() -> bool {
-    if (carriers.size() >= max_connections) return false;
-    const uint64_t now = now_ns();
-    if (!args.unix_socket_connection.empty()) {
-      int fd = connect_unix(socket_path);
-      if (fd < 0) return false;
-      ev.events = EPOLLIN | EPOLLOUT;
-      ev.data.fd = fd;
-      if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) != 0) { close(fd); return false; }
-      carriers[fd].connecting = true;
-      carriers[fd].last_activity_ns = now;
-      carriers[fd].last_ping_ns = now;
-      return true;
-    }
-    if (!pending_carrier_paths.empty() || next_carrier_index >= max_connections) return false;
-    std::string path = client_dir + "/" + std::to_string(next_carrier_index);
-    pid_t pid = fork();
-    if (pid == 0) {
-      std::string spec = path + ":" + socket_path;
-      const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
-      execvp("ssh", const_cast<char* const*>(argv));
-      _exit(127);
-    }
-    if (pid <= 0) return false;
-    ssh_pids.push_back(pid);
-    pending_carrier_paths.push_back(path);
-    next_carrier_index++;
-    return true;
-  };
-
-  // Queue one Reed-Solomon shard to one carrier. Use id_for_shard for extra-parity (resend) or next_send_id for new blocks.
-  auto queue_rs_shard_with_id = [&](int fd, uint64_t id_for_shard, unsigned n, unsigned k, uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
+  // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
+  auto queue_rs_shard_to_carrier = [&](int fd, unsigned n, unsigned k, uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
-    carrier_pending_acks[fd].emplace_back(id_for_shard, now_ns());
+    carrier_pending_acks[fd].emplace_back(next_send_id, now_ns());
     CarrierState& s = it->second;
     PacketHeader h{};
-    h.id = id_for_shard;
+    h.id = next_send_id;
     h.packet_kind = PacketKind::REED_SOLOMON;
     uint16_t size = block_size;
-    size_t packet_len = sizeof h + sizeof size + 3 + block_size;
     s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
     s.write_buf.insert(s.write_buf.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
     s.write_buf.push_back(static_cast<uint8_t>(n));
     s.write_buf.push_back(static_cast<uint8_t>(k));
     s.write_buf.push_back(static_cast<uint8_t>(shard_index));
     s.write_buf.insert(s.write_buf.end(), shard_data, shard_data + block_size);
-    std::vector<uint8_t> copy(s.write_buf.end() - packet_len, s.write_buf.end());
-    sent_unacked[fd].push_back(std::move(copy));
-  };
-  auto queue_rs_shard_to_carrier = [&](int fd, unsigned n, unsigned k, uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
-    queue_rs_shard_with_id(fd, next_send_id, n, k, block_size, shard_index, shard_data);
   };
 
   auto flush_stdout = [&]() {
@@ -433,7 +364,6 @@ int run_client(const Args& args) {
       return true;
     }
     s.read_buf.insert(s.read_buf.end(), buf, buf + n);
-    s.last_activity_ns = now_ns();  // any read indicates link is alive
 
     while (s.read_buf.size() >= sizeof(PacketHeader)) {
       const auto* h = reinterpret_cast<const PacketHeader*>(s.read_buf.data());
@@ -457,11 +387,6 @@ int run_client(const Args& args) {
             }
           }
         }
-        while (!sent_unacked[fd].empty() && reinterpret_cast<const PacketHeader*>(sent_unacked[fd].front().data())->id <= acked_id)
-          sent_unacked[fd].pop_front();
-        for (auto it_r = rs_block_pending.begin(); it_r != rs_block_pending.end(); )
-          if (it_r->first <= acked_id) it_r = rs_block_pending.erase(it_r);
-          else ++it_r;
         continue;
       }
       if (h->packet_kind == PacketKind::PONG) {
@@ -572,9 +497,7 @@ int run_client(const Args& args) {
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carrier_pending_acks.erase(fd);
-          sent_unacked.erase(fd);
           it = carriers.erase(it);
-          try_add_one_carrier();
           goto next;
         }
         s.write_pos += n;
@@ -625,8 +548,8 @@ int run_client(const Args& args) {
           if (k == 0) break;
           float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
           unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
-          unsigned n_rs = std::min(k + m, 255u);
-          m = n_rs - k;
+          unsigned n = std::min(k + m, 255u);
+          m = n - k;
           std::vector<const uint8_t*> data_ptrs(k);
           for (unsigned i = 0; i < k; ++i)
             data_ptrs[i] = stdin_buf.data() + i * block_size;
@@ -634,19 +557,12 @@ int run_client(const Args& args) {
           std::vector<uint8_t*> parity_ptrs(m);
           for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
           reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
-          RsBlockPending& rbp = rs_block_pending[next_send_id];
-          rbp.k = k;
-          rbp.n = n_rs;
-          rbp.block_size = static_cast<uint16_t>(block_size);
-          rbp.data_shards.resize(k);
-          for (unsigned i = 0; i < k; ++i)
-            rbp.data_shards[i].assign(stdin_buf.data() + i * block_size, stdin_buf.data() + (i + 1) * block_size);
-          size_t num_shards = n_rs;
+          size_t num_shards = n;
           for (size_t i = 0; i < num_shards; ++i) {
             auto it = carriers.begin();
             std::advance(it, (next_carrier + i) % carriers.size());
             const uint8_t* shard = (i < k) ? (stdin_buf.data() + i * block_size) : parity[i - k].data();
-            queue_rs_shard_to_carrier(it->first, n_rs, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
+            queue_rs_shard_to_carrier(it->first, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = it->first;
             epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
@@ -698,9 +614,6 @@ int run_client(const Args& args) {
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
-            carrier_pending_acks.erase(fd);
-            sent_unacked.erase(fd);
-            try_add_one_carrier();
             continue;
           }
         }
@@ -710,8 +623,6 @@ int run_client(const Args& args) {
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
             carrier_pending_acks.erase(fd);
-            sent_unacked.erase(fd);
-            try_add_one_carrier();
           }
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
@@ -719,8 +630,6 @@ int run_client(const Args& args) {
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
           carrier_pending_acks.erase(fd);
-          sent_unacked.erase(fd);
-          try_add_one_carrier();
         }
       }
     }
@@ -752,87 +661,18 @@ int run_client(const Args& args) {
     deliver_to_stdout();
 
     // Try to complete pending SSH carrier connections
-    const uint64_t loop_now = now_ns();
     for (auto it = pending_carrier_paths.begin(); it != pending_carrier_paths.end(); ) {
       if (access(it->c_str(), F_OK) != 0) { ++it; continue; }
       int fd = connect_unix(*it);
       if (fd >= 0) {
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = fd;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
           carriers[fd].connecting = true;
-          carriers[fd].last_activity_ns = loop_now;
-          carriers[fd].last_ping_ns = loop_now;
-        } else
+        else
           close(fd);
       }
       it = pending_carrier_paths.erase(it);
-    }
-
-    // Health check: PING periodically; close carriers with no activity within timeout and replace them
-    std::vector<int> carriers_to_close;
-    for (const auto& [cfd, st] : carriers) {
-      if (st.connecting) continue;
-      if (loop_now - st.last_activity_ns > carrier_timeout_ns)
-        carriers_to_close.push_back(cfd);
-      else if (loop_now - st.last_ping_ns >= ping_interval_ns) {
-        queue_ping_to_carrier(cfd);
-        carriers[cfd].last_ping_ns = loop_now;
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-      }
-    }
-    for (int fd : carriers_to_close) {
-      close(fd);
-      epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-      carriers.erase(fd);
-      carrier_pending_acks.erase(fd);
-      sent_unacked.erase(fd);
-      try_add_one_carrier();
-    }
-
-    // Resend un-acked data on carriers that have stalled (no activity but have un-acked packets)
-    if (!carriers.empty()) {
-      for (auto& [cfd, st] : carriers) {
-        if (st.connecting) continue;
-        auto it_su = sent_unacked.find(cfd);
-        if (it_su == sent_unacked.end() || it_su->second.empty()) continue;
-        if (loop_now - st.last_activity_ns < resend_trigger_ns) continue;
-        if (!st.write_buf.empty()) continue;  // avoid unbounded growth when link is dead
-        for (std::vector<uint8_t>& pkt : it_su->second) {
-          st.write_buf.insert(st.write_buf.end(), pkt.begin(), pkt.end());
-        }
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-      }
-      // Extra Reed-Solomon parity for un-acked large blocks: send additional error-correction shards
-      // so the server can decode even if some original shards were lost or stalled.
-      for (auto& [id, rbp] : rs_block_pending) {
-        if (loop_now - rbp.last_extra_parity_ns < extra_parity_interval_ns) continue;
-        if (rbp.data_shards.size() != rbp.k) continue;
-        if (carriers.size() < 2) continue;
-        const unsigned n_extra = 2;
-        if (rbp.n + n_extra > 255u) continue;
-        std::vector<const uint8_t*> data_ptrs(rbp.k);
-        for (unsigned i = 0; i < rbp.k; ++i) data_ptrs[i] = rbp.data_shards[i].data();
-        std::vector<std::vector<uint8_t>> extra_parity(n_extra, std::vector<uint8_t>(rbp.block_size));
-        std::vector<uint8_t*> extra_parity_ptrs(n_extra);
-        for (unsigned i = 0; i < n_extra; ++i) extra_parity_ptrs[i] = extra_parity[i].data();
-        reed_solomon::encode(rbp.k, n_extra, data_ptrs.data(), extra_parity_ptrs.data(), rbp.block_size);
-        const unsigned n_prime = rbp.n + n_extra;
-        auto it_c = carriers.begin();
-        for (unsigned i = 0; i < n_extra; ++i) {
-          queue_rs_shard_with_id(it_c->first, id, n_prime, rbp.k, rbp.block_size, rbp.n + i, extra_parity[i].data());
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = it_c->first;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, it_c->first, &ev);
-          ++it_c;
-          if (it_c == carriers.end()) it_c = carriers.begin();
-        }
-        rbp.last_extra_parity_ns = loop_now;
-      }
     }
 
     // Auto-adapt: adjust redundancy from recent RTT and add carriers when needed
@@ -888,8 +728,34 @@ int run_client(const Args& args) {
           for (uint64_t r : recent_rtt_ns) if (r > max_rtt) max_rtt = r;
         }
         bool need_more = (total_write > backpressure_write_threshold) || (max_rtt > high_rtt_threshold_ns);
-        if (need_more && try_add_one_carrier())
+        if (need_more) {
           last_add_carrier_ns = now;
+          if (!args.unix_socket_connection.empty()) {
+            int fd = connect_unix(socket_path);
+            if (fd >= 0) {
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = fd;
+              if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+                carriers[fd].connecting = true;
+              else
+                close(fd);
+            }
+          } else if (pending_carrier_paths.empty() && next_carrier_index < max_connections) {
+            std::string path = client_dir + "/" + std::to_string(next_carrier_index);
+            pid_t pid = fork();
+            if (pid == 0) {
+              std::string spec = path + ":" + socket_path;
+              const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+              execvp("ssh", const_cast<char* const*>(argv));
+              _exit(127);
+            }
+            if (pid > 0) {
+              ssh_pids.push_back(pid);
+              pending_carrier_paths.push_back(path);
+              next_carrier_index++;
+            }
+          }
+        }
       }
     }
 
