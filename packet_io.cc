@@ -23,6 +23,8 @@ bool process_carrier_read(
         std::chrono::steady_clock::now().time_since_epoch().count());
   };
   while (s.read_buf.size() >= sizeof(PacketHeader)) {
+    // Any recognised packet counts as activity on this carrier.
+    s.last_recv_ns = now_ns();
     const auto* h = reinterpret_cast<const PacketHeader*>(s.read_buf.data());
     if (h->packet_kind == PacketKind::PING) {
       if (callbacks.on_ping) callbacks.on_ping(fd, h->id);
@@ -113,6 +115,7 @@ bool process_carrier_read(
         rp.n = n;
         rp.k = k;
         rp.block_size = block_sz;
+        rp.first_recv_ns = now_ns();
       }
       if (rp.n != n || rp.k != k || rp.block_size != block_sz) {
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
@@ -273,6 +276,8 @@ void flush_carrier_writes(
         goto next;
       }
       s.write_pos += n;
+      s.last_send_ns = static_cast<uint64_t>(
+          std::chrono::steady_clock::now().time_since_epoch().count());
     }
     if (s.write_pos >= s.write_buf.size()) {
       s.write_buf.clear();

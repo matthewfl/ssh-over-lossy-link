@@ -195,6 +195,23 @@ int run_server(const Args& args) {
   const uint64_t metrics_interval_ns = 400 * 1000000ULL;  // 400ms
   uint64_t last_metrics_ns = 0;
 
+  // Unacked retransmit buffer: holds original bytes for each outstanding send_id
+  // so we can re-encode and resend on a new carrier when all existing ones die.
+  struct UnackedItem {
+    std::vector<uint8_t> data;
+    unsigned n = 0;
+    unsigned k = 0;
+    uint16_t block_size = 0;
+    bool is_small = false;
+    uint64_t send_ns = 0;
+  };
+  std::map<uint64_t, UnackedItem> unacked_data;
+  bool retransmit_needed = false;  // set when last carrier dies with unacked data
+
+  uint64_t last_ping_check_ns       = 0;
+  uint64_t last_rs_drain_ns         = 0;
+  uint64_t last_retransmit_check_ns = 0;
+
   auto connect_backend = [&]() {
     if (backend_fd >= 0) return;
     backend_fd = connect_tcp(args.remote_hostname, args.remote_port);
@@ -259,6 +276,8 @@ int run_server(const Args& args) {
 
   auto flush_carrier_writes = [&]() {
     packet_io::flush_carrier_writes(carriers, epfd, ev);
+    if (carriers.empty() && !unacked_data.empty())
+      retransmit_needed = true;
   };
 
   auto queue_ack_to_carrier = [&](int fd, uint64_t acked_id) {
@@ -352,6 +371,9 @@ int run_server(const Args& args) {
     for (auto it_m = ack_send_time_ns.begin(); it_m != ack_send_time_ns.end(); )
       if (it_m->first <= acked_id) it_m = ack_send_time_ns.erase(it_m);
       else ++it_m;
+    // Data confirmed received: remove from retransmit buffer.
+    for (auto it_u = unacked_data.begin(); it_u != unacked_data.end() && it_u->first <= acked_id; )
+      it_u = unacked_data.erase(it_u);
   };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
     runtime_auto_adapt = (pc.auto_adapt != 0);
@@ -385,7 +407,8 @@ int run_server(const Args& args) {
   bool running = true;
 
   while (running) {
-    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), -1);
+    // 15-second bound ensures we run ping/inactivity/RS-drain even when fully idle.
+    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 15000);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
@@ -405,9 +428,38 @@ int run_server(const Args& args) {
           ev.events = EPOLLIN;
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
-            carriers[client];  // default CarrierState
+            carriers[client].connect_ns = now_ns();
             if (backend_fd < 0)
               connect_backend();
+            // Re-send any data that was in-flight when all previous carriers died,
+            // using the same send_ids so the client can complete partial RS groups.
+            if (retransmit_needed && !unacked_data.empty()) {
+              retransmit_needed = false;
+              auto& cs = carriers[client];
+              for (auto& [uid, ui] : unacked_data) {
+                if (ui.is_small) {
+                  packet_io::append_small(cs.write_buf, uid, ui.data.data(), ui.data.size());
+                } else {
+                  std::vector<const uint8_t*> dptrs(ui.k);
+                  for (unsigned si = 0; si < ui.k; ++si)
+                    dptrs[si] = ui.data.data() + si * ui.block_size;
+                  unsigned m = ui.n - ui.k;
+                  std::vector<std::vector<uint8_t>> par(m, std::vector<uint8_t>(ui.block_size));
+                  std::vector<uint8_t*> pptrs(m);
+                  for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
+                  reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
+                  for (unsigned si = 0; si < ui.n; ++si) {
+                    const uint8_t* shard = (si < ui.k)
+                        ? (ui.data.data() + si * ui.block_size)
+                        : par[si - ui.k].data();
+                    packet_io::append_rs_shard(cs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
+                  }
+                }
+              }
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = client;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);
+            }
           } else {
             close(client);
           }
@@ -444,17 +496,114 @@ int run_server(const Args& args) {
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
+            if (carriers.empty() && !unacked_data.empty())
+              retransmit_needed = true;
           }
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
+          if (carriers.empty() && !unacked_data.empty())
+            retransmit_needed = true;
         }
       }
     }
 
     const uint64_t now_ns_val = now_ns();
+
+    // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
+    if (now_ns_val - last_ping_check_ns >= 1000000000ULL) {
+      last_ping_check_ns = now_ns_val;
+      static constexpr uint64_t PING_IDLE_NS = 15000000000ULL;
+      static constexpr uint64_t DEAD_IDLE_NS = 20000000000ULL;
+      static constexpr uint64_t GRACE_NS     =  5000000000ULL;
+      std::vector<int> to_kill;
+      for (auto& [cfd, cs] : carriers) {
+        if (now_ns_val - cs.connect_ns < GRACE_NS) continue;
+        uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
+        if (now_ns_val - last_activity > DEAD_IDLE_NS) {
+          to_kill.push_back(cfd);
+        } else if (cs.write_buf.empty()
+                   && now_ns_val - cs.last_send_ns > PING_IDLE_NS
+                   && now_ns_val - cs.last_recv_ns  > PING_IDLE_NS) {
+          packet_io::append_ping(cs.write_buf, 0);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = cfd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+        }
+      }
+      for (int cfd : to_kill) {
+        close(cfd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
+        carriers.erase(cfd);
+        if (carriers.empty() && !unacked_data.empty())
+          retransmit_needed = true;
+      }
+    }
+
+    // Timeout-based retransmit: re-send any group unACK'd for > 3s to all alive carriers.
+    if (!unacked_data.empty() && !carriers.empty()
+        && now_ns_val - last_retransmit_check_ns >= 500000000ULL) {
+      last_retransmit_check_ns = now_ns_val;
+      static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;
+      // Pick one non-busy carrier for retransmit.
+      int rfd = carriers.begin()->first;
+      for (auto& [uid, ui] : unacked_data) {
+        if (ui.send_ns == 0 || now_ns_val - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
+        auto& rcs = carriers[rfd];
+        if (ui.is_small) {
+          packet_io::append_small(rcs.write_buf, uid, ui.data.data(), ui.data.size());
+        } else {
+          std::vector<const uint8_t*> dptrs(ui.k);
+          for (unsigned si = 0; si < ui.k; ++si) dptrs[si] = ui.data.data() + si * ui.block_size;
+          unsigned rm = ui.n - ui.k;
+          std::vector<std::vector<uint8_t>> rpar(rm, std::vector<uint8_t>(ui.block_size));
+          std::vector<uint8_t*> rpptrs(rm);
+          for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
+          reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
+          for (unsigned si = 0; si < ui.n; ++si) {
+            const uint8_t* shard = (si < ui.k)
+                ? (ui.data.data() + si * ui.block_size) : rpar[si - ui.k].data();
+            packet_io::append_rs_shard(rcs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
+          }
+        }
+        ui.send_ns = now_ns_val;  // throttle: don't retransmit again for 3 s
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = rfd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, rfd, &ev);
+      }
+    }
+
+    if (now_ns_val - last_rs_drain_ns >= 1000000000ULL) {
+      last_rs_drain_ns = now_ns_val;
+      static constexpr uint64_t RS_STALE_NS = 10000000000ULL;
+      for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
+        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > RS_STALE_NS)
+          it = rs_pending.erase(it);
+        else
+          ++it;
+      }
+      while (true) {
+        auto ra = reassembly.find(next_deliver_id);
+        if (ra != reassembly.end()) {
+          recv_cb.on_deliver(-1, next_deliver_id, ra->second.data(), ra->second.size());
+          reassembly.erase(ra);
+          next_deliver_id++;
+        } else if (rs_pending.count(next_deliver_id)) {
+          break;
+        } else {
+          uint64_t nxt = UINT64_MAX;
+          if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
+          if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
+          if (nxt > next_deliver_id && nxt < UINT64_MAX)
+            next_deliver_id = nxt;
+          else
+            break;
+        }
+      }
+    }
+
     // When auto_adapt, server manages its own redundancy and informs the client.
     if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns
         && server_recent_rtt_ns.size() >= kMinSamplesForAdapt) {
@@ -527,25 +676,41 @@ int run_server(const Args& args) {
           }
           next_carrier_for_rs += n;
           ack_send_time_ns[next_send_id] = now_ns();
+          // Save original bytes for retransmit if all carriers die before ACK.
+          {
+            UnackedItem ui;
+            ui.data.assign(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
+            ui.n = n;  ui.k = static_cast<unsigned>(k);
+            ui.block_size = static_cast<uint16_t>(block_size);
+            ui.is_small = false;
+            ui.send_ns = now_ns();
+            unacked_data[next_send_id] = std::move(ui);
+          }
           next_send_id++;
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
           // Send any sub-block_size remainder immediately in the same flush cycle.
-          // Without this the remainder sits in backend_read_buf until the next epoll event
-          // (typically the client's ACK, ~RTT later), stacking an extra delay on top of the
-          // data that was just encoded.
           if (!backend_read_buf.empty()) {
+            UnackedItem ui;
+            ui.data = backend_read_buf;
+            ui.is_small = true;
+            ui.send_ns = now_ns();
+            unacked_data[next_send_id] = std::move(ui);
             queue_small_to_carriers(backend_read_buf.data(), backend_read_buf.size());
             backend_read_buf.clear();
           }
         } else {
           // Chunk < block_size: send as SMALL with small_packet_redundancy copies (no Reed–Solomon).
           size_t chunk = std::min(backend_read_buf.size(), block_size);
+          { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+            ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
           queue_small_to_carriers(backend_read_buf.data(), chunk);
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
         }
       } else {
         // Buffered data < block_size: SMALL with small_packet_redundancy copies.
         size_t chunk = backend_read_buf.size();
+        { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.end());
+          ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
         queue_small_to_carriers(backend_read_buf.data(), chunk);
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
       }

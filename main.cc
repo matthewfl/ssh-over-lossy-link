@@ -1,4 +1,5 @@
 #include "ssholl.h"
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <getopt.h>
@@ -171,6 +172,7 @@ bool parse_args(int argc, char* argv[], Args& out) {
 // -----------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
+  signal(SIGPIPE, SIG_IGN);
   ssholl::Args args;
   if (!ssholl::parse_args(argc, argv, args))
     return 1;

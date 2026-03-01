@@ -23,7 +23,9 @@ struct CarrierState {
   size_t write_pos = 0;
   bool connecting = false;    // client: true until connect() completes
   uint64_t last_rtt_ns = 0;   // last RTT measured via ACK on this carrier
-  uint64_t last_recv_ns = 0;  // last time any data shard arrived on this carrier
+  uint64_t last_recv_ns = 0;  // last time any packet arrived on this carrier
+  uint64_t last_send_ns = 0;  // last time bytes were actually written to this carrier fd
+  uint64_t connect_ns = 0;    // when this carrier finished connecting (set by caller)
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -32,6 +34,7 @@ struct RsPending {
   unsigned k = 0;
   size_t block_size = 0;
   std::map<unsigned, std::vector<uint8_t>> shards;
+  uint64_t first_recv_ns = 0;  // when the first shard for this group arrived
 };
 
 // Callbacks used when processing received packets. Set only the ones you need.

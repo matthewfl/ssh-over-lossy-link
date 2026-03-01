@@ -229,6 +229,25 @@ int run_client(const Args& args) {
   uint64_t last_reap_ns = 0;
   const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
 
+  // Unacked-send retransmit buffer.  Holds the original pre-encoded data for
+  // each outstanding send_id so that it can be re-encoded and re-sent on a
+  // new carrier when all existing carriers die.
+  struct UnackedItem {
+    std::vector<uint8_t> data;   // for RS: k*block_size bytes; for SMALL: raw bytes
+    unsigned n = 0;
+    unsigned k = 0;
+    uint16_t block_size = 0;
+    bool is_small = false;
+    uint64_t send_ns = 0;        // when originally sent (for timeout-based retransmit)
+  };
+  std::map<uint64_t, UnackedItem> unacked_sends;
+  bool retransmit_needed = false;  // set when last carrier dies with unacked data
+
+  // Timing for periodic operations that don't depend on carrier events.
+  uint64_t last_ping_check_ns       = 0;
+  uint64_t last_rs_drain_ns         = 0;
+  uint64_t last_retransmit_check_ns = 0;
+
   struct epoll_event ev{};
 
   ev.events = EPOLLIN;
@@ -343,6 +362,9 @@ int run_client(const Args& args) {
         while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
       }
     }
+    // Data confirmed delivered: no longer need to retransmit.
+    for (auto it_u = unacked_sends.begin(); it_u != unacked_sends.end() && it_u->first <= acked_id; )
+      it_u = unacked_sends.erase(it_u);
   };
 
   auto process_carrier_read = [&](int fd, CarrierState& s) {
@@ -362,6 +384,10 @@ int run_client(const Args& args) {
     for (auto it = carrier_pending_acks.begin(); it != carrier_pending_acks.end(); )
       if (carriers.count(it->first) == 0) it = carrier_pending_acks.erase(it);
       else ++it;
+    // packet_io::flush_carrier_writes may silently remove carriers on write error,
+    // bypassing remove_carrier.  Make sure retransmit is triggered in that case.
+    if (carriers.empty() && !unacked_sends.empty())
+      retransmit_needed = true;
   };
 
   // Maps each carrier fd to its SSH directory index (SSH mode only); used to recycle
@@ -374,16 +400,23 @@ int run_client(const Args& args) {
   }
 
   // Centralised carrier removal: closes the fd, removes from epoll, cleans up maps.
-  // Also returns the SSH index slot to the free pool (SSH mode).
+  // Also returns the SSH index slot to the free pool (SSH mode), and flags retransmit
+  // when the very last carrier is lost while data remains unacknowledged.
   auto remove_carrier = [&](int fd) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     carriers.erase(fd);
     carrier_pending_acks.erase(fd);
-    if (!args.unix_socket_connection.empty()) return;  // Unix-socket mode: nothing to recycle
-    // SSH mode: mark index slot as free by erasing from the map.
+    if (!args.unix_socket_connection.empty()) {
+      if (carriers.empty() && !unacked_sends.empty())
+        retransmit_needed = true;
+      return;
+    }
     fd_to_ssh_index.erase(fd);
+    if (carriers.empty() && !unacked_sends.empty())
+      retransmit_needed = true;
   };
+
 
   // Find a free SSH directory index in [0, max_connections) that is neither currently
   // connected nor waiting to connect.  Returns max_connections when none is available.
@@ -405,10 +438,11 @@ int run_client(const Args& args) {
   bool running = true;
 
   while (running) {
-    // When we are below the minimum carrier floor, use a short timeout so we
-    // retry the reconnect path promptly without waiting for an external event.
-    int epoll_timeout_ms = -1;
+    // Bound epoll_wait so we can run periodic tasks (ping, inactivity check, RS drain)
+    // at least every 15 seconds even when the link is completely idle.
+    int epoll_timeout_ms = 15000;
     if (carriers.size() < min_carriers_floor) {
+      // Below floor: use a much shorter timeout to reconnect promptly.
       uint64_t elapsed = now_ns() - last_add_carrier_ns;
       uint64_t floor_interval = carriers.empty() ? 50000000ULL : add_carrier_interval_ns;
       if (elapsed >= floor_interval)
@@ -465,6 +499,16 @@ int run_client(const Args& args) {
             ev.data.fd = it->first;
             epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
           }
+          // Save original data so we can retransmit on reconnect if all carriers die.
+          {
+            UnackedItem ui;
+            ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
+            ui.n = n;  ui.k = static_cast<unsigned>(k);
+            ui.block_size = static_cast<uint16_t>(block_size);
+            ui.is_small = false;
+            ui.send_ns = now_ns();
+            unacked_sends[next_send_id] = std::move(ui);
+          }
           next_send_id++;
           next_carrier += num_shards;
           stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
@@ -473,6 +517,13 @@ int run_client(const Args& args) {
         if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
           size_t chunk = stdin_buf.size();
           const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy));
+          {
+            UnackedItem ui;
+            ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
+            ui.is_small = true;
+            ui.send_ns = now_ns();
+            unacked_sends[next_send_id] = std::move(ui);
+          }
           for (unsigned i = 0; i < n_copies; ++i) {
             auto it = carriers.begin();
             std::advance(it, (next_carrier + i) % carriers.size());
@@ -505,9 +556,43 @@ int run_client(const Args& args) {
       if (it != carriers.end()) {
         if (it->second.connecting && (e & EPOLLOUT)) {
           int err = get_so_error(fd);
-          if (err == 0)
+          if (err == 0) {
             it->second.connecting = false;
-          else if (err != EINPROGRESS && err != 0) {
+            it->second.connect_ns = now_ns();
+            // Re-send any data that was in-flight on carriers that all died, using
+            // the same send_ids so the receiver can combine with any partial shards
+            // it already buffered — allowing RS groups to complete without data loss.
+            if (retransmit_needed && !unacked_sends.empty()) {
+              retransmit_needed = false;
+              for (auto& [uid, ui] : unacked_sends) {
+                if (ui.is_small) {
+                  packet_io::append_small(it->second.write_buf, uid,
+                                          ui.data.data(), ui.data.size());
+                } else {
+                  // Re-encode RS with the same parameters (n, k, block_size) so the
+                  // receiver can combine these shards with any partials it retained.
+                  std::vector<const uint8_t*> dptrs(ui.k);
+                  for (unsigned si = 0; si < ui.k; ++si)
+                    dptrs[si] = ui.data.data() + si * ui.block_size;
+                  unsigned m = ui.n - ui.k;
+                  std::vector<std::vector<uint8_t>> par(m, std::vector<uint8_t>(ui.block_size));
+                  std::vector<uint8_t*> pptrs(m);
+                  for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
+                  reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
+                  for (unsigned si = 0; si < ui.n; ++si) {
+                    const uint8_t* shard = (si < ui.k)
+                        ? (ui.data.data() + si * ui.block_size)
+                        : par[si - ui.k].data();
+                    packet_io::append_rs_shard(it->second.write_buf, uid,
+                                               ui.n, ui.k, ui.block_size, si, shard);
+                  }
+                }
+              }
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = fd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+            }
+          } else if (err != EINPROGRESS && err != 0) {
             remove_carrier(fd);
             continue;
           }
@@ -530,6 +615,13 @@ int run_client(const Args& args) {
         const unsigned n_copies = small_packet
             ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy))
             : 1u;
+        {
+          UnackedItem ui;
+          ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
+          ui.is_small = true;
+          ui.send_ns = now_ns();
+          unacked_sends[next_send_id] = std::move(ui);
+        }
         for (unsigned i = 0; i < n_copies; ++i) {
           auto it = carriers.begin();
           std::advance(it, (next_carrier + i) % carriers.size());
@@ -757,6 +849,118 @@ int run_client(const Args& args) {
               if (carriers.size() <= min_carriers_floor) break;
               remove_carrier(fd);
             }
+          }
+        }
+      }
+    }
+
+    // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
+    {
+      const uint64_t now_p = now_ns();
+
+      // Ping + dead-carrier detection.  Run at most once per second to avoid overhead.
+      if (now_p - last_ping_check_ns >= 1000000000ULL) {
+        last_ping_check_ns = now_p;
+        static constexpr uint64_t PING_IDLE_NS = 15000000000ULL;  // 15 s
+        static constexpr uint64_t DEAD_IDLE_NS = 20000000000ULL;  // 20 s
+        static constexpr uint64_t GRACE_NS     =  5000000000ULL;  //  5 s connect grace
+        std::vector<int> to_kill;
+        for (auto& [cfd, cs] : carriers) {
+          if (cs.connecting) continue;
+          if (now_p - cs.connect_ns < GRACE_NS) continue;
+          // Use the later of connect_ns and last_recv_ns as "last activity".
+          uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
+          if (now_p - last_activity > DEAD_IDLE_NS) {
+            to_kill.push_back(cfd);
+          } else if (cs.write_buf.empty()
+                     && now_p - cs.last_send_ns > PING_IDLE_NS
+                     && now_p - cs.last_recv_ns  > PING_IDLE_NS) {
+            // Truly idle: send a keepalive ping.
+            packet_io::append_ping(cs.write_buf, next_send_id);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          }
+        }
+        for (int cfd : to_kill)
+          remove_carrier(cfd);
+      }
+
+      // Timeout-based retransmit: if a send has been unACK'd for > 3s AND we have
+      // alive carriers, re-encode and resend all its shards to one carrier.  This
+      // recovers from the case where some (not all) carriers died, leaving the
+      // server's rs_pending incomplete without triggering retransmit_needed.
+      if (!unacked_sends.empty() && !carriers.empty()
+          && now_p - last_retransmit_check_ns >= 500000000ULL) {
+        last_retransmit_check_ns = now_p;
+        static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;  // 3 s
+        // Pick a non-connecting carrier for retransmit.
+        int rfd = -1;
+        for (auto& [cfd, cs] : carriers)
+          if (!cs.connecting) { rfd = cfd; break; }
+        if (rfd >= 0) {
+          for (auto& [uid, ui] : unacked_sends) {
+            if (ui.send_ns == 0 || now_p - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
+            auto& rcs = carriers[rfd];
+            if (ui.is_small) {
+              packet_io::append_small(rcs.write_buf, uid, ui.data.data(), ui.data.size());
+            } else {
+              std::vector<const uint8_t*> dptrs(ui.k);
+              for (unsigned si = 0; si < ui.k; ++si)
+                dptrs[si] = ui.data.data() + si * ui.block_size;
+              unsigned m2 = ui.n - ui.k;
+              std::vector<std::vector<uint8_t>> par2(m2, std::vector<uint8_t>(ui.block_size));
+              std::vector<uint8_t*> pptrs2(m2);
+              for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
+              reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
+              for (unsigned si = 0; si < ui.n; ++si) {
+                const uint8_t* shard = (si < ui.k)
+                    ? (ui.data.data() + si * ui.block_size)
+                    : par2[si - ui.k].data();
+                packet_io::append_rs_shard(rcs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
+              }
+            }
+            // Reset send_ns so we don't retransmit this group again for another 3 s.
+            ui.send_ns = now_p;
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = rfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, rfd, &ev);
+          }
+        }
+      }
+
+      // RS stale-group drain: safety net for RS groups that can never complete
+      // (e.g., all shards were on carriers that died before the retransmit arrived).
+      // After 10 s, drop the incomplete group and advance next_deliver_id past the
+      // gap so that later groups can be delivered.
+      if (now_p - last_rs_drain_ns >= 1000000000ULL) {
+        last_rs_drain_ns = now_p;
+        static constexpr uint64_t RS_STALE_NS = 10000000000ULL;  // 10 s
+        for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
+          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > RS_STALE_NS)
+            it = rs_pending.erase(it);
+          else
+            ++it;
+        }
+        // Advance next_deliver_id past any gaps left by the drain, delivering
+        // any reassembly entries that were previously blocked behind them.
+        while (true) {
+          auto ra = reassembly.find(next_deliver_id);
+          if (ra != reassembly.end()) {
+            recv_cb.on_deliver(-1, next_deliver_id, ra->second.data(), ra->second.size());
+            reassembly.erase(ra);
+            next_deliver_id++;
+          } else if (rs_pending.count(next_deliver_id)) {
+            break;  // still waiting for this group
+          } else {
+            // Gap: jump to the next known pending or decoded ID.
+            uint64_t nxt = UINT64_MAX;
+            if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
+            if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
+            if (nxt > next_deliver_id && nxt < UINT64_MAX)
+              next_deliver_id = nxt;
+            else
+              break;
           }
         }
       }

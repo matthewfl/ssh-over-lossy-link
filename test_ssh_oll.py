@@ -404,6 +404,10 @@ def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, co
                 conn, _ = listen_sock.accept()
             except socket.timeout:
                 continue
+            except OSError as _e:
+                import sys as _sys
+                print(f"[proxy_accept_loop] accept() raised: {_e}", file=_sys.stderr, flush=True)
+                continue
             if connection_callback:
                 connection_callback("opened")
             on_close = (lambda: connection_callback("closed")) if connection_callback else None
