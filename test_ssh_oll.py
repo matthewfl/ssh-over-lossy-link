@@ -625,12 +625,19 @@ def main():
         recv_timeout = 30.0 + (args.latency_ms * args.payload_size / max(args.packet_size, 1) * 2 / 1000.0)
     tcp_conn.settimeout(max(30.0, recv_timeout))
 
-    # Drain any data that came from the initial burst (so we start clean for measurements)
-    try:
-        while select.select([tcp_conn], [], [], 0.1)[0]:
-            tcp_conn.recv(65536)
-    except (socket.timeout, BlockingIOError):
-        pass
+    # Drain any data that came from the initial burst (so we start clean for measurements).
+    # Must receive at least trigger_size bytes so trigger is fully consumed before we send warmup.
+    drained = 0
+    drain_deadline = time.monotonic() + 15.0
+    while drained < trigger_size and time.monotonic() < drain_deadline:
+        ready, _, _ = select.select([tcp_conn], [], [], 0.1)
+        if ready:
+            chunk = tcp_conn.recv(65536)
+            if not chunk:
+                break
+            drained += len(chunk)
+    while select.select([tcp_conn], [], [], 0.0)[0]:
+        tcp_conn.recv(65536)
 
     latencies_client_to_tcp = []
     latencies_tcp_to_client = []
