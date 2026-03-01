@@ -188,7 +188,7 @@ int run_server(const Args& args) {
       backend_connected = true;
       int one = 1;
       setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-      ev.events = EPOLLIN | EPOLLOUT;
+      ev.events = EPOLLIN;  // EPOLLOUT only when we have backend_pending data to write
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     } else if (err != EINPROGRESS && err != 0) {
@@ -250,6 +250,11 @@ int run_server(const Args& args) {
     if (front.second.empty()) {
       uint64_t acked_id = front.first;
       backend_pending.pop_front();
+      if (backend_pending.empty()) {
+        ev.events = EPOLLIN;
+        ev.data.fd = backend_fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+      }
       for (auto& [cfd, _] : carriers) {
         queue_ack_to_carrier(cfd, acked_id);
         ev.events = EPOLLIN | EPOLLOUT;
@@ -263,6 +268,11 @@ int run_server(const Args& args) {
   recv_cb.on_deliver = [&](uint64_t id, const uint8_t* data, size_t len) {
     backend_pending.push_back({id, std::vector<uint8_t>(data, data + len)});
     connect_backend();
+    if (backend_fd >= 0 && backend_connected) {
+      ev.events = EPOLLIN | EPOLLOUT;
+      ev.data.fd = backend_fd;
+      epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+    }
   };
   recv_cb.on_ping = [&](int fd, uint64_t id) { send_pong(fd, id); };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
