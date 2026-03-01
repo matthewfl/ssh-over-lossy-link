@@ -77,6 +77,13 @@ bool process_carrier_read(
       if (callbacks.on_server_metrics) callbacks.on_server_metrics(pm->max_rtt_ns);
       continue;
     }
+    if (h->packet_kind == PacketKind::SERVER_CONFIG) {
+      if (s.read_buf.size() < sizeof(PacketServerConfig)) break;
+      const auto* psc = reinterpret_cast<const PacketServerConfig*>(s.read_buf.data());
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerConfig));
+      if (callbacks.on_server_config) callbacks.on_server_config(*psc);
+      continue;
+    }
     if (h->packet_kind == PacketKind::REED_SOLOMON) {
       const size_t rs_fixed = sizeof(PacketHeader) + sizeof(uint16_t) + 3;
       if (s.read_buf.size() < rs_fixed) break;
@@ -174,7 +181,7 @@ void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigne
 }
 
 void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
-                   float max_delay_ms, float reed_solomon_redundancy) {
+                   float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt) {
   PacketConfig pc{};
   pc.header.id = 0;
   pc.header.packet_kind = PacketKind::SET_CONFIG;
@@ -182,8 +189,22 @@ void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t sma
   pc.small_packet_redundancy = small_packet_redundancy;
   pc.max_delay_ms = max_delay_ms;
   pc.reed_solomon_redundancy = reed_solomon_redundancy;
+  pc.auto_adapt = auto_adapt;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&pc);
   out.insert(out.end(), p, p + sizeof pc);
+}
+
+void append_server_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
+                          float max_delay_ms, float reed_solomon_redundancy) {
+  PacketServerConfig psc{};
+  psc.header.id = 0;
+  psc.header.packet_kind = PacketKind::SERVER_CONFIG;
+  psc.packet_size = packet_size;
+  psc.small_packet_redundancy = small_packet_redundancy;
+  psc.max_delay_ms = max_delay_ms;
+  psc.reed_solomon_redundancy = reed_solomon_redundancy;
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(&psc);
+  out.insert(out.end(), p, p + sizeof psc);
 }
 
 void append_ack(std::vector<uint8_t>& out, uint64_t acked_id) {

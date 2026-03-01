@@ -59,7 +59,7 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 
 ## How it works
 
-When `ssh-oll` is started, it opens a connection to the SSH host to launch the server using `ssh lossy-ssh-host "ssh-oll --server localhost 22"`. The server creates a Unix socket such as `/tmp/ssh-oll-server.abc123def` with permissions so only the current user can access it, prints the socket path, then daemonizes and closes the initial SSH connection. The client then opens multiple carrier connections with commands like `ssh -L /tmp/ssh-oll-client.hgi456789/0:/tmp/ssh-oll-server.abc123def lossy-ssh-host`, and so on for each carrier. The client can open up to `--max-connections` sessions; by default the count is adapted automatically based on observed packet loss. Both sides monitor link latency using ACKs in both directions: the server sends ACK when it has delivered data to the backend (client→server path); the client sends ACK when it has delivered data to stdout (server→client path). Each side measures RTT from the ACKs it receives. The server reports its observed RTT to the client via SERVER_METRICS so the client can use max(client RTT, server RTT) when auto-adapting redundancy and carrier count. Both client and server are single-threaded, using epoll to manage connections and subprocesses.
+When `ssh-oll` is started, it opens a connection to the SSH host to launch the server using `ssh lossy-ssh-host "ssh-oll --server localhost 22"`. The server creates a Unix socket such as `/tmp/ssh-oll-server.abc123def` with permissions so only the current user can access it, prints the socket path, then daemonizes and closes the initial SSH connection. The client then opens multiple carrier connections with commands like `ssh -L /tmp/ssh-oll-client.hgi456789/0:/tmp/ssh-oll-server.abc123def lossy-ssh-host`, and so on for each carrier. The client can open up to `--max-connections` sessions; by default the count is adapted automatically based on observed packet loss. Both sides monitor link latency using ACKs in both directions: the server sends ACK when it has delivered data to the backend (client→server path); the client sends ACK when it has delivered data to stdout (server→client path). Each side measures RTT from the ACKs it receives. The server reports its observed RTT to the client via SERVER_METRICS so the client can use max(client RTT, server RTT) when deciding to add carriers. The client is the master for the link (carrier count, when to add more). Redundancy can be managed by the client (when auto mode is off) or by the server (when auto mode is on): the client sends SET_CONFIG with an *auto_adapt* flag; when auto_adapt is set, the server manages its own redundancy from its RTT and sends SERVER_CONFIG to the client so the client stays in sync. When auto_adapt is off, the client manages redundancy and pushes SET_CONFIG. Both client and server are single-threaded, using epoll to manage connections and subprocesses.
 
 **Lifecycle and cleanup:** The server exits when the inner SSH session to localhost:22 (or the configured host/port) ends. On exit it removes its Unix socket. Each session uses a unique random suffix in the socket path (e.g. `abc123def`), so multiple ssh-oll clients can use the same host concurrently.
 
@@ -93,6 +93,7 @@ enum packet_kind_e : uint8_t {
     PACKET_START_CONNECTION = 5,  // sent when a new carrier joins; used to associate the carrier with the logical stream
     PACKET_ACK = 6,               // both directions; cumulative ack: all data up to and including header.id delivered (for latency measurement)
     PACKET_SERVER_METRICS = 7,    // server -> client; max RTT observed by server (server→client path) for client adapt
+    PACKET_SERVER_CONFIG = 8,     // server -> client; server's current redundancy (when server manages it; auto_adapt)
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -116,7 +117,7 @@ struct __attribute__((__packed__)) packet_config : packet_header {
     uint16_t small_packet_redundancy;
     float max_delay_ms;
     float reed_solomon_redundancy;
-    // other fields as needed
+    uint8_t auto_adapt;  // 1 = server may adapt and send SERVER_CONFIG; 0 = client manages via SET_CONFIG
 };
 
 // PACKET_ACK: header only. header.id = acked_id (all data with id <= acked_id delivered).
@@ -125,7 +126,10 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 // Both sides use received ACKs for latency monitoring.
 
 // PACKET_SERVER_METRICS: server -> client. struct { packet_header; uint64_t max_rtt_ns; }
-// Server sends periodically so the client can use max(client RTT, server RTT) when adapting.
+// Server sends periodically so the client can use max(client RTT, server RTT) when adding carriers.
+
+// PACKET_SERVER_CONFIG: server -> client. Same payload as packet_config (no auto_adapt).
+// When auto_adapt is on, server adapts redundancy and sends this so the client stays in sync.
 
 ```
 

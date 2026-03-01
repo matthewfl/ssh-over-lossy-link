@@ -196,13 +196,15 @@ int run_client(const Args& args) {
   std::vector<uint8_t> stdout_buf;
   bool stdin_eof = false;
   unsigned next_carrier = 0;
-  const size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
+  size_t effective_max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
+  if (effective_max_packet == 0) effective_max_packet = 800;
   auto now_ns = []() {
     return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
   };
   std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
 
-  // Auto-adapt state: effective redundancy and RTT sampling
+  // Effective config: when auto_adapt and we have SERVER_CONFIG, use server's; else use local.
+  bool has_server_config = false;
   float effective_rs_redundancy = args.config.auto_adapt ? std::max(args.config.rs_redundancy, 0.6f) : args.config.rs_redundancy;
   unsigned effective_small_packet_redundancy = args.config.auto_adapt ? std::max(args.config.small_packet_redundancy, 6u) : args.config.small_packet_redundancy;
   std::deque<uint64_t> recent_rtt_ns;
@@ -214,7 +216,7 @@ int run_client(const Args& args) {
   const uint64_t high_rtt_threshold_ns = 200 * 1000000ULL;   // 200ms -> increase redundancy / add carriers
   const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;         // 1s -> aggressive ramp
   const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;      // 80ms -> decrease redundancy
-  const uint64_t backpressure_write_threshold = 150 * max_packet;  // total queued bytes
+  uint64_t backpressure_write_threshold = 150 * effective_max_packet;  // updated when effective_max_packet changes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t server_reported_max_rtt_ns = 0;  // server→client path RTT from SERVER_METRICS
@@ -260,11 +262,11 @@ int run_client(const Args& args) {
       next_send_id++;
   };
 
-  // Queue SET_CONFIG to one carrier (client -> server). Used by auto mode to sync server redundancy.
-  auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red) {
+  // Queue SET_CONFIG to one carrier (client -> server). Includes auto_adapt so server knows who manages redundancy.
+  auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red, uint8_t auto_adapt_val) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
-    packet_io::append_config(it->second.write_buf, pkt_size, small_red, max_delay_ms, rs_red);
+    packet_io::append_config(it->second.write_buf, pkt_size, small_red, max_delay_ms, rs_red, auto_adapt_val);
   };
 
   // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
@@ -306,6 +308,14 @@ int run_client(const Args& args) {
   };
   recv_cb.on_server_metrics = [&](uint64_t max_rtt_ns) {
     server_reported_max_rtt_ns = max_rtt_ns;
+  };
+  recv_cb.on_server_config = [&](const PacketServerConfig& psc) {
+    has_server_config = true;
+    effective_max_packet = std::min(static_cast<size_t>(psc.packet_size), static_cast<size_t>(MAX_PACKET_PAYLOAD));
+    if (effective_max_packet == 0) effective_max_packet = 800;
+    effective_rs_redundancy = (psc.reed_solomon_redundancy >= 0.1f) ? psc.reed_solomon_redundancy : 0.2f;
+    effective_small_packet_redundancy = (psc.small_packet_redundancy != 0) ? psc.small_packet_redundancy : 2u;
+    backpressure_write_threshold = 150 * effective_max_packet;
   };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it_p = carrier_pending_acks.find(fd);
@@ -374,8 +384,8 @@ int run_client(const Args& args) {
           }
           stdin_buf.insert(stdin_buf.end(), buf, buf + nr);
         }
-        while (stdin_buf.size() >= max_packet && !carriers.empty()) {
-          const size_t block_size = max_packet;
+        while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
+          const size_t block_size = effective_max_packet;
           unsigned k = static_cast<unsigned>(std::min(stdin_buf.size() / block_size, static_cast<size_t>(255)));
           if (k == 0) break;
           float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
@@ -404,7 +414,7 @@ int run_client(const Args& args) {
           stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
         }
         // Send any remainder smaller than one block as SMALL so we don't wait for EOF.
-        if (!stdin_buf.empty() && stdin_buf.size() < max_packet && !carriers.empty()) {
+        if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
           size_t chunk = stdin_buf.size();
           unsigned small_red = args.config.auto_adapt ? effective_small_packet_redundancy : args.config.small_packet_redundancy;
           const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), small_red));
@@ -468,8 +478,8 @@ int run_client(const Args& args) {
 
     if (stdin_eof && !stdin_buf.empty() && !carriers.empty()) {
       while (!stdin_buf.empty()) {
-        size_t chunk = std::min(stdin_buf.size(), max_packet);
-        const bool small_packet = (chunk < max_packet);
+        size_t chunk = std::min(stdin_buf.size(), effective_max_packet);
+        const bool small_packet = (chunk < effective_max_packet);
         unsigned small_red = args.config.auto_adapt ? effective_small_packet_redundancy : args.config.small_packet_redundancy;
         const unsigned n_copies = small_packet
             ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), small_red))
@@ -507,10 +517,25 @@ int run_client(const Args& args) {
       it = pending_carrier_paths.erase(it);
     }
 
-    // Auto-adapt: adjust redundancy from recent RTT and add carriers when needed
+    // When !auto_adapt, client manages redundancy and pushes SET_CONFIG. When auto_adapt, server manages it and sends SERVER_CONFIG.
     if (args.config.auto_adapt && !carriers.empty()) {
+      // Send initial SET_CONFIG once so server knows auto is on and gets initial values.
+      if (last_sent_rs_redundancy == -1.0f) {
+        last_sent_rs_redundancy = effective_rs_redundancy;
+        last_sent_small_packet_redundancy = effective_small_packet_redundancy;
+        int fd = carriers.begin()->first;
+        queue_config_to_carrier(fd,
+                               static_cast<uint16_t>(effective_max_packet),
+                               static_cast<uint16_t>(effective_small_packet_redundancy),
+                               args.config.max_delay_ms,
+                               effective_rs_redundancy,
+                               1u);  // auto_adapt=1: server will manage and send SERVER_CONFIG
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+      }
+    } else if (!carriers.empty()) {
       const uint64_t now = now_ns();
-
       if (now - last_adapt_ns >= adapt_interval_ns && (!recent_rtt_ns.empty() || server_reported_max_rtt_ns != 0)) {
         last_adapt_ns = now;
         uint64_t max_rtt = server_reported_max_rtt_ns;
@@ -525,21 +550,24 @@ int run_client(const Args& args) {
           effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
         }
       }
-
-      // When auto-adapt changes effective redundancy, push config to server so server→client uses same settings.
       if (effective_rs_redundancy != last_sent_rs_redundancy || effective_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = effective_rs_redundancy;
         last_sent_small_packet_redundancy = effective_small_packet_redundancy;
         int fd = carriers.begin()->first;
         queue_config_to_carrier(fd,
-                               static_cast<uint16_t>(args.config.packet_size),
+                               static_cast<uint16_t>(effective_max_packet),
                                static_cast<uint16_t>(effective_small_packet_redundancy),
                                args.config.max_delay_ms,
-                               effective_rs_redundancy);
+                               effective_rs_redundancy,
+                               0u);  // auto_adapt=0
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = fd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
       }
+    }
+
+    if (args.config.auto_adapt && !carriers.empty()) {
+      const uint64_t now = now_ns();
 
       uint64_t add_interval = add_carrier_interval_ns;
       uint64_t max_rtt_for_interval = server_reported_max_rtt_ns;

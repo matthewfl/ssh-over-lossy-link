@@ -47,6 +47,8 @@ struct ReceiveCallbacks {
   std::function<void(const PacketConfig&)> on_set_config;
   // Server -> client SERVER_METRICS; client uses for adapt (e.g. max RTT observed by server).
   std::function<void(uint64_t max_rtt_ns)> on_server_metrics;
+  // Server -> client SERVER_CONFIG; server's current redundancy (client uses when auto_adapt).
+  std::function<void(const PacketServerConfig&)> on_server_config;
 };
 
 // Process bytes from carrier read_buf: parse SMALL/REED_SOLOMON, update reassembly/rs_pending,
@@ -66,7 +68,9 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
 void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigned k,
                     uint16_t block_size, unsigned shard_index, const uint8_t* shard_data);
 void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
-                  float max_delay_ms, float reed_solomon_redundancy);
+                  float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt);
+void append_server_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
+                         float max_delay_ms, float reed_solomon_redundancy);
 void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
 void append_pong(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);

@@ -170,6 +170,14 @@ int run_server(const Args& args) {
   size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   float runtime_rs_redundancy = args.config.rs_redundancy;
   unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
+  bool runtime_auto_adapt = true;  // from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
+  float last_sent_rs_redundancy = -1.0f;
+  unsigned last_sent_small_packet_redundancy = 0;
+  uint64_t last_adapt_ns = 0;
+  const uint64_t adapt_interval_ns = 300 * 1000000ULL;
+  const uint64_t high_rtt_threshold_ns = 200 * 1000000ULL;
+  const uint64_t very_high_rtt_ns = 1000 * 1000000ULL;
+  const uint64_t low_rtt_threshold_ns = 80 * 1000000ULL;
   unsigned next_carrier_for_rs = 0;
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
@@ -252,6 +260,19 @@ int run_server(const Args& args) {
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
 
+  auto queue_server_config_to_carrier = [&](int fd) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    packet_io::append_server_config(it->second.write_buf,
+                                   static_cast<uint16_t>(max_packet),
+                                   static_cast<uint16_t>(runtime_small_packet_redundancy),
+                                   args.config.max_delay_ms,
+                                   runtime_rs_redundancy);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+  };
+
   // Delivered data is queued here; we write to backend and ACK when a chunk is fully written.
   std::deque<std::pair<uint64_t, std::vector<uint8_t>>> backend_pending;
 
@@ -308,12 +329,19 @@ int run_server(const Args& args) {
       else ++it_m;
   };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
+    runtime_auto_adapt = (pc.auto_adapt != 0);
     max_packet = std::min(static_cast<size_t>(pc.packet_size), MAX_PACKET_PAYLOAD);
     if (max_packet == 0) max_packet = 800;
     runtime_small_packet_redundancy = pc.small_packet_redundancy;
     if (runtime_small_packet_redundancy == 0) runtime_small_packet_redundancy = 1;
     runtime_rs_redundancy = pc.reed_solomon_redundancy;
     if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.2f;
+    // When auto_adapt, send current config so client has initial sync; server will send again when it adapts.
+    if (runtime_auto_adapt && !carriers.empty()) {
+      last_sent_rs_redundancy = runtime_rs_redundancy;
+      last_sent_small_packet_redundancy = runtime_small_packet_redundancy;
+      queue_server_config_to_carrier(carriers.begin()->first);
+    }
   };
 
   auto process_carrier_read = [&](int fd, CarrierState& s) {
@@ -402,7 +430,27 @@ int run_server(const Args& args) {
     }
 
     const uint64_t now_ns_val = now_ns();
-    // Report observed link quality (from ACKs received from client) so client can adapt.
+    // When auto_adapt, server manages its own redundancy and informs the client.
+    if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns && !server_recent_rtt_ns.empty()) {
+      last_adapt_ns = now_ns_val;
+      uint64_t max_rtt = 0;
+      for (uint64_t r : server_recent_rtt_ns) if (r > max_rtt) max_rtt = r;
+      if (max_rtt > high_rtt_threshold_ns) {
+        float inc = (max_rtt > very_high_rtt_ns) ? 0.25f : 0.15f;
+        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + inc);
+        unsigned inc_small = (max_rtt > very_high_rtt_ns) ? 3u : 2u;
+        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + inc_small);
+      } else if (max_rtt < low_rtt_threshold_ns) {
+        runtime_rs_redundancy = std::max(0.2f, runtime_rs_redundancy - 0.05f);
+        runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
+      }
+      if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
+        last_sent_rs_redundancy = runtime_rs_redundancy;
+        last_sent_small_packet_redundancy = runtime_small_packet_redundancy;
+        queue_server_config_to_carrier(carriers.begin()->first);
+      }
+    }
+    // Report observed link quality (from ACKs received from client) so client can adapt carriers.
     if (!carriers.empty() && !server_recent_rtt_ns.empty() && now_ns_val - last_metrics_ns >= metrics_interval_ns) {
       last_metrics_ns = now_ns_val;
       uint64_t max_rtt = 0;
