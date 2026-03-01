@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
-#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
@@ -101,8 +100,7 @@ int connect_tcp(const std::string& host, uint16_t port) {
 struct CarrierState {
   std::vector<uint8_t> read_buf;
   std::vector<uint8_t> write_buf;
-  size_t write_pos = 0;   // how much of write_buf we've sent
-  uint64_t last_write_ns = 0;  // last time we successfully wrote to this carrier (for write-stall detection)
+  size_t write_pos = 0;  // how much of write_buf we've sent
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -259,12 +257,7 @@ int run_server(const Args& args) {
     s.write_buf.insert(s.write_buf.end(), shard_data, shard_data + block_size);
   };
 
-  auto now_ns = []() {
-    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-  };
-
   auto flush_carrier_writes = [&]() {
-    const uint64_t now = now_ns();
     for (auto it = carriers.begin(); it != carriers.end(); ) {
       int fd = it->first;
       CarrierState& s = it->second;
@@ -283,7 +276,6 @@ int run_server(const Args& args) {
           goto next_carrier;
         }
         s.write_pos += n;
-        s.last_write_ns = now;
       }
       if (s.write_pos >= s.write_buf.size()) {
         s.write_buf.clear();
@@ -476,20 +468,15 @@ int run_server(const Args& args) {
     return true;
   };
 
-  const uint64_t write_stall_timeout_ns = 5 * 1000000000ULL;  // write_buf non-empty and no write progress -> dead
-
   std::vector<struct epoll_event> events(64);
   bool running = true;
 
   while (running) {
-    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 1000);
+    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), -1);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
     }
-
-    const uint64_t loop_now = now_ns();
-
     for (int i = 0; i < n; i++) {
       int fd = events[i].data.fd;
       uint32_t e = events[i].events;
@@ -505,8 +492,7 @@ int run_server(const Args& args) {
           ev.events = EPOLLIN;
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
-            CarrierState& st = carriers[client];
-            st.last_write_ns = loop_now;
+            carriers[client];  // default CarrierState
             if (backend_fd < 0)
               connect_backend();
           } else {
@@ -608,21 +594,6 @@ int run_server(const Args& args) {
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = cfd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-      }
-    }
-    // Close carriers that have stopped working (write buffer not draining).
-    std::vector<int> carriers_to_close;
-    for (const auto& [cfd, st] : carriers) {
-      if (!st.write_buf.empty() && st.last_write_ns != 0 &&
-          (loop_now - st.last_write_ns > write_stall_timeout_ns))
-        carriers_to_close.push_back(cfd);
-    }
-    for (int cfd : carriers_to_close) {
-      auto it = carriers.find(cfd);
-      if (it != carriers.end()) {
-        close(cfd);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
-        carriers.erase(it);
       }
     }
     flush_carrier_writes();
