@@ -237,6 +237,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
     results = []
     results_lock = threading.Lock()
+    continuous_errors = []
+    errors_lock = threading.Lock()
 
     def client_to_tcp():
         while not stop_event.is_set():
@@ -257,10 +259,18 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                     received += chunk
                 t1 = time.perf_counter()
                 if len(received) >= len(payload):
-                    lat_ms = 1000.0 * (t1 - t0)
-                    with results_lock:
-                        results.append((size, lat_ms))
-                    print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
+                    recv_exact = received[:len(payload)]
+                    if len(recv_exact) != len(payload) or recv_exact != payload:
+                        with errors_lock:
+                            continuous_errors.append(
+                                ("client→TCP", size, "length mismatch" if len(recv_exact) != len(payload) else "content mismatch")
+                            )
+                        print(f"client→TCP   size={size:5d}   VALIDATION FAILED", flush=True)
+                    else:
+                        lat_ms = 1000.0 * (t1 - t0)
+                        with results_lock:
+                            results.append((size, lat_ms))
+                        print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
@@ -279,10 +289,18 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                     received += chunk
                 t1 = time.perf_counter()
                 if len(received) >= len(payload):
-                    lat_ms = 1000.0 * (t1 - t0)
-                    with results_lock:
-                        results.append((size, lat_ms))
-                    print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
+                    recv_exact = received[:len(payload)]
+                    if len(recv_exact) != len(payload) or recv_exact != payload:
+                        with errors_lock:
+                            continuous_errors.append(
+                                ("TCP→client", size, "length mismatch" if len(recv_exact) != len(payload) else "content mismatch")
+                            )
+                        print(f"TCP→client   size={size:5d}   VALIDATION FAILED", flush=True)
+                    else:
+                        lat_ms = 1000.0 * (t1 - t0)
+                        with results_lock:
+                            results.append((size, lat_ms))
+                        print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
             except (BrokenPipeError, ConnectionResetError, OSError):
                 break
 
@@ -304,6 +322,15 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     t1.join(timeout=2.0)
     t2.join(timeout=2.0)
 
+    if continuous_errors:
+        print(f"\nPayload validation: {len(continuous_errors)} mismatch(es)", file=sys.stderr)
+        for direction, size, kind in continuous_errors[:20]:
+            print(f"  {direction} size={size}: {kind}", file=sys.stderr)
+        if len(continuous_errors) > 20:
+            print(f"  ... and {len(continuous_errors) - 20} more", file=sys.stderr)
+    else:
+        print("\nPayload validation: all transmitted data received correctly.")
+
     _print_size_bucket_summary(results)
 
     try:
@@ -324,6 +351,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         tcp_listen.close()
     except OSError:
         pass
+
+    return 1 if continuous_errors else 0
 
 
 def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
@@ -605,6 +634,17 @@ def main():
 
     latencies_client_to_tcp = []
     latencies_tcp_to_client = []
+    payload_errors = []  # list of (direction, iteration, message) for validation failures
+
+    def validate_payload(received, payload, direction, iteration=None):
+        """Check received bytes match payload. Appends to payload_errors on failure. Returns True if valid."""
+        if len(received) != len(payload):
+            payload_errors.append((direction, iteration, f"length mismatch: sent {len(payload)}, got {len(received)}"))
+            return False
+        if received != payload:
+            payload_errors.append((direction, iteration, "payload content mismatch (data corrupted in transit)"))
+            return False
+        return True
 
     # Warmup: one full round-trip each direction so the first timed iteration
     # doesn't pay for cold caches / scheduler; reduces stdin->TCP latency variance.
@@ -614,23 +654,26 @@ def main():
     _got = b""
     while len(_got) < len(_warm):
         _got += tcp_conn.recv(len(_warm) - len(_got))
+    if not validate_payload(_got, _warm, "client→TCP (warmup)", None):
+        print("Warmup client→TCP payload validation failed.", file=sys.stderr)
     _warm = os.urandom(args.payload_size)
     tcp_conn.sendall(_warm)
     _got = b""
     while len(_got) < len(_warm):
         _got += client_proc.stdout.read(len(_warm) - len(_got))
+    if not validate_payload(_got, _warm, "TCP→client (warmup)", None):
+        print("Warmup TCP→client payload validation failed.", file=sys.stderr)
 
     if args.continuous:
-        _run_continuous(
+        return _run_continuous(
             client_proc,
             tcp_conn,
             stop_proxy,
             tcp_listen,
             args,
         )
-        return 0
 
-    for _ in range(args.iterations):
+    for i in range(args.iterations):
         # Measurement 1: client stdin -> TCP (client sends, we read on TCP)
         payload = os.urandom(args.payload_size)
         t0 = time.perf_counter()
@@ -644,7 +687,9 @@ def main():
             received += chunk
         t1 = time.perf_counter()
         if len(received) >= len(payload):
-            latencies_client_to_tcp.append((t1 - t0) * 1000.0)
+            received_exact = received[:len(payload)]
+            if validate_payload(received_exact, payload, "client→TCP", i):
+                latencies_client_to_tcp.append((t1 - t0) * 1000.0)
 
         # Measurement 2: TCP -> client stdout (we send on TCP, read from client)
         payload = os.urandom(args.payload_size)
@@ -658,7 +703,9 @@ def main():
             received += chunk
         t1 = time.perf_counter()
         if len(received) >= len(payload):
-            latencies_tcp_to_client.append((t1 - t0) * 1000.0)
+            received_exact = received[:len(payload)]
+            if validate_payload(received_exact, payload, "TCP→client", i):
+                latencies_tcp_to_client.append((t1 - t0) * 1000.0)
 
     # Shut down client (close stdin so client sees EOF)
     try:
@@ -673,6 +720,14 @@ def main():
     stop_proxy.set()
     tcp_conn.close()
     tcp_listen.close()
+
+    # Report payload validation
+    if payload_errors:
+        print("Payload validation FAILED:", file=sys.stderr)
+        for direction, iteration, msg in payload_errors:
+            print(f"  {direction} iteration={iteration}: {msg}", file=sys.stderr)
+        return 1
+    print("Payload validation: all transmitted data received correctly.")
 
     # Report
     print("Latency (ms):")
