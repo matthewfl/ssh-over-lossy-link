@@ -196,6 +196,10 @@ int run_client(const Args& args) {
   std::vector<uint8_t> stdin_buf;
   std::vector<uint8_t> stdout_buf;
   bool stdin_eof = false;
+  bool stdin_in_epoll = true;   // tracks whether STDIN_FILENO is registered with epoll
+  bool stdout_in_epoll = false; // tracks whether STDOUT_FILENO is registered with epoll
+  // Max bytes we buffer from stdin before pausing reads (avoids spinning when carriers are dead).
+  static constexpr size_t STDIN_THROTTLE_BYTES = 256 * 1024;
   unsigned next_carrier = 0;
   size_t effective_max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   if (effective_max_packet == 0) effective_max_packet = 800;
@@ -309,12 +313,21 @@ int run_client(const Args& args) {
       ssize_t n = write(STDOUT_FILENO, stdout_buf.data(), stdout_buf.size());
       if (n <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          ev.events = EPOLLOUT;
-          ev.data.fd = STDOUT_FILENO;
-          epoll_ctl(epfd, EPOLL_CTL_ADD, STDOUT_FILENO, &ev);
+          if (!stdout_in_epoll) {
+            ev.events = EPOLLOUT;
+            ev.data.fd = STDOUT_FILENO;
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDOUT_FILENO, &ev) == 0)
+              stdout_in_epoll = true;
+          }
           return;
         }
-        break;
+        // Unrecoverable write error (e.g. EPIPE): discard buffered output.
+        stdout_buf.clear();
+        if (stdout_in_epoll) {
+          epoll_ctl(epfd, EPOLL_CTL_DEL, STDOUT_FILENO, nullptr);
+          stdout_in_epoll = false;
+        }
+        return;
       }
       stdout_buf.erase(stdout_buf.begin(), stdout_buf.begin() + n);
     }
@@ -469,11 +482,25 @@ int run_client(const Args& args) {
         while (true) {
           ssize_t nr = read(STDIN_FILENO, buf, sizeof buf);
           if (nr <= 0) {
-            if (nr == 0) stdin_eof = true;
-            else if (errno != EAGAIN && errno != EWOULDBLOCK) stdin_eof = true;
+            if (nr == 0) {
+              stdin_eof = true;
+              // Remove stdin from epoll: EOF makes the fd permanently readable
+              // (level-triggered), which would spin the event loop.
+              epoll_ctl(epfd, EPOLL_CTL_DEL, STDIN_FILENO, nullptr);
+              stdin_in_epoll = false;
+            }
+            // EINTR is transient; only treat other errors as EOF
             break;
           }
           stdin_buf.insert(stdin_buf.end(), buf, buf + nr);
+        }
+        // If stdin_buf has grown large and there are no carriers to send to,
+        // temporarily remove STDIN from epoll so we don't spin while waiting for
+        // carriers to reconnect.  It is re-armed below whenever conditions improve.
+        if (!stdin_eof && carriers.empty() && stdin_buf.size() >= STDIN_THROTTLE_BYTES
+            && stdin_in_epoll) {
+          epoll_ctl(epfd, EPOLL_CTL_DEL, STDIN_FILENO, nullptr);
+          stdin_in_epoll = false;
         }
         while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
           const size_t block_size = effective_max_packet;
@@ -544,10 +571,16 @@ int run_client(const Args& args) {
       }
 
       if (fd == STDOUT_FILENO) {
-        if (e & EPOLLOUT) {
+        if (e & (EPOLLERR | EPOLLHUP)) {
+          // Write end of stdout pipe broken; discard remaining output.
+          stdout_buf.clear();
+          epoll_ctl(epfd, EPOLL_CTL_DEL, STDOUT_FILENO, nullptr);
+          stdout_in_epoll = false;
+        } else if (e & EPOLLOUT) {
           flush_stdout();
-          if (stdout_buf.empty()) {
+          if (stdout_buf.empty() && stdout_in_epoll) {
             epoll_ctl(epfd, EPOLL_CTL_DEL, STDOUT_FILENO, nullptr);
+            stdout_in_epoll = false;
           }
         }
         continue;
@@ -565,6 +598,7 @@ int run_client(const Args& args) {
             // it already buffered — allowing RS groups to complete without data loss.
             if (retransmit_needed && !unacked_sends.empty()) {
               retransmit_needed = false;
+              const uint64_t retransmit_now = now_ns();
               for (auto& [uid, ui] : unacked_sends) {
                 if (ui.is_small) {
                   packet_io::append_small(it->second.write_buf, uid,
@@ -588,6 +622,9 @@ int run_client(const Args& args) {
                                                ui.n, ui.k, ui.block_size, si, shard);
                   }
                 }
+                // Reset timer so the periodic 3 s retransmit doesn't immediately
+                // fire a redundant duplicate of what we just queued.
+                ui.send_ns = retransmit_now;
               }
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;
@@ -1027,10 +1064,23 @@ int run_client(const Args& args) {
       }
     }
 
+    // ── Re-arm stdin if it was throttled ────────────────────────────────────
+    // Re-register STDIN with epoll once we have carriers again (can send data)
+    // or when stdin_buf drains below the throttle threshold (need more data).
+    if (!stdin_in_epoll && !stdin_eof &&
+        (!carriers.empty() || stdin_buf.size() < STDIN_THROTTLE_BYTES)) {
+      ev.events = EPOLLIN;
+      ev.data.fd = STDIN_FILENO;
+      if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev) == 0)
+        stdin_in_epoll = true;
+    }
+
     // ── Exit conditions ──────────────────────────────────────────────────────
     // Normal completion: stdin done and nothing left in flight.
-    if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty())
+    if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty()) {
+      { FILE* dbgf = fopen("/tmp/ssh-oll-client-exit.log","a"); if(dbgf){fprintf(dbgf,"stdin_eof normal exit: stdin_buf=%zu reassembly=%zu rs_pending=%zu\n",stdin_buf.size(),reassembly.size(),rs_pending.size());fclose(dbgf);} }
       running = false;
+    }
     // Fatal: no carriers AND we cannot reconnect AND nothing in flight.
     // In unix-socket mode we can always reconnect, so we never exit here.
     // In SSH mode we give up only when every index is occupied or being tried.

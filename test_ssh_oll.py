@@ -269,12 +269,49 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     continuous_errors = []
     errors_lock = threading.Lock()
 
+    # Stall tracking: per-direction "in-flight since" timestamps and stall event log.
+    # A stall is any single send that takes longer than STALL_THRESHOLD_S to complete.
+    STALL_THRESHOLD_S = 3.0
+    _inflight_lock = threading.Lock()
+    _inflight_c2t = [None]   # perf_counter start of current c2t send, or None
+    _inflight_t2c = [None]   # perf_counter start of current t2c send, or None
+    _stall_events = []        # list of (direction, duration_s)
+    _stall_lock = threading.Lock()
+
+    def _record_stall(direction, duration_s):
+        with _stall_lock:
+            _stall_events.append((direction, duration_s))
+
+    def _watchdog():
+        """Print a line whenever a direction has been blocked longer than STALL_THRESHOLD_S."""
+        while not stop_event.is_set():
+            time.sleep(1.0)
+            now = time.perf_counter()
+            with _inflight_lock:
+                t_c2t = _inflight_c2t[0]
+                t_t2c = _inflight_t2c[0]
+            parts = []
+            if t_c2t is not None:
+                elapsed = now - t_c2t
+                if elapsed >= STALL_THRESHOLD_S:
+                    parts.append(f"client→TCP stalled {elapsed:.1f}s")
+            if t_t2c is not None:
+                elapsed = now - t_t2c
+                if elapsed >= STALL_THRESHOLD_S:
+                    parts.append(f"TCP→client stalled {elapsed:.1f}s")
+            if parts:
+                print(f"[stall] {', '.join(parts)}", flush=True)
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     def client_to_tcp():
         while not stop_event.is_set():
             size = random.randint(min_size, max_size)
             payload = os.urandom(size)
             try:
                 t0 = time.perf_counter()
+                with _inflight_lock:
+                    _inflight_c2t[0] = t0
                 client_proc.stdin.write(payload)
                 client_proc.stdin.flush()
                 received = b""
@@ -287,6 +324,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                         break
                     received += chunk
                 t1 = time.perf_counter()
+                with _inflight_lock:
+                    _inflight_c2t[0] = None
                 if len(received) >= len(payload):
                     recv_exact = received[:len(payload)]
                     if len(recv_exact) != len(payload) or recv_exact != payload:
@@ -300,7 +339,11 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                         with results_lock:
                             results.append((size, lat_ms))
                         print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
+                        if t1 - t0 >= STALL_THRESHOLD_S:
+                            _record_stall("client→TCP", t1 - t0)
             except (BrokenPipeError, ConnectionResetError, OSError):
+                with _inflight_lock:
+                    _inflight_c2t[0] = None
                 break
 
     def tcp_to_client():
@@ -309,6 +352,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             payload = os.urandom(size)
             try:
                 t0 = time.perf_counter()
+                with _inflight_lock:
+                    _inflight_t2c[0] = t0
                 tcp_conn.sendall(payload)
                 received = b""
                 while len(received) < len(payload) and not stop_event.is_set():
@@ -317,6 +362,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                         break
                     received += chunk
                 t1 = time.perf_counter()
+                with _inflight_lock:
+                    _inflight_t2c[0] = None
                 if len(received) >= len(payload):
                     recv_exact = received[:len(payload)]
                     if len(recv_exact) != len(payload) or recv_exact != payload:
@@ -330,7 +377,11 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                         with results_lock:
                             results.append((size, lat_ms))
                         print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
+                        if t1 - t0 >= STALL_THRESHOLD_S:
+                            _record_stall("TCP→client", t1 - t0)
             except (BrokenPipeError, ConnectionResetError, OSError):
+                with _inflight_lock:
+                    _inflight_t2c[0] = None
                 break
 
     run_c2t = not getattr(args, 'continuous_tcp_to_client_only', False)
@@ -365,6 +416,24 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         print("\nPayload validation: all transmitted data received correctly.")
 
     _print_size_bucket_summary(results)
+
+    # Stall summary
+    with _stall_lock:
+        stall_snapshot = list(_stall_events)
+    if stall_snapshot:
+        max_stall_s = max(d for _, d in stall_snapshot)
+        c2t_stalls = [(d, ) for dir_, d in stall_snapshot if dir_ == "client→TCP"]
+        t2c_stalls = [(d, ) for dir_, d in stall_snapshot if dir_ == "TCP→client"]
+        print(f"\nStall events (>{STALL_THRESHOLD_S:.0f}s latency): {len(stall_snapshot)} total, "
+              f"max={max_stall_s:.1f}s")
+        if c2t_stalls:
+            print(f"  client→TCP: {len(c2t_stalls)} stall(s), "
+                  f"max={max(d[0] for d in c2t_stalls):.1f}s")
+        if t2c_stalls:
+            print(f"  TCP→client: {len(t2c_stalls)} stall(s), "
+                  f"max={max(d[0] for d in t2c_stalls):.1f}s")
+    else:
+        print(f"\nNo stall events (threshold: >{STALL_THRESHOLD_S:.0f}s).")
 
     try:
         client_proc.stdin.close()

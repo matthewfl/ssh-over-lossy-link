@@ -437,6 +437,7 @@ int run_server(const Args& args) {
             if (retransmit_needed && !unacked_data.empty()) {
               retransmit_needed = false;
               auto& cs = carriers[client];
+              const uint64_t retransmit_now = now_ns();
               for (auto& [uid, ui] : unacked_data) {
                 if (ui.is_small) {
                   packet_io::append_small(cs.write_buf, uid, ui.data.data(), ui.data.size());
@@ -456,6 +457,9 @@ int run_server(const Args& args) {
                     packet_io::append_rs_shard(cs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
                   }
                 }
+                // Reset timer so the periodic 3 s retransmit doesn't immediately
+                // fire a redundant duplicate of what we just queued.
+                ui.send_ns = retransmit_now;
               }
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = client;
@@ -475,7 +479,8 @@ int run_server(const Args& args) {
           uint8_t buf[READ_BUF_SIZE];
           ssize_t nr = read(backend_fd, buf, sizeof buf);
           if (nr <= 0) {
-            if (nr == 0) running = false;
+            if (nr == 0) { FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"backend EOF → exit\n");fclose(dbgf);} running = false; }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) { FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"backend read error errno=%d\n",errno);fclose(dbgf);} }
             break;
           }
           backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
@@ -484,6 +489,7 @@ int run_server(const Args& args) {
           flush_backend_pending();
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
+          { FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"backend EPOLLERR|HUP → exit\n");fclose(dbgf);} }
           running = false;
           break;
         }
@@ -549,8 +555,10 @@ int run_server(const Args& args) {
       // Global idle timeout: if nothing has been received from any carrier for
       // 2 minutes the client is gone; exit so the server process doesn't linger.
       static constexpr uint64_t SERVER_GLOBAL_IDLE_NS = 120000000000ULL;  // 2 min
-      if (now_ns_val - last_global_recv_ns > SERVER_GLOBAL_IDLE_NS)
+      if (now_ns_val - last_global_recv_ns > SERVER_GLOBAL_IDLE_NS) {
+        FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"global idle timeout → exit\n");fclose(dbgf);}
         running = false;
+      }
     }
 
     // Timeout-based retransmit: re-send any group unACK'd for > 3s to all alive carriers.
