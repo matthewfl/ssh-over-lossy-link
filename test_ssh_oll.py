@@ -132,7 +132,14 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
                 except Exception:
                     pass
     except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
+        # Write failure means the forward path is broken.  Kill the whole carrier
+        # (both directions) so the ssh-oll client/server detect the dead link
+        # promptly rather than letting a half-alive zombie connection linger.
+        if kill_callback:
+            try:
+                kill_callback()
+            except Exception:
+                pass
     finally:
         try:
             sock_to.shutdown(socket.SHUT_WR)
@@ -154,7 +161,11 @@ def _relay_zero_latency(sock_from, sock_to, death_probability=0.0, kill_callback
                 return
             sock_to.sendall(data)
     except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
+        if kill_callback:
+            try:
+                kill_callback()
+            except Exception:
+                pass
     finally:
         try:
             sock_to.shutdown(socket.SHUT_WR)
@@ -259,14 +270,17 @@ def _bucket_label(size, bucket_size=500):
     return (lo, hi, f"{lo}-{hi}")
 
 
-def _evaluate_test_criteria(args, all_latencies_ms, stall_events):
+def _evaluate_test_criteria(args, all_latencies_ms, stall_events,
+                             timed_latencies_ms=None, test_start_time=None):
     """Check --test-* pass/fail criteria.  Returns a list of failure strings (empty = pass).
 
     Parameters
     ----------
-    args              : parsed argparse namespace
-    all_latencies_ms  : list of float — latency of every *completed* measurement in ms
-    stall_events      : list of (direction, duration_s) — stalls recorded during the test
+    args                : parsed argparse namespace
+    all_latencies_ms    : list of float — latency of every *completed* measurement in ms
+    stall_events        : list of (direction, duration_s) — stalls recorded during the test
+    timed_latencies_ms  : optional list of (timestamp, latency_ms) for warmup filtering
+    test_start_time     : optional float (perf_counter) when the test started
     """
     failures = []
 
@@ -290,6 +304,27 @@ def _evaluate_test_criteria(args, all_latencies_ms, stall_events):
                 )
         else:
             failures.append("no completed measurements — cannot evaluate average latency")
+
+    if getattr(args, "test_max_average_latency_after_warmup", None) is not None:
+        warmup_s = getattr(args, "warmup_seconds", 30.0)
+        if timed_latencies_ms is not None and test_start_time is not None:
+            warmup_cutoff = test_start_time + warmup_s
+            post_warmup = [lat for ts, lat in timed_latencies_ms if ts >= warmup_cutoff]
+        else:
+            # Fallback: use all latencies if no timing info available
+            post_warmup = full_latencies
+        if post_warmup:
+            avg_pw = sum(post_warmup) / len(post_warmup)
+            threshold = args.test_max_average_latency_after_warmup
+            if avg_pw > threshold:
+                failures.append(
+                    f"post-warmup average latency {avg_pw:.1f} ms exceeds threshold {threshold:.1f} ms"
+                    f" (n={len(post_warmup)}, warmup={warmup_s:.0f}s)"
+                )
+        else:
+            failures.append(
+                f"no measurements after {warmup_s:.0f}s warmup — cannot evaluate post-warmup average latency"
+            )
 
     if getattr(args, "test_min_packets", None) is not None:
         n = len(full_latencies)
@@ -326,7 +361,10 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     # Short timeout so recv() returns periodically and threads can check stop_event
     tcp_conn.settimeout(1.0)
 
-    results = []
+    test_start_time = time.perf_counter()
+
+    results = []         # list of (size, lat_ms)
+    timed_results = []   # list of (timestamp, lat_ms) for warmup-filtered criteria
     results_lock = threading.Lock()
     continuous_errors = []
     errors_lock = threading.Lock()
@@ -374,9 +412,13 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 else:
                     _last_stall_print[label] = 0.0  # reset when stall clears
             if parts:
-                print(f"[stall] {', '.join(parts)}", flush=True)
+                try:
+                    print(f"[stall] {', '.join(parts)}", flush=True)
+                except Exception:
+                    pass
 
-    threading.Thread(target=_watchdog, daemon=True).start()
+    _watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    _watchdog_thread.start()
 
     def client_to_tcp():
         while not stop_event.is_set():
@@ -412,12 +454,20 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                             continuous_errors.append(
                                 ("client→TCP", size, "length mismatch" if len(recv_exact) != len(payload) else "content mismatch")
                             )
-                        print(f"client→TCP   size={size:5d}   VALIDATION FAILED", flush=True)
+                        try:
+                            print(f"client→TCP   size={size:5d}   VALIDATION FAILED", flush=True)
+                        except Exception:
+                            pass
                     else:
                         lat_ms = 1000.0 * dur
+                        ts = time.perf_counter()
                         with results_lock:
                             results.append((size, lat_ms))
-                        print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
+                            timed_results.append((ts, lat_ms))
+                        try:
+                            print(f"client→TCP   size={size:5d}   latency_ms={lat_ms:.2f}")
+                        except Exception:
+                            pass
                         if dur >= STALL_THRESHOLD_S:
                             _record_stall("client→TCP", dur)
                 elif dur >= STALL_THRESHOLD_S:
@@ -460,12 +510,15 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                                 _fd = raw_stdout.fileno()
                             except Exception:
                                 _fd = -1
-                            print(
-                                f"[t2c-diag] stalled {_elapsed:.1f}s: "
-                                f"recv={len(received)}/{size} fd={_fd} "
-                                f"stdout_closed={raw_stdout.closed}",
-                                flush=True,
-                            )
+                            try:
+                                print(
+                                    f"[t2c-diag] stalled {_elapsed:.1f}s: "
+                                    f"recv={len(received)}/{size} fd={_fd} "
+                                    f"stdout_closed={raw_stdout.closed}",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
                         continue
                     try:
                         chunk = raw_stdout.read(len(payload) - len(received))
@@ -489,12 +542,20 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                             continuous_errors.append(
                                 ("TCP→client", size, "length mismatch" if len(recv_exact) != len(payload) else "content mismatch")
                             )
-                        print(f"TCP→client   size={size:5d}   VALIDATION FAILED", flush=True)
+                        try:
+                            print(f"TCP→client   size={size:5d}   VALIDATION FAILED", flush=True)
+                        except Exception:
+                            pass
                     else:
                         lat_ms = 1000.0 * dur
+                        ts = time.perf_counter()
                         with results_lock:
                             results.append((size, lat_ms))
-                        print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
+                            timed_results.append((ts, lat_ms))
+                        try:
+                            print(f"TCP→client   size={size:5d}   latency_ms={lat_ms:.2f}")
+                        except Exception:
+                            pass
                         if dur >= STALL_THRESHOLD_S:
                             _record_stall("TCP→client", dur)
                 elif dur >= STALL_THRESHOLD_S:
@@ -536,6 +597,9 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     # exit soon after stop_event is set.
     if run_t2c:
         t2.join(timeout=3.0)
+    # Watchdog checks stop_event with 1 s sleep intervals; join to ensure it
+    # finishes printing before the main thread proceeds to stdout output.
+    _watchdog_thread.join(timeout=2.0)
 
     if continuous_errors:
         print(f"\nPayload validation: {len(continuous_errors)} mismatch(es)", file=sys.stderr)
@@ -598,7 +662,11 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     all_latencies_ms = [lat for _, lat in results]
     with _stall_lock:
         stall_snap = list(_stall_events)
-    test_failures = _evaluate_test_criteria(args, all_latencies_ms, stall_snap)
+    with results_lock:
+        timed_snap = list(timed_results)
+    test_failures = _evaluate_test_criteria(args, all_latencies_ms, stall_snap,
+                                            timed_latencies_ms=timed_snap,
+                                            test_start_time=test_start_time)
     if test_failures:
         print("\nTEST FAILED:", file=sys.stderr)
         for f in test_failures:
@@ -606,7 +674,8 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     else:
         _has_criteria = any(
             getattr(args, k, None) is not None
-            for k in ("test_max_latency", "test_max_average_latency", "test_min_packets")
+            for k in ("test_max_latency", "test_max_average_latency",
+                      "test_max_average_latency_after_warmup", "test_min_packets")
         )
         if _has_criteria:
             print("\nTEST PASSED: all criteria met.")
@@ -808,6 +877,21 @@ def main():
         default=None,
         metavar="N",
         help="Fail if fewer than N packets complete successfully during the test.",
+    )
+    parser.add_argument(
+        "--test-max-average-latency-after-warmup",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="Fail if average latency of packets measured after --warmup-seconds exceeds this value in ms."
+             " Useful for checking steady-state performance once auto-adapt has stabilised.",
+    )
+    parser.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Warmup window in seconds for --test-max-average-latency-after-warmup. Default 30.",
     )
     args = parser.parse_args()
 
@@ -1086,7 +1170,8 @@ def main():
 
     _has_criteria = any(
         getattr(args, k, None) is not None
-        for k in ("test_max_latency", "test_max_average_latency", "test_min_packets")
+        for k in ("test_max_latency", "test_max_average_latency",
+                  "test_max_average_latency_after_warmup", "test_min_packets")
     )
     if _has_criteria:
         print("\nTEST PASSED: all criteria met.")
@@ -1094,4 +1179,6 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Use os._exit() to avoid Python finalizer races with daemon threads
+    # (daemon threads writing to stdout can trigger SIGABRT during sys.exit cleanup).
+    os._exit(main())

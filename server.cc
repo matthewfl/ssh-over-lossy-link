@@ -144,6 +144,14 @@ int run_server(const Args& args) {
   close(STDOUT_FILENO);
   close(STDERR_FILENO);
 
+  // Open per-process debug log if --debug was passed.
+  FILE* dbg = nullptr;
+  if (args.debug) {
+    char dbg_path[128];
+    snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-server-%d.log", (int)getpid());
+    dbg = fopen(dbg_path, "w");
+  }
+
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
     unlink(socket_path.c_str());
@@ -416,9 +424,9 @@ int run_server(const Args& args) {
       if (errno == EINTR) continue;
       break;
     }
-    {
-      static FILE* lef = fopen("/tmp/ssh-oll-srv-events.log","a");
-      if(lef && n > 0){ fprintf(lef,"[epoll-return t=%llu n=%d]\n",(unsigned long long)(now_ns()/1000000ULL),n); fflush(lef); }
+    if (dbg && n > 0) {
+      fprintf(dbg, "[epoll-return t=%llu n=%d]\n", (unsigned long long)(now_ns()/1000000ULL), n);
+      fflush(dbg);
     }
     for (int i = 0; i < n; i++) {
       int fd = events[i].data.fd;
@@ -436,8 +444,9 @@ int run_server(const Args& args) {
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
             carriers[client].connect_ns = now_ns();
-            { static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-              if(ef){ fprintf(ef,"[carrier-open t=%llu fd=%d total=%zu]\n",(unsigned long long)(now_ns()/1000000ULL),client,carriers.size()); fflush(ef);} }
+            if (dbg) { fprintf(dbg, "[carrier-open t=%llu fd=%d total=%zu]\n",
+                               (unsigned long long)(now_ns()/1000000ULL), client, carriers.size());
+                        fflush(dbg); }
             if (backend_fd < 0)
               connect_backend();
             // Re-send any data that was in-flight when all previous carriers died,
@@ -495,11 +504,10 @@ int run_server(const Args& args) {
           if (nr <= 0) {
             if (nr == 0) {
               running = false;
-              static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-              if(ef){ fprintf(ef,"[backend-eof t=%llu]\n",(unsigned long long)(now_ns()/1000000ULL)); fflush(ef);}
+              if (dbg) fprintf(dbg, "[backend-eof t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-              static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-              if(ef){ fprintf(ef,"[backend-read-err t=%llu errno=%d]\n",(unsigned long long)(now_ns()/1000000ULL),errno); fflush(ef);}
+              if (dbg) fprintf(dbg, "[backend-read-err t=%llu errno=%d]\n",
+                               (unsigned long long)(now_ns()/1000000ULL), errno);
             }
             break;
           }
@@ -509,7 +517,7 @@ int run_server(const Args& args) {
           flush_backend_pending();
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
-          { FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"backend EPOLLERR|HUP → exit\n");fclose(dbgf);} }
+          if (dbg) fprintf(dbg, "[backend-err t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
           running = false;
           break;
         }
@@ -524,8 +532,9 @@ int run_server(const Args& args) {
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
-            { static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-              if(ef){ fprintf(ef,"[carrier-close-read t=%llu fd=%d total=%zu]\n",(unsigned long long)(now_ns()/1000000ULL),fd,carriers.size()); fflush(ef);} }
+            if (dbg) { fprintf(dbg, "[carrier-close-read t=%llu fd=%d total=%zu]\n",
+                               (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
+                        fflush(dbg); }
             if (carriers.empty() && !unacked_data.empty())
               retransmit_needed = true;
             carrier_removed = true;
@@ -535,8 +544,9 @@ int run_server(const Args& args) {
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
-          { static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-            if(ef){ fprintf(ef,"[carrier-close-err t=%llu fd=%d total=%zu]\n",(unsigned long long)(now_ns()/1000000ULL),fd,carriers.size()); fflush(ef);} }
+          if (dbg) { fprintf(dbg, "[carrier-close-err t=%llu fd=%d total=%zu]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
+                      fflush(dbg); }
           if (carriers.empty() && !unacked_data.empty())
             retransmit_needed = true;
         }
@@ -546,16 +556,15 @@ int run_server(const Args& args) {
     const uint64_t now_ns_val = now_ns();
 
     // ── Debug: periodic state dump ──────────────────────────────────────────
-    {
+    if (dbg) {
       static uint64_t last_dbg_ns = 0;
-      static FILE* dbgf3 = fopen("/tmp/ssh-oll-srv-state.log","a");
-      if (dbgf3 && now_ns_val - last_dbg_ns >= 1000000000ULL) {
+      if (now_ns_val - last_dbg_ns >= 1000000000ULL) {
         last_dbg_ns = now_ns_val;
-        fprintf(dbgf3,"[srv t=%llu] carriers=%zu unacked=%zu backend_read_buf=%zu retransmit_needed=%d next_send_id=%llu backend_fd=%d backend_connected=%d\n",
+        fprintf(dbg, "[srv t=%llu] carriers=%zu unacked=%zu backend_buf=%zu retransmit=%d next_send_id=%llu backend_fd=%d connected=%d\n",
                 (unsigned long long)(now_ns_val/1000000ULL),
                 carriers.size(), unacked_data.size(), backend_read_buf.size(), (int)retransmit_needed,
                 (unsigned long long)next_send_id, backend_fd, (int)backend_connected);
-        fflush(dbgf3);
+        fflush(dbg);
       }
     }
 
@@ -596,7 +605,7 @@ int run_server(const Args& args) {
       // 2 minutes the client is gone; exit so the server process doesn't linger.
       static constexpr uint64_t SERVER_GLOBAL_IDLE_NS = 120000000000ULL;  // 2 min
       if (now_ns_val - last_global_recv_ns > SERVER_GLOBAL_IDLE_NS) {
-        FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"global idle timeout → exit\n");fclose(dbgf);}
+        if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu]\n", (unsigned long long)(now_ns_val/1000000ULL));
         running = false;
       }
     }
@@ -605,7 +614,7 @@ int run_server(const Args& args) {
     if (!unacked_data.empty() && !carriers.empty()
         && now_ns_val - last_retransmit_check_ns >= 500000000ULL) {
       last_retransmit_check_ns = now_ns_val;
-      static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;
+      static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 1000000000ULL;
       // Collect ready carriers; distribute shards round-robin across all of them so
       // that no single carrier failure can wipe out a retransmit attempt.
       std::vector<int> rt_carriers;
@@ -745,12 +754,14 @@ int run_server(const Args& args) {
     }
 
     ensure_backend_connected();
-    if (!backend_read_buf.empty() && carriers.empty()) {
-      static FILE* dbgf2 = fopen("/tmp/ssh-oll-srv-stall.log","a");
-      if(dbgf2){
-        fprintf(dbgf2,"[srv-t2c-stall] backend_read_buf=%zu carriers=0 unacked=%zu retransmit_needed=%d\n",
+    if (dbg && !backend_read_buf.empty() && carriers.empty()) {
+      static uint64_t last_stall_log = 0;
+      if (now_ns_val - last_stall_log >= 1000000000ULL) {
+        last_stall_log = now_ns_val;
+        fprintf(dbg, "[srv-t2c-stall t=%llu] backend_buf=%zu carriers=0 unacked=%zu retransmit=%d\n",
+                (unsigned long long)(now_ns_val/1000000ULL),
                 backend_read_buf.size(), unacked_data.size(), (int)retransmit_needed);
-        fflush(dbgf2);
+        fflush(dbg);
       }
     }
     if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
@@ -821,30 +832,27 @@ int run_server(const Args& args) {
     }
     flush_backend_pending();
     flush_carrier_writes();
-    // Debug: count loop iterations
-    {
+    if (dbg) {
       static uint64_t loop_count = 0;
       static uint64_t last_log_ns = 0;
       loop_count++;
       uint64_t t = now_ns();
       if (t - last_log_ns >= 5000000000ULL) {
         last_log_ns = t;
-        static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-        if(ef){ fprintf(ef,"[loop-count t=%llu loops=%llu carriers=%zu]\n",
-                (unsigned long long)(t/1000000ULL),(unsigned long long)loop_count,carriers.size()); fflush(ef); }
+        fprintf(dbg, "[loop-count t=%llu loops=%llu carriers=%zu]\n",
+                (unsigned long long)(t/1000000ULL), (unsigned long long)loop_count, carriers.size());
+        fflush(dbg);
       }
     }
   }
 
-  {
-    static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
-    if(ef){
-      fprintf(ef,"[server-exit t=%llu carriers=%zu unacked=%zu next_send_id=%llu backend_fd=%d backend_connected=%d]\n",
-              (unsigned long long)(now_ns()/1000000ULL),
-              carriers.size(), unacked_data.size(), (unsigned long long)next_send_id,
-              backend_fd, (int)backend_connected);
-      fflush(ef);
-    }
+  if (dbg) {
+    fprintf(dbg, "[server-exit t=%llu carriers=%zu unacked=%zu next_send_id=%llu backend_fd=%d connected=%d]\n",
+            (unsigned long long)(now_ns()/1000000ULL),
+            carriers.size(), unacked_data.size(), (unsigned long long)next_send_id,
+            backend_fd, (int)backend_connected);
+    fflush(dbg);
+    fclose(dbg);
   }
   for (auto& [fd, _] : carriers)
     close(fd);

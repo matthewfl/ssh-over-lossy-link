@@ -99,6 +99,7 @@ struct Config {
 struct Args {
   Config config;
   bool server_mode = false;
+  bool debug = false;           // write debug logs to /tmp/ssh-oll-{client,server}-<pid>.log
   std::string lossy_ssh_host;   // required in client mode unless unix_socket_connection is set
   std::string remote_hostname = "localhost";
   uint16_t remote_port = 22;

@@ -259,6 +259,14 @@ int run_client(const Args& args) {
   uint64_t last_retransmit_check_ns = 0;
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
+  // Open per-process debug log if --debug was passed.
+  FILE* dbg = nullptr;
+  if (args.debug) {
+    char dbg_path[128];
+    snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-client-%d.log", (int)getpid());
+    dbg = fopen(dbg_path, "w");
+  }
+
   struct epoll_event ev{};
 
   ev.events = EPOLLIN;
@@ -423,9 +431,8 @@ int run_client(const Args& args) {
   // Also returns the SSH index slot to the free pool (SSH mode), and flags retransmit
   // when the very last carrier is lost while data remains unacknowledged.
   auto remove_carrier = [&](int fd) {
-    { static FILE* rcf = fopen("/tmp/ssh-oll-cli-events.log","a");
-      if(rcf){ fprintf(rcf,"[carrier-remove t=%llu fd=%d total=%zu]\n",
-               (unsigned long long)(now_ns()/1000000ULL),fd,carriers.size()-1); fflush(rcf); } }
+    if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     carriers.erase(fd);
@@ -462,8 +469,11 @@ int run_client(const Args& args) {
 
   while (running) {
     // Bound epoll_wait so we can run periodic tasks (ping, inactivity check, RS drain)
-    // at least every 15 seconds even when the link is completely idle.
-    int epoll_timeout_ms = 15000;
+    // promptly even when the link is idle.  500 ms ensures carrier death is detected
+    // within one epoll cycle even if the kernel-level EOF event is delayed on a
+    // unix-socket carrier (observed: close() on proxy side takes up to one poll
+    // cycle to propagate on some Linux configurations).
+    int epoll_timeout_ms = 500;
     if (carriers.size() < min_carriers_floor) {
       // Below floor: use a much shorter timeout to reconnect promptly.
       uint64_t elapsed = now_ns() - last_add_carrier_ns;
@@ -893,8 +903,8 @@ int run_client(const Args& args) {
       // Ping + dead-carrier detection.  Run at most once per second to avoid overhead.
       if (now_p - last_ping_check_ns >= 1000000000ULL) {
         last_ping_check_ns = now_p;
-        static constexpr uint64_t PING_IDLE_NS = 15000000000ULL;  // 15 s
-        static constexpr uint64_t DEAD_IDLE_NS = 20000000000ULL;  // 20 s
+        static constexpr uint64_t PING_IDLE_NS =  2000000000ULL;  //  2 s
+        static constexpr uint64_t DEAD_IDLE_NS =  5000000000ULL;  //  5 s
         static constexpr uint64_t GRACE_NS     =  5000000000ULL;  //  5 s connect grace
         std::vector<int> to_kill;
         for (auto& [cfd, cs] : carriers) {
@@ -935,7 +945,7 @@ int run_client(const Args& args) {
       if (!unacked_sends.empty() && !carriers.empty()
           && now_p - last_retransmit_check_ns >= 500000000ULL) {
         last_retransmit_check_ns = now_p;
-        static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;  // 3 s
+        static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 1000000000ULL;  // 1 s
         // Collect all ready (non-connecting) carriers for round-robin retransmit.
         // Spreading shards across multiple carriers means no single carrier failure
         // can wipe out a retransmit attempt.
@@ -984,19 +994,16 @@ int run_client(const Args& args) {
       }
 
       // ── Debug: periodic state dump ────────────────────────────────────────
-      {
-        static FILE* cdbgf = fopen("/tmp/ssh-oll-cli-state.log","a");
-        if (cdbgf) {
-          fprintf(cdbgf,"[cli] carriers=%zu unacked=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu\n",
-                  carriers.size(), unacked_sends.size(), reassembly.size(), rs_pending.size(),
-                  (unsigned long long)next_deliver_id, stdout_buf.size());
-          if (!rs_pending.empty()) {
-            auto it = rs_pending.begin();
-            fprintf(cdbgf,"  first rs_pending id=%llu shards=%zu k=%u n=%u\n",
-                    (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
-          }
-          fflush(cdbgf);
+      if (dbg) {
+        fprintf(dbg, "[cli] carriers=%zu unacked=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu\n",
+                carriers.size(), unacked_sends.size(), reassembly.size(), rs_pending.size(),
+                (unsigned long long)next_deliver_id, stdout_buf.size());
+        if (!rs_pending.empty()) {
+          auto it = rs_pending.begin();
+          fprintf(dbg, "  first rs_pending id=%llu shards=%zu k=%u n=%u\n",
+                  (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
         }
+        fflush(dbg);
       }
 
       // RS stale-group drain: safety net for RS groups that can never complete
@@ -1090,9 +1097,8 @@ int run_client(const Args& args) {
           // Unix-socket mode: just dial a fresh connection.
           if (carriers.size() < max_connections) {
             int fd = connect_unix(socket_path);
-            { static FILE* cef = fopen("/tmp/ssh-oll-cli-reconnect.log","a");
-              if(cef){ fprintf(cef,"[floor-add t=%llu carriers=%zu fd=%d errno=%d]\n",
-                       (unsigned long long)(now_ns()/1000000ULL),carriers.size(),fd,fd<0?errno:0); fflush(cef); } }
+            if (dbg) fprintf(dbg, "[floor-add t=%llu carriers=%zu fd=%d errno=%d]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), carriers.size(), fd, fd<0?errno:0);
             if (fd >= 0) {
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;
@@ -1139,7 +1145,8 @@ int run_client(const Args& args) {
     // ── Exit conditions ──────────────────────────────────────────────────────
     // Normal completion: stdin done and nothing left in flight.
     if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty()) {
-      { FILE* dbgf = fopen("/tmp/ssh-oll-client-exit.log","a"); if(dbgf){fprintf(dbgf,"stdin_eof normal exit: stdin_buf=%zu reassembly=%zu rs_pending=%zu\n",stdin_buf.size(),reassembly.size(),rs_pending.size());fclose(dbgf);} }
+      if (dbg) fprintf(dbg, "[client-exit-normal t=%llu stdin_buf=%zu reassembly=%zu rs_pending=%zu]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), stdin_buf.size(), reassembly.size(), rs_pending.size());
       running = false;
     }
     // Fatal: no carriers AND we cannot reconnect AND nothing in flight.
@@ -1170,6 +1177,7 @@ int run_client(const Args& args) {
       unlink((client_dir + "/" + std::to_string(i)).c_str());
     rmdir(client_dir.c_str());
   }
+  if (dbg) fclose(dbg);
   return 0;
 }
 

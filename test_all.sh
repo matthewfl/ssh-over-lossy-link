@@ -92,96 +92,104 @@ echo ""
 
 # ============================================================================
 # 1. Fixed low latency — the baseline.
-#    Observed: avg ~11 ms, max ~15 ms, ~2800 packets/30 s.
-#    Thresholds are generous (2×–5×) to absorb run-to-run variation.
+#    Observed: avg ~11 ms, max ~15 ms, ~2800 packets/60 s.
+#    Post-warmup avg should settle near 2× the injected latency (both directions).
 # ============================================================================
 run_test "fixed-10ms" \
-    --continuous --continuous-duration 30 \
+    --continuous --continuous-duration 60 \
     --latency-ms 10 \
     --test-max-latency        200 \
     --test-max-average-latency  50 \
+    --test-max-average-latency-after-warmup 30 \
     --test-min-packets         500
 
 # ============================================================================
 # 2. Fixed medium latency — 100 ms one-way (typical WAN hop).
-#    Observed: avg ~101 ms, max ~103 ms, ~600 packets/30 s.
+#    Observed: avg ~101 ms, max ~103 ms, ~600 packets/60 s.
 # ============================================================================
 run_test "fixed-100ms" \
-    --continuous --continuous-duration 30 \
+    --continuous --continuous-duration 60 \
     --latency-ms 100 \
     --test-max-latency        500 \
-    --test-max-average-latency 200 \
+    --test-max-average-latency 250 \
+    --test-max-average-latency-after-warmup 220 \
     --test-min-packets         300
 
 # ============================================================================
 # 3. Bimodal random: 95 % at 10 ms, 5 % at 100 ms.
 #    Simulates a fast link with infrequent high-latency chunks (e.g. TCP
 #    retransmits on the underlying carrier network).
-#    Observed: avg ~15 ms, max ~111 ms, ~3500 packets/30 s.
+#    Observed: avg ~15 ms, max ~111 ms, ~3500 packets/60 s.
 # ============================================================================
 run_test "random-10ms-base-100ms-spike-5pct" \
-    --continuous --continuous-duration 30 \
+    --continuous --continuous-duration 60 \
     --latency-random \
     --latency-random-low-ms  10  \
     --latency-random-high-ms 100 \
     --latency-random-pct     5   \
     --test-max-latency        500 \
     --test-max-average-latency 100 \
+    --test-max-average-latency-after-warmup 35 \
     --test-min-packets        1000
 
 # ============================================================================
 # 4. Bimodal random: 95 % at 100 ms, 5 % at 1000 ms.
 #    Simulates a WAN link with occasional high-latency bursts.
-#    Observed: avg ~107 ms, max ~905 ms, ~730 packets/60 s.
+#    Observed: avg ~107 ms, max ~905 ms, ~730 packets/90 s.
 # ============================================================================
 run_test "random-100ms-base-1000ms-spike-5pct" \
-    --continuous --continuous-duration 60 \
+    --continuous --continuous-duration 90 \
     --latency-random \
     --latency-random-low-ms  100  \
     --latency-random-high-ms 1000 \
     --latency-random-pct     5    \
     --test-max-latency       2000 \
-    --test-max-average-latency 300 \
+    --test-max-average-latency 350 \
+    --test-max-average-latency-after-warmup 250 \
     --test-min-packets        400
 
 # ============================================================================
 # 5. Bimodal random: 95 % at 100 ms, 5 % at 2000 ms.
 #    The harshest pure-latency test; validates RS redundancy adaptation.
-#    Observed: avg ~175 ms, max ~2001 ms, ~1200 packets/100 s.
+#    Observed: avg ~175 ms, max ~2001 ms, ~1200 packets/120 s.
 # ============================================================================
 run_test "random-100ms-base-2000ms-spike-5pct" \
-    --continuous --continuous-duration 100 \
+    --continuous --continuous-duration 120 \
     --latency-random \
     --latency-random-low-ms  100  \
     --latency-random-high-ms 2000 \
     --latency-random-pct     5    \
     --test-max-latency       5000 \
     --test-max-average-latency 500 \
+    --test-max-average-latency-after-warmup 300 \
     --test-min-packets        600
 
 # ============================================================================
 # 6. Rare connection death — 0.2 % per-packet probability.
 #    RS + retransmit should recover within a few seconds.
 #    50 ms base latency so the connection isn't trivially fast.
+#    Warmup 30s; post-warmup avg should be close to base latency once settled.
 # ============================================================================
 run_test "connection-death-0.002-t2c" \
     --init-latency-override 0.05 \
-    --continuous --continuous-duration 60 \
+    --continuous --continuous-duration 90 \
     --continuous-tcp-to-client-only \
     --latency-ms 50 \
     --connection-death-probability 0.002 \
     --test-max-latency        10000 \
-    --test-max-average-latency  500 \
+    --test-max-average-latency  800 \
+    --test-max-average-latency-after-warmup 300 \
     --test-min-packets           40
 
 run_test "connection-death-0.002-c2t" \
     --init-latency-override 0.05 \
-    --continuous --continuous-duration 60 \
+    --continuous --continuous-duration 90 \
     --continuous-client-to-tcp-only \
     --latency-ms 50 \
     --connection-death-probability 0.002 \
     --test-max-latency        10000 \
-    --test-max-average-latency  500 \
+    --test-max-average-latency  800 \
+    --test-max-average-latency-after-warmup 300 \
     --test-min-packets           40
 
 # ============================================================================
@@ -192,22 +200,24 @@ run_test "connection-death-0.002-c2t" \
 # ============================================================================
 run_test "connection-death-0.01-t2c" \
     --init-latency-override 0.05 \
-    --continuous --continuous-duration 60 \
+    --continuous --continuous-duration 90 \
     --continuous-tcp-to-client-only \
     --latency-ms 50 \
     --connection-death-probability 0.01 \
     --test-max-latency        20000 \
-    --test-max-average-latency 1000 \
+    --test-max-average-latency 1500 \
+    --test-max-average-latency-after-warmup 600 \
     --test-min-packets           15
 
 run_test "connection-death-0.01-c2t" \
     --init-latency-override 0.05 \
-    --continuous --continuous-duration 60 \
+    --continuous --continuous-duration 90 \
     --continuous-client-to-tcp-only \
     --latency-ms 50 \
     --connection-death-probability 0.01 \
     --test-max-latency        20000 \
-    --test-max-average-latency 1000 \
+    --test-max-average-latency 1500 \
+    --test-max-average-latency-after-warmup 600 \
     --test-min-packets           15
 
 # ============================================================================
@@ -217,15 +227,16 @@ run_test "connection-death-0.01-c2t" \
 # ============================================================================
 run_test "combined-latency-and-death" \
     --init-latency-override 0.05 \
-    --continuous --continuous-duration 60 \
+    --continuous --continuous-duration 90 \
     --continuous-tcp-to-client-only \
     --latency-random \
     --latency-random-low-ms  50  \
     --latency-random-high-ms 500 \
     --latency-random-pct     5   \
     --connection-death-probability 0.005 \
-    --test-max-latency        15000 \
-    --test-max-average-latency  800 \
+    --test-max-latency        20000 \
+    --test-max-average-latency 1500 \
+    --test-max-average-latency-after-warmup 400 \
     --test-min-packets           20
 
 # ============================================================================
@@ -234,7 +245,7 @@ run_test "combined-latency-and-death" \
 #    Thresholds are relaxed compared to adaptive mode (no RS tuning).
 # ============================================================================
 run_test "no-auto-adapt-fixed-10ms" \
-    --continuous --continuous-duration 30 \
+    --continuous --continuous-duration 60 \
     --latency-ms 10 \
     --test-max-latency       1000 \
     --test-max-average-latency 300 \

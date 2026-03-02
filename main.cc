@@ -22,6 +22,7 @@ const struct option LONG_OPTS[] = {
   { "max-delay",            required_argument, nullptr, 'd' },
   { "server",               no_argument,       nullptr, 'S' },
   { "unix-socket-connection", required_argument, nullptr, 'u' },
+  { "debug",                no_argument,       nullptr, 'D' },
   { "help",                 no_argument,       nullptr, 'h' },
   { nullptr, 0, nullptr, 0 },
 };
@@ -75,13 +76,14 @@ void usage(const char* program_name) {
     << "  --max-delay N                 Max delay (ms) waiting for buffer for RS. Default: 1\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
     << "  --unix-socket-connection PATH Connect directly to Unix socket PATH instead of SSH -L\n"
+    << "  --debug                       Write verbose debug logs to /tmp/ssh-oll-{client,server}-<pid>.log\n"
     << "  --help                        Show this help\n";
 }
 
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:Su:h", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:Su:Dh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -116,6 +118,9 @@ bool parse_args(int argc, char* argv[], Args& out) {
           break;
         case 'u':
           out.unix_socket_connection = optarg;
+          break;
+        case 'D':
+          out.debug = true;
           break;
         case 'h':
           usage(argv[0]);
