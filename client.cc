@@ -63,9 +63,14 @@ std::string launch_server(const Args& args) {
     close(pipefd[0]);
     if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
     close(pipefd[1]);
+    // Redirect stdin to /dev/null. The launch ssh inherits our stdin (the real SSH stream).
+    // If it forwarded that to the remote, it would consume and lose the SSH version string
+    // before our main loop can forward it—sshd would respond "Invalid SSH identification string".
+    int devnull = open("/dev/null", O_RDONLY);
+    if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
     std::string port_str = std::to_string(args.remote_port);
     const char* argv[] = {
-      "ssh",
+      "ssh", "-n",
       args.lossy_ssh_host.c_str(),
       args.config.path_on_server.c_str(),
       "--server",
@@ -170,15 +175,17 @@ int run_client(const Args& args) {
       if (pid == 0) {
         // Exit automatically if the parent (ssh-oll) dies for any reason.
         prctl(PR_SET_PDEATHSIG, SIGTERM);
-        // Redirect stderr to /dev/null: SSH prints diagnostic noise (e.g. address-in-use)
-        // that would leak onto the user's terminal.  In --debug mode keep it visible.
-        if (!args.debug) {
-          int dn = open("/dev/null", O_WRONLY);
-          if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+        // Redirect stdout and stderr to /dev/null. stdout must never be written to—
+        // the carrier inherits the ProxyCommand stdout; any output would corrupt the SSH stream.
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) {
+          dup2(dn, STDOUT_FILENO);
+          dup2(dn, STDERR_FILENO);
+          close(dn);
         }
         std::string spec = local_path + ":" + socket_path;
         const char* argv[] = {
-          "ssh", "-N",
+          "ssh", "-n", "-N",
           "-o", "ExitOnForwardFailure=yes",
           // "-o", "ServerAliveInterval=10",
           // "-o", "ServerAliveCountMax=3",
@@ -915,13 +922,15 @@ int run_client(const Args& args) {
               pid_t pid = fork();
               if (pid == 0) {
                 prctl(PR_SET_PDEATHSIG, SIGTERM);
-                if (!args.debug) {
-                  int dn = open("/dev/null", O_WRONLY);
-                  if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+                int dn = open("/dev/null", O_WRONLY);
+                if (dn >= 0) {
+                  dup2(dn, STDOUT_FILENO);
+                  dup2(dn, STDERR_FILENO);
+                  close(dn);
                 }
                 std::string spec = path + ":" + socket_path;
                 const char* argv[] = {
-                  "ssh", "-N",
+                  "ssh", "-n", "-N",
                   "-o", "ExitOnForwardFailure=yes",
                   // "-o", "ServerAliveInterval=10",
                   // "-o", "ServerAliveCountMax=3",
@@ -1233,13 +1242,15 @@ int run_client(const Args& args) {
             pid_t pid = fork();
             if (pid == 0) {
               prctl(PR_SET_PDEATHSIG, SIGTERM);
-              if (!args.debug) {
-                int dn = open("/dev/null", O_WRONLY);
-                if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+              int dn = open("/dev/null", O_WRONLY);
+              if (dn >= 0) {
+                dup2(dn, STDOUT_FILENO);
+                dup2(dn, STDERR_FILENO);
+                close(dn);
               }
               std::string spec = path + ":" + socket_path;
               const char* argv[] = {
-                "ssh", "-N",
+                "ssh", "-n", "-N",
                 "-o", "ExitOnForwardFailure=yes",
                 // "-o", "ServerAliveInterval=10",
                 // "-o", "ServerAliveCountMax=3",
