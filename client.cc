@@ -11,9 +11,11 @@
 #include <map>
 #include <random>
 #include <set>
+#include <signal.h>
 #include <string>
 #include <vector>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -116,9 +118,24 @@ int get_so_error(int fd) {
   return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 ? err : -1;
 }
 
+// Set by SIGINT/SIGTERM handler; causes the main event loop to exit cleanly.
+static volatile sig_atomic_t g_shutdown_requested = 0;
+static void shutdown_handler(int) { g_shutdown_requested = 1; }
+
 }  // namespace
 
 int run_client(const Args& args) {
+  // Catch SIGINT (Ctrl-C) and SIGTERM so the cleanup path (kill SSH children,
+  // unlink sockets) runs even when the user interrupts the session.
+  {
+    struct sigaction sa{};
+    sa.sa_handler = shutdown_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+  }
+
   std::string socket_path;
   std::string client_dir;
   std::map<unsigned, pid_t> ssh_idx_to_pid;  // SSH slot index -> PID
@@ -151,8 +168,23 @@ int run_client(const Args& args) {
         return 1;
       }
       if (pid == 0) {
+        // Exit automatically if the parent (ssh-oll) dies for any reason.
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        // Redirect stderr to /dev/null: SSH prints diagnostic noise (e.g. address-in-use)
+        // that would leak onto the user's terminal.  In --debug mode keep it visible.
+        if (!args.debug) {
+          int dn = open("/dev/null", O_WRONLY);
+          if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+        }
         std::string spec = local_path + ":" + socket_path;
-        const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+        const char* argv[] = {
+          "ssh", "-N",
+          "-o", "ExitOnForwardFailure=yes",
+          // "-o", "ServerAliveInterval=10",
+          // "-o", "ServerAliveCountMax=3",
+          "-L", spec.c_str(),
+          args.lossy_ssh_host.c_str(), nullptr
+        };
         execvp("ssh", const_cast<char* const*>(argv));
         _exit(127);
       }
@@ -271,6 +303,10 @@ int run_client(const Args& args) {
 
   struct epoll_event ev{};
 
+  // Maps each carrier fd to its SSH directory index (SSH mode only).
+  // Declared here so the initial connect loop and remove_carrier lambda can both use it.
+  std::map<int, unsigned> fd_to_ssh_index;
+
   ev.events = EPOLLIN;
   ev.data.fd = STDIN_FILENO;
   epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
@@ -278,13 +314,21 @@ int run_client(const Args& args) {
   for (unsigned i = 0; i < N; ++i) {
     std::string path = args.unix_socket_connection.empty() ? (client_dir + "/" + std::to_string(i)) : socket_path;
     int fd = connect_unix(path);
-    if (fd < 0) continue;
+    if (fd < 0) {
+      // SSH for this slot isn't ready yet; queue it so the main loop picks it up.
+      if (args.unix_socket_connection.empty())
+        pending_carrier_paths.push_back(path);
+      continue;
+    }
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
       carriers[fd].connecting = true;
-    else
+      if (args.unix_socket_connection.empty())
+        fd_to_ssh_index[fd] = i;  // correct slot→fd mapping
+    } else {
       close(fd);
+    }
   }
 
   if (carriers.empty()) {
@@ -421,14 +465,7 @@ int run_client(const Args& args) {
       retransmit_needed = true;
   };
 
-  // Maps each carrier fd to its SSH directory index (SSH mode only); used to recycle
-  // index slots when a carrier dies so we never exhaust max_connections permanently.
-  std::map<int, unsigned> fd_to_ssh_index;
-  if (args.unix_socket_connection.empty()) {
-    // Populate for the initial N carriers (they were connected just above).
-    unsigned idx = 0;
-    for (auto& [fd, _] : carriers) fd_to_ssh_index[fd] = idx++;
-  }
+  // fd_to_ssh_index is declared and populated above in the initial connect loop.
 
   // Centralised carrier removal: closes the fd, removes from epoll, cleans up maps.
   // In SSH mode: kills the owning SSH process and unlinks its socket file so the
@@ -475,6 +512,9 @@ int run_client(const Args& args) {
       if (path.size() > prefix.size())
         in_use.insert(static_cast<unsigned>(std::stoul(path.substr(prefix.size()))));
     }
+    // Also exclude slots that have a live SSH process (prevents double-launching when a
+    // carrier's connect failed/was delayed and the process is still starting up).
+    for (auto& [idx, _] : ssh_idx_to_pid) in_use.insert(idx);
     for (unsigned i = 0; i < max_connections; ++i)
       if (!in_use.count(i)) return i;
     return max_connections;
@@ -484,6 +524,8 @@ int run_client(const Args& args) {
   bool running = true;
 
   while (running) {
+    if (g_shutdown_requested) break;
+
     // Bound epoll_wait so we can run periodic tasks (ping, inactivity check, RS drain)
     // promptly even when the link is idle.  500 ms ensures carrier death is detected
     // within one epoll cycle even if the kernel-level EOF event is delayed on a
@@ -501,7 +543,10 @@ int run_client(const Args& args) {
     }
     int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), epoll_timeout_ms);
     if (n < 0) {
-      if (errno == EINTR) continue;
+      if (errno == EINTR) {
+        // Signal interrupted the wait; re-check shutdown flag at the top of the loop.
+        continue;
+      }
       break;
     }
 
@@ -713,8 +758,22 @@ int run_client(const Args& args) {
     flush_carrier_writes();
     flush_stdout();
 
-    // Try to complete pending SSH carrier connections
+    // Try to complete pending SSH carrier connections.
     for (auto it = pending_carrier_paths.begin(); it != pending_carrier_paths.end(); ) {
+      std::string prefix = client_dir + "/";
+      unsigned slot = (it->size() > prefix.size())
+          ? static_cast<unsigned>(std::stoul(it->substr(prefix.size()))) : 0;
+      // If the SSH process for this slot has exited on its own (e.g. auth failure,
+      // ExitOnForwardFailure), remove the entry so the slot is freed for relaunch.
+      if (auto pit = ssh_idx_to_pid.find(slot); pit != ssh_idx_to_pid.end()) {
+        if (waitpid(pit->second, nullptr, WNOHANG) != 0) {
+          // Process exited; clean up and let find_free_ssh_index reclaim this slot.
+          ssh_idx_to_pid.erase(pit);
+          unlink(it->c_str());
+          it = pending_carrier_paths.erase(it);
+          continue;
+        }
+      }
       if (access(it->c_str(), F_OK) != 0) { ++it; continue; }
       int fd = connect_unix(*it);
       if (fd >= 0) {
@@ -723,14 +782,15 @@ int run_client(const Args& args) {
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
           carriers[fd].connecting = true;
           // Record SSH index for later recycling.
-          std::string prefix = client_dir + "/";
           if (it->size() > prefix.size())
-            fd_to_ssh_index[fd] = static_cast<unsigned>(std::stoul(it->substr(prefix.size())));
+            fd_to_ssh_index[fd] = slot;
         } else {
           close(fd);
         }
+        it = pending_carrier_paths.erase(it);  // success: remove from pending
+      } else {
+        ++it;  // transient failure (SSH still starting): retry next iteration
       }
-      it = pending_carrier_paths.erase(it);
     }
 
     // When !auto_adapt, client manages redundancy and pushes SET_CONFIG. When auto_adapt, server manages it and sends SERVER_CONFIG.
@@ -854,8 +914,20 @@ int run_client(const Args& args) {
               std::string path = client_dir + "/" + std::to_string(free_idx);
               pid_t pid = fork();
               if (pid == 0) {
+                prctl(PR_SET_PDEATHSIG, SIGTERM);
+                if (!args.debug) {
+                  int dn = open("/dev/null", O_WRONLY);
+                  if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+                }
                 std::string spec = path + ":" + socket_path;
-                const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+                const char* argv[] = {
+                  "ssh", "-N",
+                  "-o", "ExitOnForwardFailure=yes",
+                  // "-o", "ServerAliveInterval=10",
+                  // "-o", "ServerAliveCountMax=3",
+                  "-L", spec.c_str(),
+                  args.lossy_ssh_host.c_str(), nullptr
+                };
                 execvp("ssh", const_cast<char* const*>(argv));
                 _exit(127);
               }
@@ -926,6 +998,27 @@ int run_client(const Args& args) {
               std::remove_if(pids_to_reap.begin(), pids_to_reap.end(),
                   [](pid_t p) { return waitpid(p, nullptr, WNOHANG) != 0; }),
               pids_to_reap.end());
+        }
+        // Also reap SSH processes that died on their own (e.g. remote refused the
+        // tunnel).  These are ssh_idx_to_pid entries not yet touched by remove_carrier.
+        // Pending-path cleanup is handled in the pending loop; here we handle the case
+        // where the fd was already connected and the SSH died without an epoll event.
+        if (!args.unix_socket_connection.empty()) {
+          // Unix-socket mode: no SSH processes to reap.
+        } else {
+          std::vector<unsigned> dead_slots;
+          for (auto& [idx, pid] : ssh_idx_to_pid) {
+            // Skip slots that have an active carrier (remove_carrier will handle those).
+            bool active = false;
+            for (auto& [fd, fi] : fd_to_ssh_index) if (fi == idx) { active = true; break; }
+            if (active) continue;
+            if (waitpid(pid, nullptr, WNOHANG) != 0)
+              dead_slots.push_back(idx);
+          }
+          for (unsigned idx : dead_slots) {
+            ssh_idx_to_pid.erase(idx);
+            unlink((client_dir + "/" + std::to_string(idx)).c_str());
+          }
         }
         static constexpr uint64_t PING_IDLE_NS =  2000000000ULL;  //  2 s
         static constexpr uint64_t DEAD_IDLE_NS =  5000000000ULL;  //  5 s
@@ -1139,9 +1232,20 @@ int run_client(const Args& args) {
             std::string path = client_dir + "/" + std::to_string(free_idx);
             pid_t pid = fork();
             if (pid == 0) {
+              prctl(PR_SET_PDEATHSIG, SIGTERM);
+              if (!args.debug) {
+                int dn = open("/dev/null", O_WRONLY);
+                if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+              }
               std::string spec = path + ":" + socket_path;
-              const char* argv[] = { "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
-                                     "-L", spec.c_str(), args.lossy_ssh_host.c_str(), nullptr };
+              const char* argv[] = {
+                "ssh", "-N",
+                "-o", "ExitOnForwardFailure=yes",
+                // "-o", "ServerAliveInterval=10",
+                // "-o", "ServerAliveCountMax=3",
+                "-L", spec.c_str(),
+                args.lossy_ssh_host.c_str(), nullptr
+              };
               execvp("ssh", const_cast<char* const*>(argv));
               _exit(127);
             }
