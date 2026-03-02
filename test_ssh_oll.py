@@ -86,11 +86,19 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
     dequeued. This prevents head-of-line blocking: a tiny ACK packet that arrives just before a
     large RS-shard burst will not cause the shards to wait an extra full delay period.
     """
+    _last_diag = [0.0]
     try:
         while not stop_event.is_set():
             try:
                 data, read_ts = q.get(timeout=0.5)
             except queue.Empty:
+                if debug_label:
+                    now = time.perf_counter()
+                    if now - _last_diag[0] > 5.0:
+                        _last_diag[0] = now
+                        _qs = q.qsize()
+                        if _qs > 0:
+                            print(f"[proxy-q] {debug_label} sender idle but qsize={_qs}", flush=True)
                 continue
             if not data:
                 break
@@ -98,6 +106,10 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
                 kill_callback()
                 return
             delay = delay_spec() if callable(delay_spec) else delay_spec
+            if debug_label:
+                _qs = q.qsize()
+                if _qs > 3:
+                    print(f"[proxy-q] {debug_label} qsize={_qs} delay={delay*1000:.0f}ms", flush=True)
             if delay > 0:
                 if read_ts is not None:
                     # Schedule delivery at arrival_time + delay; any queue-wait time is already
@@ -111,7 +123,11 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
                 import sys
                 actual_delay = time.perf_counter() - read_ts
                 print(f"[proxy-debug] {debug_label} sending {len(data)} bytes actual_delay={actual_delay*1000:.1f}ms", file=sys.stderr, flush=True)
+            _t_send = time.perf_counter()
             sock_to.sendall(data)
+            _send_elapsed = time.perf_counter() - _t_send
+            if _send_elapsed > 0.1:
+                print(f"[proxy-send-block] sendall blocked {_send_elapsed*1000:.0f}ms len={len(data)}", flush=True)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
     finally:
@@ -171,6 +187,8 @@ def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, ki
     sender.join()
 
 
+_proxy_debug_enabled = False  # set True temporarily for diagnostics
+
 def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
     """Connect to server socket and relay client_conn <-> server in both directions with optional latency."""
     try:
@@ -204,7 +222,6 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
         _conn_id = next(proxy_connection._counter)
         _threading.current_thread()._proxy_conn_id = _conn_id
     relay_kw = {"death_probability": connection_death_probability, "kill_callback": kill_connection}
-    debug_s2c = f"s→c conn#{_conn_id}" if _conn_id == 0 else None
     try:
         t1 = threading.Thread(
             target=relay_with_latency,
@@ -215,7 +232,7 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
         t2 = threading.Thread(
             target=relay_with_latency,
             args=(server_conn, client_conn, delay_spec),
-            kwargs={**relay_kw, "debug_label": debug_s2c},
+            kwargs=relay_kw,
             daemon=True,
         )
         t1.start()
@@ -237,6 +254,48 @@ def _bucket_label(size, bucket_size=500):
     lo = (size // bucket_size) * bucket_size
     hi = lo + bucket_size
     return (lo, hi, f"{lo}-{hi}")
+
+
+def _evaluate_test_criteria(args, all_latencies_ms, stall_events):
+    """Check --test-* pass/fail criteria.  Returns a list of failure strings (empty = pass).
+
+    Parameters
+    ----------
+    args              : parsed argparse namespace
+    all_latencies_ms  : list of float — latency of every *completed* measurement in ms
+    stall_events      : list of (direction, duration_s) — stalls recorded during the test
+    """
+    failures = []
+
+    # Build the full latency set: completed measurements + stall durations (converted to ms)
+    full_latencies = list(all_latencies_ms)
+    stall_ms = [dur_s * 1000.0 for _, dur_s in stall_events]
+
+    if getattr(args, "test_max_latency", None) is not None:
+        worst = max(full_latencies + stall_ms) if (full_latencies or stall_ms) else 0.0
+        if worst > args.test_max_latency:
+            failures.append(
+                f"max latency {worst:.1f} ms exceeds threshold {args.test_max_latency:.1f} ms"
+            )
+
+    if getattr(args, "test_max_average_latency", None) is not None:
+        if full_latencies:
+            avg = sum(full_latencies) / len(full_latencies)
+            if avg > args.test_max_average_latency:
+                failures.append(
+                    f"average latency {avg:.1f} ms exceeds threshold {args.test_max_average_latency:.1f} ms"
+                )
+        else:
+            failures.append("no completed measurements — cannot evaluate average latency")
+
+    if getattr(args, "test_min_packets", None) is not None:
+        n = len(full_latencies)
+        if n < args.test_min_packets:
+            failures.append(
+                f"only {n} packets completed, need at least {args.test_min_packets}"
+            )
+
+    return failures
 
 
 def _print_size_bucket_summary(results, bucket_size=500):
@@ -275,6 +334,9 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     _inflight_lock = threading.Lock()
     _inflight_c2t = [None]   # perf_counter start of current c2t send, or None
     _inflight_t2c = [None]   # perf_counter start of current t2c send, or None
+    # Phase labels: "send" (in sendall/write) vs "recv" (waiting for data from peer)
+    _t2c_phase = [""]
+    _c2t_phase = [""]
     _stall_events = []        # list of (direction, duration_s)
     _stall_lock = threading.Lock()
 
@@ -294,15 +356,18 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             with _inflight_lock:
                 t_c2t = _inflight_c2t[0]
                 t_t2c = _inflight_t2c[0]
+                phase_c2t = _c2t_phase[0]
+                phase_t2c = _t2c_phase[0]
             parts = []
-            for label, t_start in (("client→TCP", t_c2t), ("TCP→client", t_t2c)):
+            for label, t_start, phase in (("client→TCP", t_c2t, phase_c2t), ("TCP→client", t_t2c, phase_t2c)):
                 if t_start is not None:
                     elapsed = now - t_start
                     if elapsed >= STALL_THRESHOLD_S:
                         last = _last_stall_print[label]
                         if elapsed >= last + 5.0:
                             _last_stall_print[label] = elapsed
-                            parts.append(f"{label} stalled {elapsed:.1f}s")
+                            phase_str = f" [{phase}]" if phase else ""
+                            parts.append(f"{label} stalled {elapsed:.1f}s{phase_str}")
                 else:
                     _last_stall_print[label] = 0.0  # reset when stall clears
             if parts:
@@ -318,8 +383,11 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 t0 = time.perf_counter()
                 with _inflight_lock:
                     _inflight_c2t[0] = t0
+                    _c2t_phase[0] = "write-stdin"
                 client_proc.stdin.write(payload)
                 client_proc.stdin.flush()
+                with _inflight_lock:
+                    _c2t_phase[0] = "recv-tcp"
                 received = b""
                 while len(received) < len(payload) and not stop_event.is_set():
                     try:
@@ -332,6 +400,7 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 t1 = time.perf_counter()
                 with _inflight_lock:
                     _inflight_c2t[0] = None
+                    _c2t_phase[0] = ""
                 dur = t1 - t0
                 if len(received) >= len(payload):
                     recv_exact = received[:len(payload)]
@@ -354,6 +423,7 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 with _inflight_lock:
                     _inflight_c2t[0] = None
+                    _c2t_phase[0] = ""
                 break
 
     def tcp_to_client():
@@ -364,16 +434,50 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 t0 = time.perf_counter()
                 with _inflight_lock:
                     _inflight_t2c[0] = t0
+                    _t2c_phase[0] = "sendall-tcp"
                 tcp_conn.sendall(payload)
                 received = b""
+                # Use the raw unbuffered fd so select() reflects true kernel readiness
+                # without the BufferedReader's internal buffer interfering.
+                raw_stdout = client_proc.stdout.raw
+                with _inflight_lock:
+                    _t2c_phase[0] = "read-stdout"
+                _last_progress = time.perf_counter()
                 while len(received) < len(payload) and not stop_event.is_set():
-                    chunk = client_proc.stdout.read(len(payload) - len(received))
+                    # Poll with 1 s timeout so stop_event can interrupt the read.
+                    try:
+                        r, _, _ = select.select([raw_stdout], [], [], 1.0)
+                    except (OSError, ValueError):
+                        break
+                    if not r:
+                        _elapsed = time.perf_counter() - t0
+                        if _elapsed > 3.0 and time.perf_counter() - _last_progress > 5.0:
+                            _last_progress = time.perf_counter()
+                            try:
+                                _fd = raw_stdout.fileno()
+                            except Exception:
+                                _fd = -1
+                            print(
+                                f"[t2c-diag] stalled {_elapsed:.1f}s: "
+                                f"recv={len(received)}/{size} fd={_fd} "
+                                f"stdout_closed={raw_stdout.closed}",
+                                flush=True,
+                            )
+                        continue
+                    try:
+                        chunk = raw_stdout.read(len(payload) - len(received))
+                    except BlockingIOError:
+                        continue
+                    except (OSError, ValueError):
+                        break
                     if not chunk:
                         break
                     received += chunk
+                    _last_progress = time.perf_counter()
                 t1 = time.perf_counter()
                 with _inflight_lock:
                     _inflight_t2c[0] = None
+                    _t2c_phase[0] = ""
                 dur = t1 - t0
                 if len(received) >= len(payload):
                     recv_exact = received[:len(payload)]
@@ -396,6 +500,7 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 with _inflight_lock:
                     _inflight_t2c[0] = None
+                    _t2c_phase[0] = ""
                 break
 
     run_c2t = not getattr(args, 'continuous_tcp_to_client_only', False)
@@ -417,8 +522,17 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         pass
     stop_event.set()
 
-    t1.join(timeout=2.0)
-    t2.join(timeout=2.0)
+    # Wait for the C2T thread to finish its current iteration before we close
+    # client_proc.stdin — concurrent stdin.write() + stdin.close() from two
+    # threads can crash Python's internal file-locking (SIGABRT).
+    # The C2T thread checks stop_event at the top of each iteration so it
+    # exits quickly once it returns from tcp_conn.recv() (1 s timeout).
+    if run_c2t:
+        t1.join(timeout=3.0)
+    # The T2C thread uses select+read1 with 1 s timeout, so it should also
+    # exit soon after stop_event is set.
+    if run_t2c:
+        t2.join(timeout=3.0)
 
     if continuous_errors:
         print(f"\nPayload validation: {len(continuous_errors)} mismatch(es)", file=sys.stderr)
@@ -449,6 +563,9 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     else:
         print(f"\nNo stall events (threshold: >{STALL_THRESHOLD_S:.0f}s).")
 
+    # Tear down: close client stdin so the client process exits (→ stdout EOF),
+    # which unblocks any thread stuck in client_proc.stdout.read().  Then close
+    # the TCP sockets so threads blocked in tcp_conn.recv() also unblock.
     try:
         client_proc.stdin.close()
     except (BrokenPipeError, OSError):
@@ -468,7 +585,30 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     except OSError:
         pass
 
-    return 1 if continuous_errors else 0
+    # Now threads should have unblocked; join them with a generous timeout.
+    if run_c2t:
+        t1.join(timeout=5.0)
+    if run_t2c:
+        t2.join(timeout=5.0)
+
+    # Evaluate pass/fail criteria.
+    all_latencies_ms = [lat for _, lat in results]
+    with _stall_lock:
+        stall_snap = list(_stall_events)
+    test_failures = _evaluate_test_criteria(args, all_latencies_ms, stall_snap)
+    if test_failures:
+        print("\nTEST FAILED:", file=sys.stderr)
+        for f in test_failures:
+            print(f"  FAIL: {f}", file=sys.stderr)
+    else:
+        _has_criteria = any(
+            getattr(args, k, None) is not None
+            for k in ("test_max_latency", "test_max_average_latency", "test_min_packets")
+        )
+        if _has_criteria:
+            print("\nTEST PASSED: all criteria met.")
+
+    return 1 if (continuous_errors or test_failures) else 0
 
 
 def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
@@ -641,6 +781,30 @@ def main():
         action="store_true",
         default=False,
         help="In --continuous mode, only run the client→TCP direction (suppress TCP→client)",
+    )
+
+    # Pass/fail criteria (both continuous and non-continuous modes).
+    # The test exits with code 1 if any violated criterion is detected.
+    parser.add_argument(
+        "--test-max-latency",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="Fail if any single measured latency (or stall duration) exceeds this value in ms.",
+    )
+    parser.add_argument(
+        "--test-max-average-latency",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="Fail if the average latency across all completed measurements exceeds this value in ms.",
+    )
+    parser.add_argument(
+        "--test-min-packets",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Fail if fewer than N packets complete successfully during the test.",
     )
     args = parser.parse_args()
 
@@ -906,6 +1070,20 @@ def main():
     elif args.latency_ms:
         print(f"  (injected proxy latency: {args.latency_ms} ms per direction)")
 
+    all_latencies_ms = latencies_client_to_tcp + latencies_tcp_to_client
+    test_failures = _evaluate_test_criteria(args, all_latencies_ms, [])
+    if test_failures:
+        print("\nTEST FAILED:", file=sys.stderr)
+        for f in test_failures:
+            print(f"  FAIL: {f}", file=sys.stderr)
+        return 1
+
+    _has_criteria = any(
+        getattr(args, k, None) is not None
+        for k in ("test_max_latency", "test_max_average_latency", "test_min_packets")
+    )
+    if _has_criteria:
+        print("\nTEST PASSED: all criteria met.")
     return 0
 
 

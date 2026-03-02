@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# test_all.sh — run a suite of ssh-oll integration tests with pass/fail criteria.
+#
+# Each test exercises test_ssh_oll.py with a different network profile and asserts
+# latency / throughput bounds.  Exit code is 0 when all tests pass, non-zero otherwise.
+#
+# Usage:
+#   ./test_all.sh                     # run all tests
+#   ./test_all.sh fixed-10ms          # run only the named test(s) (prefix match)
+#   VERBOSE=1 ./test_all.sh           # always print test output
+#   SSH_OLL=./ssh-oll ./test_all.sh   # override binary path
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SSH_OLL="${SSH_OLL:-${SCRIPT_DIR}/ssh-oll}"
+TEST="${SCRIPT_DIR}/test_ssh_oll.py"
+VERBOSE="${VERBOSE:-0}"
+FILTER="${1:-}"         # optional prefix filter (run only matching test names)
+
+# Simulated SSH-auth latency per new carrier connection (0.3 s).  This exercises
+# the connection-establishment path without dominating measured latencies.
+# Override with INIT_LATENCY=N to use a different value.
+INIT_LATENCY="${INIT_LATENCY:-0.3}"
+
+# ── Counters ────────────────────────────────────────────────────────────────
+pass=0
+fail=0
+skip=0
+declare -a failed_names=()
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+run_test() {
+    local name="$1"; shift
+    # Apply optional filter
+    if [[ -n "$FILTER" && "$name" != "$FILTER"* ]]; then
+        ((skip++)) || true
+        return
+    fi
+
+    local logfile
+    logfile="$(mktemp /tmp/ssh-oll-test-XXXXXX.log)"
+    printf "  %-52s " "$name"
+
+    # Pick a random high port (32768–60999) to avoid TIME_WAIT conflicts between
+    # back-to-back tests that all default to port 2222.
+    local tcp_port=$(( RANDOM % 28232 + 32768 ))
+
+    local exit_code=0
+    python3 "$TEST" --ssh-oll-path "$SSH_OLL" \
+        --tcp-port "$tcp_port" \
+        --initial-connection-latency "$INIT_LATENCY" \
+        "$@" >"$logfile" 2>&1 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        echo "PASS"
+        ((pass++)) || true
+    else
+        echo "FAIL  (exit $exit_code)"
+        ((fail++)) || true
+        failed_names+=("$name")
+    fi
+
+    if [[ $exit_code -ne 0 || "$VERBOSE" == "1" ]]; then
+        # Indent test output for readability
+        sed 's/^/    | /' "$logfile"
+    fi
+    rm -f "$logfile"
+
+    # Brief pause: lets the previous ssh-oll server daemon exit on backend EOF and
+    # gives the OS time to release file descriptors and socket resources.
+    sleep 2
+}
+
+# ── Build check ─────────────────────────────────────────────────────────────
+if [[ ! -x "$SSH_OLL" ]]; then
+    echo "ERROR: ssh-oll binary not found at $SSH_OLL" >&2
+    echo "       Run 'make' first, or set SSH_OLL=/path/to/ssh-oll" >&2
+    exit 1
+fi
+
+echo "ssh-oll binary: $SSH_OLL"
+echo "Running tests..."
+echo ""
+
+# ============================================================================
+# 1. Fixed low latency — the baseline.
+#    Observed: avg ~11 ms, max ~15 ms, ~2800 packets/30 s.
+#    Thresholds are generous (2×–5×) to absorb run-to-run variation.
+# ============================================================================
+run_test "fixed-10ms" \
+    --continuous --continuous-duration 30 \
+    --latency-ms 10 \
+    --test-max-latency        200 \
+    --test-max-average-latency  50 \
+    --test-min-packets         500
+
+# ============================================================================
+# 2. Fixed medium latency — 100 ms one-way (typical WAN hop).
+#    Observed: avg ~101 ms, max ~103 ms, ~600 packets/30 s.
+# ============================================================================
+run_test "fixed-100ms" \
+    --continuous --continuous-duration 30 \
+    --latency-ms 100 \
+    --test-max-latency        500 \
+    --test-max-average-latency 200 \
+    --test-min-packets         300
+
+# ============================================================================
+# 3. Bimodal random: 95 % at 10 ms, 5 % at 100 ms.
+#    Simulates a fast link with infrequent high-latency chunks (e.g. TCP
+#    retransmits on the underlying carrier network).
+#    Observed: avg ~15 ms, max ~111 ms, ~3500 packets/30 s.
+# ============================================================================
+run_test "random-10ms-base-100ms-spike-5pct" \
+    --continuous --continuous-duration 30 \
+    --latency-random \
+    --latency-random-low-ms  10  \
+    --latency-random-high-ms 100 \
+    --latency-random-pct     5   \
+    --test-max-latency        500 \
+    --test-max-average-latency 100 \
+    --test-min-packets        1000
+
+# ============================================================================
+# 4. Bimodal random: 95 % at 100 ms, 5 % at 1000 ms.
+#    Simulates a WAN link with occasional high-latency bursts.
+#    Observed: avg ~107 ms, max ~905 ms, ~730 packets/60 s.
+# ============================================================================
+run_test "random-100ms-base-1000ms-spike-5pct" \
+    --continuous --continuous-duration 60 \
+    --latency-random \
+    --latency-random-low-ms  100  \
+    --latency-random-high-ms 1000 \
+    --latency-random-pct     5    \
+    --test-max-latency       2000 \
+    --test-max-average-latency 300 \
+    --test-min-packets        400
+
+# ============================================================================
+# 5. Bimodal random: 95 % at 100 ms, 5 % at 2000 ms.
+#    The harshest pure-latency test; validates RS redundancy adaptation.
+#    Observed: avg ~175 ms, max ~2001 ms, ~1200 packets/100 s.
+# ============================================================================
+run_test "random-100ms-base-2000ms-spike-5pct" \
+    --continuous --continuous-duration 100 \
+    --latency-random \
+    --latency-random-low-ms  100  \
+    --latency-random-high-ms 2000 \
+    --latency-random-pct     5    \
+    --test-max-latency       5000 \
+    --test-max-average-latency 500 \
+    --test-min-packets        600
+
+# ============================================================================
+# 6. Rare connection death — 0.2 % per-packet probability.
+#    RS + retransmit should recover within a few seconds.
+#    50 ms base latency so the connection isn't trivially fast.
+# ============================================================================
+run_test "connection-death-0.002" \
+    --continuous --continuous-duration 60 \
+    --latency-ms 50 \
+    --connection-death-probability 0.002 \
+    --test-max-latency        10000 \
+    --test-max-average-latency  500 \
+    --test-min-packets           80
+
+# ============================================================================
+# 7. Moderate connection death — 1 % per-packet probability.
+#    Connections die frequently; retransmit and carrier-floor logic exercised.
+# ============================================================================
+run_test "connection-death-0.01" \
+    --continuous --continuous-duration 60 \
+    --latency-ms 50 \
+    --connection-death-probability 0.01 \
+    --test-max-latency        20000 \
+    --test-max-average-latency 1000 \
+    --test-min-packets           40
+
+# ============================================================================
+# 8. Combined: latency spikes + connection death.
+#    Both RS adaptation and retransmit recovery must work simultaneously.
+# ============================================================================
+run_test "combined-latency-and-death" \
+    --continuous --continuous-duration 60 \
+    --latency-random \
+    --latency-random-low-ms  50  \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.005 \
+    --test-max-latency        15000 \
+    --test-max-average-latency  800 \
+    --test-min-packets           60
+
+# ============================================================================
+# 9. Auto-adapt disabled (--no-auto) — fixed RS and carrier count.
+#    Verifies the non-adaptive path delivers data on a clean 10 ms link.
+#    Thresholds are relaxed compared to adaptive mode (no RS tuning).
+# ============================================================================
+run_test "no-auto-adapt-fixed-10ms" \
+    --continuous --continuous-duration 30 \
+    --latency-ms 10 \
+    --extra-client-args --no-auto \
+    --test-max-latency       1000 \
+    --test-max-average-latency 300 \
+    --test-min-packets         50
+
+# ============================================================================
+# 10. Integrity-only — no latency/throughput criteria; just verify that no
+#     payload corruption occurs across a 15-second run.
+# ============================================================================
+run_test "sanity-integrity" \
+    --continuous --continuous-duration 15 \
+    --latency-ms 5
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+echo ""
+echo "────────────────────────────────────────────────────────"
+total=$(( pass + fail + skip ))
+echo "Results: ${pass} passed  ${fail} failed  ${skip} skipped  (${total} total)"
+if [[ ${#failed_names[@]} -gt 0 ]]; then
+    echo "Failed tests:"
+    for n in "${failed_names[@]}"; do
+        echo "  - $n"
+    done
+fi
+echo "────────────────────────────────────────────────────────"
+
+[[ $fail -eq 0 ]]
