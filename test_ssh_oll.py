@@ -127,7 +127,10 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
             sock_to.sendall(data)
             _send_elapsed = time.perf_counter() - _t_send
             if _send_elapsed > 0.1:
-                print(f"[proxy-send-block] sendall blocked {_send_elapsed*1000:.0f}ms len={len(data)}", flush=True)
+                try:
+                    print(f"[proxy-send-block] sendall blocked {_send_elapsed*1000:.0f}ms len={len(data)}", flush=True)
+                except Exception:
+                    pass
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
     finally:
@@ -867,10 +870,13 @@ def main():
                 else:
                     connection_count[0] -= 1
                 n = connection_count[0]
-            if event == "opened":
-                print(f"Connection opened (total {n})", flush=True)
-            else:
-                print(f"Connection closed (total {n})", flush=True)
+            try:
+                if event == "opened":
+                    print(f"Connection opened (total {n})", flush=True)
+                else:
+                    print(f"Connection closed (total {n})", flush=True)
+            except Exception:
+                pass
 
     initial_latency_sec = max(0.0, args.initial_connection_latency)
     death_prob = max(0.0, min(1.0, args.connection_death_probability))

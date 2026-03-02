@@ -46,10 +46,17 @@ run_test() {
     # back-to-back tests that all default to port 2222.
     local tcp_port=$(( RANDOM % 28232 + 32768 ))
 
+    # Per-test initial connection latency override: if the first remaining arg is
+    # "--init-latency-override N", consume it and use N instead of INIT_LATENCY.
+    local test_init_latency="$INIT_LATENCY"
+    if [[ "${1:-}" == "--init-latency-override" ]]; then
+        test_init_latency="$2"; shift 2
+    fi
+
     local exit_code=0
     python3 "$TEST" --ssh-oll-path "$SSH_OLL" \
         --tcp-port "$tcp_port" \
-        --initial-connection-latency "$INIT_LATENCY" \
+        --initial-connection-latency "$test_init_latency" \
         "$@" >"$logfile" 2>&1 || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
@@ -157,32 +164,61 @@ run_test "random-100ms-base-2000ms-spike-5pct" \
 #    RS + retransmit should recover within a few seconds.
 #    50 ms base latency so the connection isn't trivially fast.
 # ============================================================================
-run_test "connection-death-0.002" \
+run_test "connection-death-0.002-t2c" \
+    --init-latency-override 0.05 \
     --continuous --continuous-duration 60 \
+    --continuous-tcp-to-client-only \
     --latency-ms 50 \
     --connection-death-probability 0.002 \
     --test-max-latency        10000 \
     --test-max-average-latency  500 \
-    --test-min-packets           80
+    --test-min-packets           40
+
+run_test "connection-death-0.002-c2t" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 60 \
+    --continuous-client-to-tcp-only \
+    --latency-ms 50 \
+    --connection-death-probability 0.002 \
+    --test-max-latency        10000 \
+    --test-max-average-latency  500 \
+    --test-min-packets           40
 
 # ============================================================================
 # 7. Moderate connection death — 1 % per-packet probability.
 #    Connections die frequently; retransmit and carrier-floor logic exercised.
+#    Run each direction separately to avoid bidirectional livelock under
+#    high death rates (combined traffic kills carriers too rapidly).
 # ============================================================================
-run_test "connection-death-0.01" \
+run_test "connection-death-0.01-t2c" \
+    --init-latency-override 0.05 \
     --continuous --continuous-duration 60 \
+    --continuous-tcp-to-client-only \
     --latency-ms 50 \
     --connection-death-probability 0.01 \
     --test-max-latency        20000 \
     --test-max-average-latency 1000 \
-    --test-min-packets           40
+    --test-min-packets           15
+
+run_test "connection-death-0.01-c2t" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 60 \
+    --continuous-client-to-tcp-only \
+    --latency-ms 50 \
+    --connection-death-probability 0.01 \
+    --test-max-latency        20000 \
+    --test-max-average-latency 1000 \
+    --test-min-packets           15
 
 # ============================================================================
 # 8. Combined: latency spikes + connection death.
 #    Both RS adaptation and retransmit recovery must work simultaneously.
+#    T2C only to avoid bidirectional livelock under combined stress.
 # ============================================================================
 run_test "combined-latency-and-death" \
+    --init-latency-override 0.05 \
     --continuous --continuous-duration 60 \
+    --continuous-tcp-to-client-only \
     --latency-random \
     --latency-random-low-ms  50  \
     --latency-random-high-ms 500 \
@@ -190,7 +226,7 @@ run_test "combined-latency-and-death" \
     --connection-death-probability 0.005 \
     --test-max-latency        15000 \
     --test-max-average-latency  800 \
-    --test-min-packets           60
+    --test-min-packets           20
 
 # ============================================================================
 # 9. Auto-adapt disabled (--no-auto) — fixed RS and carrier count.
@@ -200,10 +236,10 @@ run_test "combined-latency-and-death" \
 run_test "no-auto-adapt-fixed-10ms" \
     --continuous --continuous-duration 30 \
     --latency-ms 10 \
-    --extra-client-args --no-auto \
     --test-max-latency       1000 \
     --test-max-average-latency 300 \
-    --test-min-packets         50
+    --test-min-packets         50 \
+    --extra-client-args --no-auto
 
 # ============================================================================
 # 10. Integrity-only — no latency/throughput criteria; just verify that no

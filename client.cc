@@ -254,7 +254,8 @@ int run_client(const Args& args) {
 
   // Timing for periodic operations that don't depend on carrier events.
   uint64_t last_ping_check_ns       = 0;
-  uint64_t last_rs_drain_ns         = 0;
+  uint64_t last_rs_drain_ns                = 0;
+  uint64_t next_deliver_id_stuck_since_ns  = 0;  // when gap at next_deliver_id first appeared
   uint64_t last_retransmit_check_ns = 0;
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
@@ -422,6 +423,9 @@ int run_client(const Args& args) {
   // Also returns the SSH index slot to the free pool (SSH mode), and flags retransmit
   // when the very last carrier is lost while data remains unacknowledged.
   auto remove_carrier = [&](int fd) {
+    { static FILE* rcf = fopen("/tmp/ssh-oll-cli-events.log","a");
+      if(rcf){ fprintf(rcf,"[carrier-remove t=%llu fd=%d total=%zu]\n",
+               (unsigned long long)(now_ns()/1000000ULL),fd,carriers.size()-1); fflush(rcf); } }
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     carriers.erase(fd);
@@ -979,6 +983,22 @@ int run_client(const Args& args) {
         }
       }
 
+      // ── Debug: periodic state dump ────────────────────────────────────────
+      {
+        static FILE* cdbgf = fopen("/tmp/ssh-oll-cli-state.log","a");
+        if (cdbgf) {
+          fprintf(cdbgf,"[cli] carriers=%zu unacked=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu\n",
+                  carriers.size(), unacked_sends.size(), reassembly.size(), rs_pending.size(),
+                  (unsigned long long)next_deliver_id, stdout_buf.size());
+          if (!rs_pending.empty()) {
+            auto it = rs_pending.begin();
+            fprintf(cdbgf,"  first rs_pending id=%llu shards=%zu k=%u n=%u\n",
+                    (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
+          }
+          fflush(cdbgf);
+        }
+      }
+
       // RS stale-group drain: safety net for RS groups that can never complete
       // (e.g., all shards were on carriers that died before the retransmit arrived).
       // After 10 s, drop the incomplete group and advance next_deliver_id past the
@@ -986,31 +1006,67 @@ int run_client(const Args& args) {
       if (now_p - last_rs_drain_ns >= 1000000000ULL) {
         last_rs_drain_ns = now_p;
         static constexpr uint64_t RS_STALE_NS = 10000000000ULL;  // 10 s
+        // Collect IDs that are actually being erased (had partial shards but timed out).
+        // We must only gap-jump past IDs that were genuinely stale — not past IDs that
+        // simply haven't received any shard yet (e.g. a SMALL arrived before the RS shard).
+        std::vector<uint64_t> drained_ids;
         for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > RS_STALE_NS)
+          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > RS_STALE_NS) {
+            drained_ids.push_back(it->first);
             it = rs_pending.erase(it);
-          else
+          } else
             ++it;
         }
+        // Build a set of drained IDs for O(1) lookup in the loop below.
+        std::set<uint64_t> drained_set(drained_ids.begin(), drained_ids.end());
         // Advance next_deliver_id past any gaps left by the drain, delivering
         // any reassembly entries that were previously blocked behind them.
+        //
+        // Gap-jump rules (to avoid the RS+SMALL-split race):
+        //  1. Always jump a gap that was explicitly stale-drained (partial shards timed out).
+        //  2. Always jump when all carriers are dead (shards can never arrive).
+        //  3. Jump a gap that has been continuously present for > RS_STALE_NS —
+        //     this covers RS groups where NO shard ever arrived (e.g., carrier
+        //     died before delivering any shard) while giving enough time for
+        //     retransmission to succeed before we give up.
+        //  Never jump a gap that just appeared (out-of-order SMALL/RS race).
         while (true) {
           auto ra = reassembly.find(next_deliver_id);
           if (ra != reassembly.end()) {
             recv_cb.on_deliver(-1, next_deliver_id, ra->second.data(), ra->second.size());
             reassembly.erase(ra);
             next_deliver_id++;
+            next_deliver_id_stuck_since_ns = 0;  // gap resolved
           } else if (rs_pending.count(next_deliver_id)) {
-            break;  // still waiting for this group
+            next_deliver_id_stuck_since_ns = 0;  // waiting normally, not stuck
+            break;
           } else {
-            // Gap: jump to the next known pending or decoded ID.
-            uint64_t nxt = UINT64_MAX;
-            if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
-            if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
-            if (nxt > next_deliver_id && nxt < UINT64_MAX)
-              next_deliver_id = nxt;
-            else
+            // Gap: next_deliver_id is absent from both reassembly and rs_pending.
+            bool has_higher = !reassembly.empty() || !rs_pending.empty();
+            if (!has_higher) {
+              next_deliver_id_stuck_since_ns = 0;
               break;
+            }
+            bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
+            bool no_carriers        = carriers.empty();
+            bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
+                                       now_p - next_deliver_id_stuck_since_ns >= RS_STALE_NS);
+            if (explicitly_drained || no_carriers || gap_timed_out) {
+              uint64_t nxt = UINT64_MAX;
+              if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
+              if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
+              if (nxt > next_deliver_id && nxt < UINT64_MAX) {
+                next_deliver_id = nxt;
+                next_deliver_id_stuck_since_ns = 0;
+              } else {
+                break;
+              }
+            } else {
+              // Gap just appeared or retransmit still in flight — start/continue timer.
+              if (next_deliver_id_stuck_since_ns == 0)
+                next_deliver_id_stuck_since_ns = now_p;
+              break;
+            }
           }
         }
       }
@@ -1034,6 +1090,9 @@ int run_client(const Args& args) {
           // Unix-socket mode: just dial a fresh connection.
           if (carriers.size() < max_connections) {
             int fd = connect_unix(socket_path);
+            { static FILE* cef = fopen("/tmp/ssh-oll-cli-reconnect.log","a");
+              if(cef){ fprintf(cef,"[floor-add t=%llu carriers=%zu fd=%d errno=%d]\n",
+                       (unsigned long long)(now_ns()/1000000ULL),carriers.size(),fd,fd<0?errno:0); fflush(cef); } }
             if (fd >= 0) {
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;

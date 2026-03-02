@@ -210,7 +210,8 @@ int run_server(const Args& args) {
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
 
   uint64_t last_ping_check_ns       = 0;
-  uint64_t last_rs_drain_ns         = 0;
+  uint64_t last_rs_drain_ns                = 0;
+  uint64_t next_deliver_id_stuck_since_ns  = 0;
   uint64_t last_retransmit_check_ns = 0;
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
@@ -409,11 +410,15 @@ int run_server(const Args& args) {
   bool running = true;
 
   while (running) {
-    // 15-second bound ensures we run ping/inactivity/RS-drain even when fully idle.
-    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 15000);
+    // 500ms bound ensures retransmit/ping checks run promptly even when carriers are idle.
+    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 500);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
+    }
+    {
+      static FILE* lef = fopen("/tmp/ssh-oll-srv-events.log","a");
+      if(lef && n > 0){ fprintf(lef,"[epoll-return t=%llu n=%d]\n",(unsigned long long)(now_ns()/1000000ULL),n); fflush(lef); }
     }
     for (int i = 0; i < n; i++) {
       int fd = events[i].data.fd;
@@ -431,6 +436,8 @@ int run_server(const Args& args) {
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
             carriers[client].connect_ns = now_ns();
+            { static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+              if(ef){ fprintf(ef,"[carrier-open t=%llu fd=%d total=%zu]\n",(unsigned long long)(now_ns()/1000000ULL),client,carriers.size()); fflush(ef);} }
             if (backend_fd < 0)
               connect_backend();
             // Re-send any data that was in-flight when all previous carriers died,
@@ -466,6 +473,12 @@ int run_server(const Args& args) {
               ev.data.fd = client;
               epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);
             }
+            // If there is buffered backend data that couldn't be encoded earlier
+            // because all carriers were dead, encode and send it now.
+            if (!backend_read_buf.empty()) {
+              flush_backend_pending();
+              flush_carrier_writes();
+            }
           } else {
             close(client);
           }
@@ -480,8 +493,14 @@ int run_server(const Args& args) {
           uint8_t buf[READ_BUF_SIZE];
           ssize_t nr = read(backend_fd, buf, sizeof buf);
           if (nr <= 0) {
-            if (nr == 0) { FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"backend EOF → exit\n");fclose(dbgf);} running = false; }
-            else if (errno != EAGAIN && errno != EWOULDBLOCK) { FILE* dbgf = fopen("/tmp/ssh-oll-server-exit.log","a"); if(dbgf){fprintf(dbgf,"backend read error errno=%d\n",errno);fclose(dbgf);} }
+            if (nr == 0) {
+              running = false;
+              static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+              if(ef){ fprintf(ef,"[backend-eof t=%llu]\n",(unsigned long long)(now_ns()/1000000ULL)); fflush(ef);}
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+              static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+              if(ef){ fprintf(ef,"[backend-read-err t=%llu errno=%d]\n",(unsigned long long)(now_ns()/1000000ULL),errno); fflush(ef);}
+            }
             break;
           }
           backend_read_buf.insert(backend_read_buf.end(), buf, buf + nr);
@@ -499,19 +518,25 @@ int run_server(const Args& args) {
 
       auto it = carriers.find(fd);
       if (it != carriers.end()) {
+        bool carrier_removed = false;
         if (e & EPOLLIN) {
           if (!process_carrier_read(fd, it->second)) {
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
+            { static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+              if(ef){ fprintf(ef,"[carrier-close-read t=%llu fd=%d total=%zu]\n",(unsigned long long)(now_ns()/1000000ULL),fd,carriers.size()); fflush(ef);} }
             if (carriers.empty() && !unacked_data.empty())
               retransmit_needed = true;
+            carrier_removed = true;
           }
         }
-        if (e & (EPOLLERR | EPOLLHUP)) {
+        if (!carrier_removed && (e & (EPOLLERR | EPOLLHUP))) {
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
+          { static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+            if(ef){ fprintf(ef,"[carrier-close-err t=%llu fd=%d total=%zu]\n",(unsigned long long)(now_ns()/1000000ULL),fd,carriers.size()); fflush(ef);} }
           if (carriers.empty() && !unacked_data.empty())
             retransmit_needed = true;
         }
@@ -519,6 +544,20 @@ int run_server(const Args& args) {
     }
 
     const uint64_t now_ns_val = now_ns();
+
+    // ── Debug: periodic state dump ──────────────────────────────────────────
+    {
+      static uint64_t last_dbg_ns = 0;
+      static FILE* dbgf3 = fopen("/tmp/ssh-oll-srv-state.log","a");
+      if (dbgf3 && now_ns_val - last_dbg_ns >= 1000000000ULL) {
+        last_dbg_ns = now_ns_val;
+        fprintf(dbgf3,"[srv t=%llu] carriers=%zu unacked=%zu backend_read_buf=%zu retransmit_needed=%d next_send_id=%llu backend_fd=%d backend_connected=%d\n",
+                (unsigned long long)(now_ns_val/1000000ULL),
+                carriers.size(), unacked_data.size(), backend_read_buf.size(), (int)retransmit_needed,
+                (unsigned long long)next_send_id, backend_fd, (int)backend_connected);
+        fflush(dbgf3);
+      }
+    }
 
     // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
     if (now_ns_val - last_ping_check_ns >= 1000000000ULL) {
@@ -613,28 +652,50 @@ int run_server(const Args& args) {
     if (now_ns_val - last_rs_drain_ns >= 1000000000ULL) {
       last_rs_drain_ns = now_ns_val;
       static constexpr uint64_t RS_STALE_NS = 10000000000ULL;
+      // Collect only the IDs that were actually erased (had partial shards and
+      // timed out).  We must never gap-jump past IDs that simply haven't received
+      // any shard yet — those shards may still arrive.
+      std::vector<uint64_t> drained_ids;
       for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > RS_STALE_NS)
+        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > RS_STALE_NS) {
+          drained_ids.push_back(it->first);
           it = rs_pending.erase(it);
-        else
+        } else
           ++it;
       }
+      std::set<uint64_t> drained_set(drained_ids.begin(), drained_ids.end());
       while (true) {
         auto ra = reassembly.find(next_deliver_id);
         if (ra != reassembly.end()) {
           recv_cb.on_deliver(-1, next_deliver_id, ra->second.data(), ra->second.size());
           reassembly.erase(ra);
           next_deliver_id++;
+          next_deliver_id_stuck_since_ns = 0;
         } else if (rs_pending.count(next_deliver_id)) {
+          next_deliver_id_stuck_since_ns = 0;
           break;
         } else {
-          uint64_t nxt = UINT64_MAX;
-          if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
-          if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
-          if (nxt > next_deliver_id && nxt < UINT64_MAX)
-            next_deliver_id = nxt;
-          else
+          bool has_higher = !reassembly.empty() || !rs_pending.empty();
+          if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
+          bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
+          bool no_carriers        = carriers.empty();
+          bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
+                                     now_ns_val - next_deliver_id_stuck_since_ns >= RS_STALE_NS);
+          if (explicitly_drained || no_carriers || gap_timed_out) {
+            uint64_t nxt = UINT64_MAX;
+            if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
+            if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
+            if (nxt > next_deliver_id && nxt < UINT64_MAX) {
+              next_deliver_id = nxt;
+              next_deliver_id_stuck_since_ns = 0;
+            } else {
+              break;
+            }
+          } else {
+            if (next_deliver_id_stuck_since_ns == 0)
+              next_deliver_id_stuck_since_ns = now_ns_val;
             break;
+          }
         }
       }
     }
@@ -684,6 +745,14 @@ int run_server(const Args& args) {
     }
 
     ensure_backend_connected();
+    if (!backend_read_buf.empty() && carriers.empty()) {
+      static FILE* dbgf2 = fopen("/tmp/ssh-oll-srv-stall.log","a");
+      if(dbgf2){
+        fprintf(dbgf2,"[srv-t2c-stall] backend_read_buf=%zu carriers=0 unacked=%zu retransmit_needed=%d\n",
+                backend_read_buf.size(), unacked_data.size(), (int)retransmit_needed);
+        fflush(dbgf2);
+      }
+    }
     if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
       const size_t block_size = max_packet;
       if (backend_read_buf.size() >= block_size) {
@@ -752,8 +821,31 @@ int run_server(const Args& args) {
     }
     flush_backend_pending();
     flush_carrier_writes();
+    // Debug: count loop iterations
+    {
+      static uint64_t loop_count = 0;
+      static uint64_t last_log_ns = 0;
+      loop_count++;
+      uint64_t t = now_ns();
+      if (t - last_log_ns >= 5000000000ULL) {
+        last_log_ns = t;
+        static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+        if(ef){ fprintf(ef,"[loop-count t=%llu loops=%llu carriers=%zu]\n",
+                (unsigned long long)(t/1000000ULL),(unsigned long long)loop_count,carriers.size()); fflush(ef); }
+      }
+    }
   }
 
+  {
+    static FILE* ef = fopen("/tmp/ssh-oll-srv-events.log","a");
+    if(ef){
+      fprintf(ef,"[server-exit t=%llu carriers=%zu unacked=%zu next_send_id=%llu backend_fd=%d backend_connected=%d]\n",
+              (unsigned long long)(now_ns()/1000000ULL),
+              carriers.size(), unacked_data.size(), (unsigned long long)next_send_id,
+              backend_fd, (int)backend_connected);
+      fflush(ef);
+    }
+  }
   for (auto& [fd, _] : carriers)
     close(fd);
   if (backend_fd >= 0) close(backend_fd);
