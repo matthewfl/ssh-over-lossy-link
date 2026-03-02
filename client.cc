@@ -121,7 +121,8 @@ int get_so_error(int fd) {
 int run_client(const Args& args) {
   std::string socket_path;
   std::string client_dir;
-  std::vector<pid_t> ssh_pids;
+  std::map<unsigned, pid_t> ssh_idx_to_pid;  // SSH slot index -> PID
+  std::vector<pid_t> pids_to_reap;           // SIGTERMed but not yet waitpid'd
 
   if (!args.unix_socket_connection.empty()) {
     socket_path = args.unix_socket_connection;
@@ -138,14 +139,14 @@ int run_client(const Args& args) {
     }
 
     const unsigned N = args.config.connections;
-    ssh_pids.reserve(N);
 
     for (unsigned i = 0; i < N; ++i) {
       std::string local_path = client_dir + "/" + std::to_string(i);
       pid_t pid = fork();
       if (pid < 0) {
         std::perror("ssh-oll: fork");
-        for (pid_t p : ssh_pids) kill(p, SIGTERM);
+        for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
+        for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
         rmdir(client_dir.c_str());
         return 1;
       }
@@ -155,7 +156,7 @@ int run_client(const Args& args) {
         execvp("ssh", const_cast<char* const*>(argv));
         _exit(127);
       }
-      ssh_pids.push_back(pid);
+      ssh_idx_to_pid[i] = pid;
     }
 
     // Wait for SSH to create sockets and accept connections.
@@ -179,7 +180,8 @@ int run_client(const Args& args) {
   if (epfd < 0) {
     std::perror("ssh-oll: epoll_create1");
     if (args.unix_socket_connection.empty()) {
-      for (pid_t p : ssh_pids) kill(p, SIGTERM);
+      for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
+      for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
       rmdir(client_dir.c_str());
     }
     return 1;
@@ -289,7 +291,8 @@ int run_client(const Args& args) {
     std::fprintf(stderr, "ssh-oll: could not connect any carrier to server\n");
     close(epfd);
     if (args.unix_socket_connection.empty()) {
-      for (pid_t p : ssh_pids) kill(p, SIGTERM);
+      for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
+      for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
       rmdir(client_dir.c_str());
     }
     return 1;
@@ -428,8 +431,8 @@ int run_client(const Args& args) {
   }
 
   // Centralised carrier removal: closes the fd, removes from epoll, cleans up maps.
-  // Also returns the SSH index slot to the free pool (SSH mode), and flags retransmit
-  // when the very last carrier is lost while data remains unacknowledged.
+  // In SSH mode: kills the owning SSH process and unlinks its socket file so the
+  // slot can be reused cleanly.  Flags retransmit when the last carrier is lost.
   auto remove_carrier = [&](int fd) {
     if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu]\n",
                      (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
@@ -442,7 +445,20 @@ int run_client(const Args& args) {
         retransmit_needed = true;
       return;
     }
-    fd_to_ssh_index.erase(fd);
+    // SSH mode: kill the SSH process that owns this carrier slot so it doesn't
+    // linger as an orphan, and unlink its socket file so the index is reusable.
+    auto idx_it = fd_to_ssh_index.find(fd);
+    if (idx_it != fd_to_ssh_index.end()) {
+      unsigned idx = idx_it->second;
+      auto pid_it = ssh_idx_to_pid.find(idx);
+      if (pid_it != ssh_idx_to_pid.end()) {
+        kill(pid_it->second, SIGTERM);
+        pids_to_reap.push_back(pid_it->second);
+        ssh_idx_to_pid.erase(pid_it);
+      }
+      unlink((client_dir + "/" + std::to_string(idx)).c_str());
+      fd_to_ssh_index.erase(idx_it);
+    }
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
   };
@@ -844,7 +860,7 @@ int run_client(const Args& args) {
                 _exit(127);
               }
               if (pid > 0) {
-                ssh_pids.push_back(pid);
+                ssh_idx_to_pid[free_idx] = pid;
                 pending_carrier_paths.push_back(path);
                 if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
               }
@@ -903,6 +919,14 @@ int run_client(const Args& args) {
       // Ping + dead-carrier detection.  Run at most once per second to avoid overhead.
       if (now_p - last_ping_check_ns >= 1000000000ULL) {
         last_ping_check_ns = now_p;
+
+        // Reap any SSH processes that have exited after receiving SIGTERM.
+        if (!pids_to_reap.empty()) {
+          pids_to_reap.erase(
+              std::remove_if(pids_to_reap.begin(), pids_to_reap.end(),
+                  [](pid_t p) { return waitpid(p, nullptr, WNOHANG) != 0; }),
+              pids_to_reap.end());
+        }
         static constexpr uint64_t PING_IDLE_NS =  2000000000ULL;  //  2 s
         static constexpr uint64_t DEAD_IDLE_NS =  5000000000ULL;  //  5 s
         static constexpr uint64_t GRACE_NS     =  5000000000ULL;  //  5 s connect grace
@@ -1122,7 +1146,7 @@ int run_client(const Args& args) {
               _exit(127);
             }
             if (pid > 0) {
-              ssh_pids.push_back(pid);
+              ssh_idx_to_pid[free_idx] = pid;
               pending_carrier_paths.push_back(path);
               if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
             }
@@ -1171,8 +1195,15 @@ int run_client(const Args& args) {
   if (!args.unix_socket_connection.empty()) {
     // Direct Unix socket mode: no SSH processes or client_dir to clean up
   } else {
-    for (pid_t p : ssh_pids)
+    // Kill all remaining SSH processes (those not yet killed by remove_carrier).
+    for (auto& [_, p] : ssh_idx_to_pid)
       kill(p, SIGTERM);
+    // Reap previously-killed-but-not-yet-waited processes.
+    for (pid_t p : pids_to_reap)
+      waitpid(p, nullptr, 0);
+    // Reap the freshly-killed ones.
+    for (auto& [_, p] : ssh_idx_to_pid)
+      waitpid(p, nullptr, 0);
     for (unsigned i = 0; i < next_carrier_index; ++i)
       unlink((client_dir + "/" + std::to_string(i)).c_str());
     rmdir(client_dir.c_str());
