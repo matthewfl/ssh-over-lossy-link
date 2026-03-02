@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <dirent.h>
 
 namespace ssholl {
 
@@ -43,6 +44,29 @@ std::string make_client_dir() {
   char suffix[16];
   snprintf(suffix, sizeof suffix, "%08x", r);
   return std::string("/tmp/ssh-oll-client.") + suffix;
+}
+
+// Remove all entries in dir_path (socket files) and the directory itself.
+// Retries a few times to handle SSH processes that may not have released sockets yet.
+void remove_client_dir(const std::string& dir_path) {
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    DIR* d = opendir(dir_path.c_str());
+    if (d) {
+      struct dirent* ent;
+      while ((ent = readdir(d)) != nullptr) {
+        if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' || (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+          continue;
+        std::string p = dir_path + "/" + ent->d_name;
+        unlink(p.c_str());
+      }
+      closedir(d);
+    }
+    if (rmdir(dir_path.c_str()) == 0)
+      return;
+    if (errno != ENOTEMPTY && errno != EEXIST)
+      return;
+    usleep(50000);  // 50 ms before retry
+  }
 }
 
 // Launch server on remote host; read one line (socket path) from stdout. Returns path or empty on failure.
@@ -125,15 +149,16 @@ int get_so_error(int fd) {
   return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 ? err : -1;
 }
 
-// Set by SIGINT/SIGTERM handler; causes the main event loop to exit cleanly.
+// Set by SIGINT/SIGTERM/SIGHUP handler; causes the main event loop to exit cleanly.
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static void shutdown_handler(int) { g_shutdown_requested = 1; }
 
 }  // namespace
 
 int run_client(const Args& args) {
-  // Catch SIGINT (Ctrl-C) and SIGTERM so the cleanup path (kill SSH children,
-  // unlink sockets) runs even when the user interrupts the session.
+  // Catch SIGINT (Ctrl-C), SIGTERM, and SIGHUP so the cleanup path (kill SSH children,
+  // unlink sockets) runs. SIGHUP is sent when the SSH session closes (e.g. user
+  // disconnects); without a handler, the process would be killed before cleanup.
   {
     struct sigaction sa{};
     sa.sa_handler = shutdown_handler;
@@ -141,6 +166,7 @@ int run_client(const Args& args) {
     sa.sa_flags = SA_RESTART;
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP,  &sa, nullptr);
   }
 
   std::string socket_path;
@@ -171,7 +197,7 @@ int run_client(const Args& args) {
         std::perror("ssh-oll: fork");
         for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
         for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
-        rmdir(client_dir.c_str());
+        remove_client_dir(client_dir);
         return 1;
       }
       if (pid == 0) {
@@ -223,7 +249,7 @@ int run_client(const Args& args) {
     if (args.unix_socket_connection.empty()) {
       for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
       for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
-      rmdir(client_dir.c_str());
+      remove_client_dir(client_dir);
     }
     return 1;
   }
@@ -346,7 +372,7 @@ int run_client(const Args& args) {
     if (args.unix_socket_connection.empty()) {
       for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
       for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
-      rmdir(client_dir.c_str());
+      remove_client_dir(client_dir);
     }
     return 1;
   }
@@ -1321,9 +1347,7 @@ int run_client(const Args& args) {
     // Reap the freshly-killed ones.
     for (auto& [_, p] : ssh_idx_to_pid)
       waitpid(p, nullptr, 0);
-    for (unsigned i = 0; i < next_carrier_index; ++i)
-      unlink((client_dir + "/" + std::to_string(i)).c_str());
-    rmdir(client_dir.c_str());
+    remove_client_dir(client_dir);
   }
   if (dbg) fclose(dbg);
   return 0;

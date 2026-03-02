@@ -86,7 +86,7 @@ struct Config {
   std::string path_on_server = "ssh-oll";
   unsigned connections = 10;
   unsigned max_connections = 200;
-  unsigned packet_size = 800;
+  unsigned packet_size = 400;
   unsigned small_packet_redundancy = 2;
   float rs_redundancy = 0.2f;
   float max_delay_ms = 1.0f;
