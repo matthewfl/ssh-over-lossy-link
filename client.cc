@@ -69,16 +69,18 @@ std::string launch_server(const Args& args) {
     int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
     std::string port_str = std::to_string(args.remote_port);
-    const char* argv[] = {
-      "ssh", "-n",
-      args.lossy_ssh_host.c_str(),
-      args.config.path_on_server.c_str(),
-      "--server",
-      args.remote_hostname.c_str(),
-      port_str.c_str(),
-      nullptr
-    };
-    execvp("ssh", const_cast<char* const*>(argv));
+    std::vector<const char*> argv_vec;
+    argv_vec.push_back("ssh");
+    argv_vec.push_back("-n");
+    argv_vec.push_back(args.lossy_ssh_host.c_str());
+    argv_vec.push_back(args.config.path_on_server.c_str());
+    argv_vec.push_back("--server");
+    if (args.debug)
+      argv_vec.push_back("--debug");
+    argv_vec.push_back(args.remote_hostname.c_str());
+    argv_vec.push_back(port_str.c_str());
+    argv_vec.push_back(nullptr);
+    execvp("ssh", const_cast<char* const*>(argv_vec.data()));
     _exit(127);
   }
   close(pipefd[1]);
