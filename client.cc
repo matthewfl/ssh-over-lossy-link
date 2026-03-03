@@ -1127,7 +1127,7 @@ int run_client(const Args& args) {
                                    && (now - last_redundancy_pressure_add_ns >= REDUNDANCY_PRESSURE_ADD_INTERVAL_NS
                                        || last_redundancy_pressure_add_ns == 0);
         bool need_more = (total_write > backpressure_write_threshold)
-                         || (rtt_outlier && within_carrier_cap)
+                         || (rtt_outlier && within_carrier_cap && !unacked_sends.empty())  // no replace-add when idle
                          || redundancy_pressure;
         if (need_more) {
           last_add_carrier_ns = now;
@@ -1180,19 +1180,21 @@ int run_client(const Args& args) {
 
       // Carrier reaping: periodically close carriers that are clearly worse than their peers.
       // Two criteria (either triggers a reap):
-      //   1. RTT outlier: last_rtt_ns > 3× median AND > 1s (stalled on client→server path).
-      //   2. Silence: no shard received from server in 10s while other carriers are active
+      //   1. RTT outlier: last_rtt_ns > 5× median AND > 3×RTT (stalled on client→server path).
+      //   2. Silence: no shard received from server in N×RTT while other carriers are active
       //      (stalled on server→client path).
       // Skip reaping during initial handshake: when we have unacked data and few RTT
-      // samples, we shouldn't kill carriers. The "silent" carriers (haven't received ACK)
-      // are often good—ACKs go only to the carrier that delivered; others are used for
-      // sending. Reaping them causes churn that stalls the handshake on high-latency links.
+      // samples, we shouldn't kill carriers.
+      // Skip RTT outlier reap when idle: with no data in flight, a slower carrier still
+      // works (PING/PONG keeps it alive). Reaping and replacing causes churn for no benefit.
       const bool early_handshake = (unacked_sends.size() > 0 && rtt_samples.size() < 10);
+      const bool idle = unacked_sends.empty();
       if (!early_handshake && carriers.size() > min_carriers_floor && now - last_reap_ns >= reap_check_interval_ns) {
         last_reap_ns = now;
 
         // RTT-based reap: find worst carrier and reap if it's a clear outlier.
-        if (rtt_samples.size() >= 2) {
+        // When idle, skip—no benefit to replacing a marginally slower carrier.
+        if (!idle && rtt_samples.size() >= 2) {
           std::vector<uint64_t> sorted = rtt_samples;
           std::sort(sorted.begin(), sorted.end());
           uint64_t median_rtt = sorted[sorted.size() / 2];
