@@ -87,19 +87,22 @@ Conversely, a carrier is *reaped* in auto mode when: the carrier count is above 
 
 #### Reed-Solomon redundancy
 
-RS redundancy is adjusted every ~300 ms using a **shard-spread signal**: for each decoded RS group, the time between the *first* shard arriving and the *k*-th (last-needed) shard arriving is recorded. On a healthy link all shards arrive nearly simultaneously → spread ≈ 0. A non-zero spread means the group had to wait for a late or substitute parity shard — a direct sign that RS is under pressure.
+RS redundancy is adjusted every ~300 ms using two complementary timing signals measured on decoded RS groups. Both are independent of the link's base RTT — a uniformly high-latency link where all shards arrive slow but *together* reads as healthy.
 
-This metric is intentionally independent of the link's base RTT. A uniformly high-latency link where all shards arrive slow but *together* reads as zero spread and does not trigger a redundancy increase.
-
-The 10th percentile of recent spreads is treated as the fast-path baseline. A group is "struggling" if its spread is more than 2× the baseline (and above 1 ms absolute to avoid noise).
+**Increase signal — spread + final gap:** For each decoded group, if the total shard spread (first → k-th shard) exceeds 2 ms *and* the last inter-shard gap (k-1-th → k-th shard) accounts for more than half the total spread, the group is marked "struggling" — the last needed shard was a bottleneck, meaning one more loss would have stalled delivery.
 
 | Condition | Action |
 |-----------|--------|
 | > 5 % of groups struggling | Increase RS redundancy by +0.5 (aggressive) |
 | > 1 % struggling | Increase RS redundancy by +0.25 |
-| < 0.2 % struggling (≥ 30 samples) | Decrease RS redundancy by −0.05 (gradual) |
 
-RS redundancy is clamped to [0.2, 2.0]. Both directions are monitored: the server tracks spread for the client→server path and reports a rolling average in `SERVER_METRICS` every 400 ms; the client tracks the server→client path locally. The worse of the two directions drives the redundancy adjustment. In `--auto` mode the server manages its own redundancy and reports its chosen value via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
+**Decrease signal — extra-shard gap:** When a group decodes from its k-th shard, the arrival time of the (k+1)-th shard is recorded. If the 90th-percentile of recent k→(k+1) gaps is below 0.1 ms, it means an extra shard was essentially free nearly every time — the link has consistent headroom and parity can be reduced.
+
+| Condition | Action |
+|-----------|--------|
+| Extra-shard p90 < 0.1 ms **and** < 0.2 % struggling | Decrease RS redundancy by −0.05 (gradual) |
+
+RS redundancy is clamped to [0.1, 2.0] (minimum lowered from 0.2 since the extra-shard signal provides a safe lower bound). Both directions are monitored: the server reports c2s shard spread and average extra-shard gap to the client in `SERVER_METRICS` every 400 ms; the client measures s2c locally. In `--auto` mode the server manages its own redundancy and reports its chosen value via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
 
 #### RTT-scaled timeouts
 

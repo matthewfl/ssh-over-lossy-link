@@ -34,6 +34,7 @@ struct RsPending {
   unsigned k = 0;
   size_t block_size = 0;
   std::map<unsigned, std::vector<uint8_t>> shards;
+  std::map<unsigned, uint64_t> shard_recv_ns;  // shard_index -> arrival time (ns)
   uint64_t first_recv_ns = 0;  // when the first shard for this group arrived
 };
 
@@ -52,16 +53,22 @@ struct ReceiveCallbacks {
   std::function<void(const PacketConfig&)> on_set_config;
   // Fired each time an RS group is fully decoded.
   //   shards_received: how many shards arrived before decode was possible (>= k)
-  //   n:              total shards that were sent for this group
-  //   shard_spread_ns: time between the first shard arriving and the k-th (last-needed)
-  //                   shard arriving.  On a healthy link all k shards arrive nearly
-  //                   simultaneously → spread ≈ 0.  A spread > 0 means we had to wait
-  //                   for a slower/later shard, indicating a lagging or lossy carrier.
-  //                   This metric is independent of the link's base RTT.
-  std::function<void(unsigned shards_received, unsigned n, uint64_t shard_spread_ns)> on_rs_decode;
+  //   n:              total shards sent for this group
+  //   shard_spread_ns: time from the 1st shard to the k-th (last-needed) shard.
+  //                   Independent of link RTT: zero means all arrived together.
+  //   gap_final_ns:   time between the (k-1)-th and k-th shard specifically.
+  //                   Large gap_final relative to shard_spread means the last needed
+  //                   shard was a bottleneck (group was close to failing).
+  std::function<void(unsigned shards_received, unsigned n,
+                     uint64_t shard_spread_ns, uint64_t gap_final_ns)> on_rs_decode;
+  // Fired when the first "extra" shard (beyond the k needed) arrives for a recently
+  // decoded group.  gap_ns is the time from when the k-th shard arrived (decode
+  // triggered) to when this (k+1)-th shard arrived.  A consistently small gap means
+  // the extra shard was essentially free — we could reduce RS redundancy safely.
+  std::function<void(uint64_t gap_ns)> on_rs_extra_shard;
   // Server -> client SERVER_METRICS; client uses for adapt.
-  // avg_shard_spread_ns is the server's measured shard spread for the client→server path.
-  std::function<void(uint64_t max_rtt_ns, uint64_t avg_shard_spread_ns)> on_server_metrics;
+  std::function<void(uint64_t max_rtt_ns, uint64_t avg_shard_spread_ns,
+                     uint64_t avg_extra_shard_gap_ns)> on_server_metrics;
   // Server -> client SERVER_CONFIG; server's current redundancy (client uses when auto_adapt).
   std::function<void(const PacketServerConfig&)> on_server_config;
 };
@@ -69,12 +76,16 @@ struct ReceiveCallbacks {
 // Process bytes from carrier read_buf: parse SMALL/REED_SOLOMON, update reassembly/rs_pending,
 // advance next_deliver_id, invoke on_deliver for contiguous data. Invoke on_ping/on_ack/on_set_config
 // for control packets. Mutates s.read_buf, reassembly, rs_pending, next_deliver_id.
+// recently_decoded_ns: shared map of (id -> decode_time_ns) for recently decoded RS groups;
+//   used to detect and time "extra" shards that arrive after a group has already decoded.
+//   Caller must pass the same map across all calls for a session.
 // Returns false if the connection should be closed (eof or error).
 bool process_carrier_read(
   int fd,
   CarrierState& s,
   std::map<uint64_t, std::vector<uint8_t>>& reassembly,
   std::map<uint64_t, RsPending>& rs_pending,
+  std::map<uint64_t, uint64_t>& recently_decoded_ns,
   uint64_t& next_deliver_id,
   const ReceiveCallbacks& callbacks);
 
@@ -91,7 +102,7 @@ void append_pong(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
 void append_ready(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
-                           uint64_t avg_shard_spread_ns);
+                           uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).

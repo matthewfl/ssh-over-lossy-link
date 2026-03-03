@@ -16,6 +16,7 @@ bool process_carrier_read(
   CarrierState& s,
   std::map<uint64_t, std::vector<uint8_t>>& reassembly,
   std::map<uint64_t, RsPending>& rs_pending,
+  std::map<uint64_t, uint64_t>& recently_decoded_ns,
   uint64_t& next_deliver_id,
   const ReceiveCallbacks& callbacks) {
   auto now_ns = []() -> uint64_t {
@@ -88,7 +89,8 @@ bool process_carrier_read(
       const auto* pm = reinterpret_cast<const PacketServerMetrics*>(s.read_buf.data());
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerMetrics));
       if (callbacks.on_server_metrics)
-        callbacks.on_server_metrics(pm->max_rtt_ns, pm->avg_shard_spread_ns);
+        callbacks.on_server_metrics(pm->max_rtt_ns, pm->avg_shard_spread_ns,
+                                    pm->avg_extra_shard_gap_ns);
       continue;
     }
     if (h->packet_kind == PacketKind::SERVER_CONFIG) {
@@ -108,6 +110,16 @@ bool process_carrier_read(
       uint64_t id = h->id;
       unsigned n = prs->n, k = prs->k;
       if (id < next_deliver_id) {
+        // Group already decoded; this is an "extra" shard arriving late.
+        // If it's the first extra shard for this group, fire on_rs_extra_shard so
+        // the caller can measure the gap between the k-th and (k+1)-th shard.
+        if (callbacks.on_rs_extra_shard) {
+          auto it = recently_decoded_ns.find(id);
+          if (it != recently_decoded_ns.end()) {
+            callbacks.on_rs_extra_shard(now_ns() - it->second);
+            recently_decoded_ns.erase(it);  // only report first extra shard per group
+          }
+        }
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
         continue;
       }
@@ -132,8 +144,10 @@ bool process_carrier_read(
         continue;
       }
       if (!rp.shards.count(idx)) {
+        uint64_t t = now_ns();
         rp.shards[idx].assign(prs->data, prs->data + block_sz);
-        s.last_recv_ns = now_ns();
+        rp.shard_recv_ns[idx] = t;
+        s.last_recv_ns = t;
       }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
       if (rp.shards.size() >= static_cast<size_t>(k)) {
@@ -157,9 +171,25 @@ bool process_carrier_read(
               reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
           }
         }
-        if (callbacks.on_rs_decode) {
-          uint64_t spread_ns = now_ns() - rp.first_recv_ns;
-          callbacks.on_rs_decode(static_cast<unsigned>(rp.shards.size()), rp.n, spread_ns);
+        if (callbacks.on_rs_decode || callbacks.on_rs_extra_shard) {
+          // Sort per-shard arrival times to compute spread and the final inter-shard gap.
+          std::vector<uint64_t> times;
+          times.reserve(rp.shard_recv_ns.size());
+          for (auto& [si, t] : rp.shard_recv_ns) times.push_back(t);
+          std::sort(times.begin(), times.end());
+          uint64_t shard_spread_ns = times[k - 1] - times[0];
+          uint64_t gap_final_ns = (k >= 2) ? (times[k - 1] - times[k - 2]) : 0;
+          uint64_t decode_time_ns = times[k - 1];
+          if (callbacks.on_rs_decode)
+            callbacks.on_rs_decode(static_cast<unsigned>(rp.shards.size()), rp.n,
+                                   shard_spread_ns, gap_final_ns);
+          // Record decode time so we can measure the k→(k+1) gap when the next shard arrives.
+          if (callbacks.on_rs_extra_shard) {
+            recently_decoded_ns[id] = decode_time_ns;
+            // Prune to avoid unbounded growth: keep only the last 64 decoded groups.
+            while (recently_decoded_ns.size() > 64)
+              recently_decoded_ns.erase(recently_decoded_ns.begin());
+          }
         }
         rs_pending.erase(id);
         while (reassembly.count(next_deliver_id)) {
@@ -257,12 +287,13 @@ void append_ready(std::vector<uint8_t>& out) {
 }
 
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
-                           uint64_t avg_shard_spread_ns) {
+                           uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns) {
   PacketServerMetrics pm{};
   pm.header.id = 0;
   pm.header.packet_kind = PacketKind::SERVER_METRICS;
   pm.max_rtt_ns = max_rtt_ns;
   pm.avg_shard_spread_ns = avg_shard_spread_ns;
+  pm.avg_extra_shard_gap_ns = avg_extra_shard_gap_ns;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&pm);
   out.insert(out.end(), p, p + sizeof pm);
 }

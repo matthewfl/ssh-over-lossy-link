@@ -70,7 +70,8 @@ struct PacketConfig {
 struct PacketServerMetrics {
   PacketHeader header;
   uint64_t max_rtt_ns;
-  uint64_t avg_shard_spread_ns;  // avg shard spread for client→server RS groups
+  uint64_t avg_shard_spread_ns;     // avg spread (1st→k-th shard) for c2s RS groups
+  uint64_t avg_extra_shard_gap_ns;  // avg gap (k-th→(k+1)-th shard) for c2s RS groups
 };
 
 // Server -> client: server's current redundancy config (when auto_adapt; client stays in sync).
@@ -95,7 +96,7 @@ struct Config {
   unsigned max_connections = 200;
   unsigned packet_size = 400;
   unsigned small_packet_redundancy = 2;
-  float rs_redundancy = 0.2f;
+  float rs_redundancy = 0.1f;
   float max_delay_ms = 1.0f;
   unsigned rtt_hint_ms = 0;  // 0 = auto from observed latency; else hint for cold-start timeouts
 };
