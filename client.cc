@@ -227,8 +227,9 @@ int run_client(const Args& args) {
     }
 
     // Wait for SSH to create sockets and accept connections.
-    for (int wait_ms = 0; wait_ms < 5000; wait_ms += 100) {
-      usleep(100 * 1000);
+    // On high-latency links, each ssh -L can take 10+ seconds to establish.
+    for (int wait_ms = 0; wait_ms < 30000; wait_ms += 200) {
+      usleep(200 * 1000);
       bool any = false;
       for (unsigned i = 0; i < N; ++i) {
         std::string path = client_dir + "/" + std::to_string(i);
@@ -1057,9 +1058,9 @@ int run_client(const Args& args) {
             unlink((client_dir + "/" + std::to_string(idx)).c_str());
           }
         }
-        static constexpr uint64_t PING_IDLE_NS =  2000000000ULL;  //  2 s
-        static constexpr uint64_t DEAD_IDLE_NS =  5000000000ULL;  //  5 s
-        static constexpr uint64_t GRACE_NS     =  5000000000ULL;  //  5 s connect grace
+        static constexpr uint64_t PING_IDLE_NS =  15000000000ULL;  // 15 s (README: keepalive when idle)
+        static constexpr uint64_t DEAD_IDLE_NS =  20000000000ULL;  // 20 s (README: inactivity timeout)
+        static constexpr uint64_t GRACE_NS     =  10000000000ULL;  // 10 s post-connect grace (allows slow first RTT)
         std::vector<int> to_kill;
         for (auto& [cfd, cs] : carriers) {
           if (cs.connecting) continue;
