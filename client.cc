@@ -288,6 +288,7 @@ int run_client(const Args& args) {
   const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
+  uint64_t last_redundancy_pressure_add_ns = 0;  // rate-limit: at most one add per 60s from rs ratio
   // RTT outlier threshold: carrier must be both 5× median AND above this absolute. Scales with link.
   // Fraction-slow thresholds (mirrors server.cc constants).
   // Shard-spread thresholds: what fraction of RS groups are "struggling" (spread > 2× floor).
@@ -1025,22 +1026,23 @@ int run_client(const Args& args) {
         // Three triggers:
         //   1. Write backlog: existing carriers can't drain fast enough.
         //   2. RTT outlier: one carrier is clearly stalled vs peers; open a replacement.
-        //   3. Redundancy pressure: RS redundancy has climbed above the baseline because
-        //      the link is lossy.  With the new RS layout (n=carriers, k=n/(1+rs_frac))
-        //      each additional carrier directly adds one more shard slot, increasing k
-        //      and restoring effective throughput.  Opening more carriers is the natural
-        //      complement to raising parity: parity tolerates loss on existing carriers,
-        //      more carriers grows k so more data goes through per RS group.
-        //      In auto_adapt the baseline is 0.6; use > 0.65 so we only trigger when
-        //      we've actually increased redundancy due to detected loss (not on a clean link).
+        //   3. Redundancy pressure: RS redundancy has climbed above 0.4 (link is lossy).
+        //      With the new RS layout (n=carriers, k=n/(1+rs_frac)) each additional carrier
+        //      directly adds one more shard slot. Rate-limit to once per 60s so each new
+        //      connection has time to influence the ratio before we add another.
+        static constexpr uint64_t REDUNDANCY_PRESSURE_ADD_INTERVAL_NS = 60 * 1000000000ULL;
         bool redundancy_pressure = args.config.auto_adapt
-                                   && (effective_rs_redundancy > 0.65f)
-                                   && within_carrier_cap;
+                                   && (effective_rs_redundancy > 0.4f)
+                                   && within_carrier_cap
+                                   && (now - last_redundancy_pressure_add_ns >= REDUNDANCY_PRESSURE_ADD_INTERVAL_NS
+                                       || last_redundancy_pressure_add_ns == 0);
         bool need_more = (total_write > backpressure_write_threshold)
                          || (rtt_outlier && within_carrier_cap)
                          || redundancy_pressure;
         if (need_more) {
           last_add_carrier_ns = now;
+          if (redundancy_pressure)
+            last_redundancy_pressure_add_ns = now;
           if (!args.unix_socket_connection.empty()) {
             int fd = connect_unix(socket_path);
             if (fd >= 0) {
