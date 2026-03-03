@@ -72,6 +72,7 @@ struct PacketServerMetrics {
   uint64_t max_rtt_ns;
   uint64_t avg_shard_spread_ns;     // avg spread (1st→k-th shard) for c2s RS groups
   uint64_t avg_extra_shard_gap_ns;  // avg gap (k-th→(k+1)-th shard) for c2s RS groups
+  uint32_t rs_pending_count;        // c2s RS groups server is waiting to decode; client may add carriers
 };
 
 // Server -> client: server's current redundancy config (when auto_adapt; client stays in sync).

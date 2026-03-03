@@ -339,7 +339,8 @@ int run_server(const Args& args) {
     };
     packet_io::append_server_metrics(it->second.write_buf, max_rtt_ns,
                                      deque_avg(c2s_shard_spread_ns),
-                                     deque_avg(c2s_extra_shard_gap_ns));
+                                     deque_avg(c2s_extra_shard_gap_ns),
+                                     static_cast<uint32_t>(rs_pending.size()));
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -473,10 +474,6 @@ int run_server(const Args& args) {
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
-    }
-    if (dbg && n > 0) {
-      fprintf(dbg, "[epoll-return t=%llu n=%d]\n", (unsigned long long)(now_ns()/1000000ULL), n);
-      fflush(dbg);
     }
     for (int i = 0; i < n; i++) {
       int fd = events[i].data.fd;
@@ -614,15 +611,23 @@ int run_server(const Args& args) {
 
     const uint64_t now_ns_val = now_ns();
 
-    // ── Debug: periodic state dump ──────────────────────────────────────────
+    // ── Debug: periodic state dump (mirrors client format) ────────────────────
     if (dbg) {
       static uint64_t last_dbg_ns = 0;
       if (now_ns_val - last_dbg_ns >= 1000000000ULL) {
         last_dbg_ns = now_ns_val;
-        fprintf(dbg, "[srv t=%llu] carriers=%zu unacked=%zu backend_buf=%zu retransmit=%d next_send_id=%llu backend_fd=%d connected=%d\n",
-                (unsigned long long)(now_ns_val/1000000ULL),
-                carriers.size(), unacked_data.size(), backend_read_buf.size(), (int)retransmit_needed,
-                (unsigned long long)next_send_id, backend_fd, (int)backend_connected);
+        size_t unacked_bytes = 0;
+        for (const auto& [_, ui] : unacked_data) unacked_bytes += ui.data.size();
+        fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu\n",
+                carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
+                (unsigned long long)next_deliver_id, backend_read_buf.size());
+        fprintf(dbg, "  rs_redundancy=%.2f small_packet_copies=%u\n",
+                runtime_rs_redundancy, runtime_small_packet_redundancy);
+        if (!rs_pending.empty()) {
+          auto it = rs_pending.begin();
+          fprintf(dbg, "  first rs_pending id=%llu shards=%zu k=%u n=%u\n",
+                  (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
+        }
         fflush(dbg);
       }
     }

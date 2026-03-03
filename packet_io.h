@@ -68,7 +68,7 @@ struct ReceiveCallbacks {
   std::function<void(uint64_t gap_ns)> on_rs_extra_shard;
   // Server -> client SERVER_METRICS; client uses for adapt.
   std::function<void(uint64_t max_rtt_ns, uint64_t avg_shard_spread_ns,
-                     uint64_t avg_extra_shard_gap_ns)> on_server_metrics;
+                     uint64_t avg_extra_shard_gap_ns, uint32_t rs_pending_count)> on_server_metrics;
   // Server -> client SERVER_CONFIG; server's current redundancy (client uses when auto_adapt).
   std::function<void(const PacketServerConfig&)> on_server_config;
 };
@@ -102,7 +102,8 @@ void append_pong(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
 void append_ready(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
-                           uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns);
+                           uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
+                           uint32_t rs_pending_count);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).

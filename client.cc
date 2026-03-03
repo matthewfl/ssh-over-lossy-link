@@ -301,6 +301,7 @@ int run_client(const Args& args) {
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
   uint64_t last_redundancy_pressure_add_ns = 0;  // rate-limit: at most one add per 60s from rs ratio
+  uint64_t last_rs_pending_pressure_add_ns = 0;  // rate-limit: add every 10s when rs_pending is very high
   // RTT outlier threshold: carrier must be both 5× median AND above this absolute. Scales with link.
   // Fraction-slow thresholds (mirrors server.cc constants).
   // Shard-spread thresholds: what fraction of RS groups are "struggling" (spread > 2× floor).
@@ -312,6 +313,7 @@ int run_client(const Args& args) {
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t server_reported_max_rtt_ns = 0;  // server→client path RTT from SERVER_METRICS
+  uint32_t server_rs_pending_count = 0;     // c2s RS groups server is waiting to decode (from SERVER_METRICS)
   // s2c metrics (measured locally on decoded RS groups from server).
   std::deque<uint64_t> s2c_shard_spread_ns;
   std::deque<uint64_t> s2c_gap_final_ns;
@@ -509,11 +511,12 @@ int run_client(const Args& args) {
     while (s2c_extra_shard_gap_ns.size() > kMaxSpreadSamples) s2c_extra_shard_gap_ns.pop_front();
   };
   recv_cb.on_server_metrics = [&](uint64_t max_rtt_ns, uint64_t avg_spread_ns,
-                                   uint64_t avg_extra_gap_ns) {
+                                   uint64_t avg_extra_gap_ns, uint32_t rs_pending_count) {
     if (max_rtt_ns < 10000000000ULL)
       server_reported_max_rtt_ns = max_rtt_ns;
     c2s_avg_shard_spread_ns   = avg_spread_ns;
     c2s_avg_extra_shard_gap_ns = avg_extra_gap_ns;
+    server_rs_pending_count   = rs_pending_count;
   };
   recv_cb.on_server_config = [&](const PacketServerConfig& psc) {
     has_server_config = true;
@@ -1117,34 +1120,51 @@ int run_client(const Args& args) {
       // Carrier addition: when a carrier is stalled (clear RTT outlier), allow an add after
       // reap_check_interval_ns so the reap logic has time to run before we add another.
       // For backpressure or redundancy-pressure additions use the normal 100ms add interval.
-      // All triggers share the same cap (min_carriers_floor * 3) to prevent unbounded growth:
-      // the reap-and-replace pattern for rtt_outlier works within that budget.
-      bool within_carrier_cap = (carriers.size() < min_carriers_floor * 3u);
+      // Growth is capped by max_connections (user-configured, default 200).
       uint64_t add_interval = add_carrier_interval_ns;
-      if (rtt_outlier && within_carrier_cap)
+      if (rtt_outlier)
         add_interval = reap_check_interval_ns;  // at most one add per reap cycle when replacing a stall
 
+      // rs_pending pressure: many RS groups waiting to decode = need more carriers.
+      // Client rs_pending: s2c path lossy (client waiting for server shards).
+      // Server rs_pending: c2s path lossy (server waiting for client shards); reported via SERVER_METRICS.
+      // On very lossy links we add every 10s so n grows and more shards have a chance to arrive.
+      static constexpr size_t RS_PENDING_PRESSURE_THRESHOLD = 50;
+      static constexpr uint64_t RS_PENDING_PRESSURE_ADD_INTERVAL_NS = 10 * 1000000000ULL;
+      bool rs_pending_pressure = args.config.auto_adapt
+                                && rs_pending.size() > RS_PENDING_PRESSURE_THRESHOLD
+                                && (now - last_rs_pending_pressure_add_ns >= RS_PENDING_PRESSURE_ADD_INTERVAL_NS
+                                    || last_rs_pending_pressure_add_ns == 0);
+      bool server_rs_pending_pressure = args.config.auto_adapt
+                                       && server_rs_pending_count > RS_PENDING_PRESSURE_THRESHOLD
+                                       && (now - last_rs_pending_pressure_add_ns >= RS_PENDING_PRESSURE_ADD_INTERVAL_NS
+                                           || last_rs_pending_pressure_add_ns == 0);
+      bool any_rs_pending_pressure = rs_pending_pressure || server_rs_pending_pressure;
+      if (any_rs_pending_pressure && add_interval > RS_PENDING_PRESSURE_ADD_INTERVAL_NS)
+        add_interval = RS_PENDING_PRESSURE_ADD_INTERVAL_NS;
+
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
-        // Three triggers:
+        // Five triggers:
         //   1. Write backlog: existing carriers can't drain fast enough.
         //   2. RTT outlier: one carrier is clearly stalled vs peers; open a replacement.
         //   3. Redundancy pressure: RS redundancy has climbed above 0.4 (link is lossy).
-        //      With the new RS layout (n=carriers, k=n/(1+rs_frac)) each additional carrier
-        //      directly adds one more shard slot. Rate-limit to once per 60s so each new
-        //      connection has time to influence the ratio before we add another.
+        //   4. rs_pending pressure: client has many s2c RS groups stuck (lossy s2c path).
+        //   5. server_rs_pending pressure: server has many c2s RS groups stuck (lossy c2s path).
         static constexpr uint64_t REDUNDANCY_PRESSURE_ADD_INTERVAL_NS = 60 * 1000000000ULL;
         bool redundancy_pressure = args.config.auto_adapt
                                    && (effective_rs_redundancy > 0.4f)
-                                   && within_carrier_cap
                                    && (now - last_redundancy_pressure_add_ns >= REDUNDANCY_PRESSURE_ADD_INTERVAL_NS
                                        || last_redundancy_pressure_add_ns == 0);
         bool need_more = (total_write > backpressure_write_threshold)
-                         || (rtt_outlier && within_carrier_cap && !unacked_sends.empty())  // no replace-add when idle
-                         || redundancy_pressure;
+                         || (rtt_outlier && !unacked_sends.empty())  // no replace-add when idle
+                         || redundancy_pressure
+                         || any_rs_pending_pressure;
         if (need_more) {
           last_add_carrier_ns = now;
           if (redundancy_pressure)
             last_redundancy_pressure_add_ns = now;
+          if (any_rs_pending_pressure)
+            last_rs_pending_pressure_add_ns = now;
           if (!args.unix_socket_connection.empty()) {
             int fd = connect_unix(socket_path);
             if (fd >= 0) {
@@ -1315,9 +1335,13 @@ int run_client(const Args& args) {
 
       // ── Debug: periodic state dump ────────────────────────────────────────
       if (dbg) {
-        fprintf(dbg, "[cli] carriers=%zu unacked=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu\n",
-                carriers.size(), unacked_sends.size(), reassembly.size(), rs_pending.size(),
+        size_t unacked_bytes = 0;
+        for (const auto& [_, ui] : unacked_sends) unacked_bytes += ui.data.size();
+        fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu\n",
+                carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
                 (unsigned long long)next_deliver_id, stdout_buf.size());
+        fprintf(dbg, "  rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
+                effective_rs_redundancy, effective_small_packet_redundancy, server_rs_pending_count);
         if (!rs_pending.empty()) {
           auto it = rs_pending.begin();
           fprintf(dbg, "  first rs_pending id=%llu shards=%zu k=%u n=%u\n",

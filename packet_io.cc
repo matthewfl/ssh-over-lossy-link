@@ -90,7 +90,7 @@ bool process_carrier_read(
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerMetrics));
       if (callbacks.on_server_metrics)
         callbacks.on_server_metrics(pm->max_rtt_ns, pm->avg_shard_spread_ns,
-                                    pm->avg_extra_shard_gap_ns);
+                                    pm->avg_extra_shard_gap_ns, pm->rs_pending_count);
       continue;
     }
     if (h->packet_kind == PacketKind::SERVER_CONFIG) {
@@ -287,13 +287,15 @@ void append_ready(std::vector<uint8_t>& out) {
 }
 
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
-                           uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns) {
+                           uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
+                           uint32_t rs_pending_count) {
   PacketServerMetrics pm{};
   pm.header.id = 0;
   pm.header.packet_kind = PacketKind::SERVER_METRICS;
   pm.max_rtt_ns = max_rtt_ns;
   pm.avg_shard_spread_ns = avg_shard_spread_ns;
   pm.avg_extra_shard_gap_ns = avg_extra_shard_gap_ns;
+  pm.rs_pending_count = rs_pending_count;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&pm);
   out.insert(out.end(), p, p + sizeof pm);
 }
