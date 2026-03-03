@@ -942,7 +942,7 @@ int run_client(const Args& args) {
 
       // Carrier addition: when a carrier is stalled (clear RTT outlier), allow an add after
       // reap_check_interval_ns so the reap logic has time to run before we add another.
-      // For backpressure or fraction_slow-based additions use the normal 100ms add interval.
+      // For backpressure or redundancy-pressure additions use the normal 100ms add interval.
       // All triggers share the same cap (min_carriers_floor * 3) to prevent unbounded growth:
       // the reap-and-replace pattern for rtt_outlier works within that budget.
       bool within_carrier_cap = (carriers.size() < min_carriers_floor * 3u);
@@ -951,12 +951,23 @@ int run_client(const Args& args) {
         add_interval = reap_check_interval_ns;  // at most one add per reap cycle when replacing a stall
 
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
-        // Add a carrier for backpressure (write queues filling) or to replace a clear
-        // RTT outlier.  Fraction-slow alone is NOT a trigger: with natural latency
-        // variance every link looks "slow" relative to its fastest samples, which
-        // would cause the connection count to balloon to min_carriers_floor*3 and
-        // create RS-shard churn that stalls data delivery.
-        bool need_more = (total_write > backpressure_write_threshold) || (rtt_outlier && within_carrier_cap);
+        // Three triggers:
+        //   1. Write backlog: existing carriers can't drain fast enough.
+        //   2. RTT outlier: one carrier is clearly stalled vs peers; open a replacement.
+        //   3. Redundancy pressure: RS redundancy has climbed above the baseline because
+        //      the link is lossy.  With the new RS layout (n=carriers, k=n/(1+rs_frac))
+        //      each additional carrier directly adds one more shard slot, increasing k
+        //      and restoring effective throughput.  Opening more carriers is the natural
+        //      complement to raising parity: parity tolerates loss on existing carriers,
+        //      more carriers grows k so more data goes through per RS group.
+        //      Threshold > 0.4 means more than ~29% of our bandwidth is parity overhead,
+        //      i.e. the link is genuinely lossy enough to warrant a new carrier.
+        bool redundancy_pressure = args.config.auto_adapt
+                                   && (effective_rs_redundancy > 0.4f)
+                                   && within_carrier_cap;
+        bool need_more = (total_write > backpressure_write_threshold)
+                         || (rtt_outlier && within_carrier_cap)
+                         || redundancy_pressure;
         if (need_more) {
           last_add_carrier_ns = now;
           if (!args.unix_socket_connection.empty()) {
