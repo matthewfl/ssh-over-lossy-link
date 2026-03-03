@@ -71,9 +71,10 @@ bool process_carrier_read(
     }
     if (h->packet_kind == PacketKind::SET_CONFIG) {
       if (s.read_buf.size() < sizeof(PacketConfig)) break;
-      const auto* pc = reinterpret_cast<const PacketConfig*>(s.read_buf.data());
+      PacketConfig pc;
+      std::memcpy(&pc, s.read_buf.data(), sizeof(pc));
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketConfig));
-      if (callbacks.on_set_config) callbacks.on_set_config(*pc);
+      if (callbacks.on_set_config) callbacks.on_set_config(pc);
       continue;
     }
     if (h->packet_kind == PacketKind::START_CONNECTION) {
@@ -84,20 +85,27 @@ bool process_carrier_read(
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
       continue;  // header-only; last_recv_ns already updated; confirms server is ready
     }
+    if (h->packet_kind == PacketKind::SUGGEST_CLOSE) {
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      if (callbacks.on_suggest_close) callbacks.on_suggest_close(fd);
+      continue;
+    }
     if (h->packet_kind == PacketKind::SERVER_METRICS) {
       if (s.read_buf.size() < sizeof(PacketServerMetrics)) break;
-      const auto* pm = reinterpret_cast<const PacketServerMetrics*>(s.read_buf.data());
+      PacketServerMetrics pm;
+      std::memcpy(&pm, s.read_buf.data(), sizeof(pm));
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerMetrics));
       if (callbacks.on_server_metrics)
-        callbacks.on_server_metrics(pm->max_rtt_ns, pm->avg_shard_spread_ns,
-                                    pm->avg_extra_shard_gap_ns, pm->rs_pending_count);
+        callbacks.on_server_metrics(pm.max_rtt_ns, pm.avg_shard_spread_ns,
+                                    pm.avg_extra_shard_gap_ns, pm.rs_pending_count);
       continue;
     }
     if (h->packet_kind == PacketKind::SERVER_CONFIG) {
       if (s.read_buf.size() < sizeof(PacketServerConfig)) break;
-      const auto* psc = reinterpret_cast<const PacketServerConfig*>(s.read_buf.data());
+      PacketServerConfig psc;
+      std::memcpy(&psc, s.read_buf.data(), sizeof(psc));
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerConfig));
-      if (callbacks.on_server_config) callbacks.on_server_config(*psc);
+      if (callbacks.on_server_config) callbacks.on_server_config(psc);
       continue;
     }
     if (h->packet_kind == PacketKind::REED_SOLOMON) {
@@ -286,6 +294,13 @@ void append_ready(std::vector<uint8_t>& out) {
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
 }
 
+void append_suggest_close(std::vector<uint8_t>& out) {
+  PacketHeader h{};
+  h.id = 0;
+  h.packet_kind = PacketKind::SUGGEST_CLOSE;
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+}
+
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
                            uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
                            uint32_t rs_pending_count) {
@@ -304,7 +319,8 @@ void flush_carrier_writes(
   std::map<int, CarrierState>& carriers,
   int epfd,
   struct epoll_event& ev,
-  std::function<bool(int fd, const CarrierState&)> skip_write) {
+  std::function<bool(int fd, const CarrierState&)> skip_write,
+  std::function<void(int fd, const char* reason)> on_removed) {
   for (auto it = carriers.begin(); it != carriers.end(); ) {
     int fd = it->first;
     CarrierState& s = it->second;
@@ -321,6 +337,7 @@ void flush_carrier_writes(
           epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
           break;
         }
+        if (on_removed) on_removed(fd, "write_error");
         close(fd);
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
         it = carriers.erase(it);

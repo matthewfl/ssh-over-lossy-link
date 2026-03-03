@@ -230,6 +230,8 @@ int run_server(const Args& args) {
   uint64_t next_deliver_id_stuck_since_ns  = 0;
   uint64_t last_retransmit_check_ns = 0;
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
+  uint64_t last_suggest_close_ns = 0;  // rate-limit SUGGEST_CLOSE to at most 1 per 10s
+  static constexpr uint64_t suggest_close_min_interval_ns = 10 * 1000000000ULL;
 
   // RTT-scaled timeouts: server observes server→client RTT from ACKs. Use 5 s default when unknown.
   auto get_effective_rtt_ns = [&]() -> uint64_t {
@@ -318,7 +320,11 @@ int run_server(const Args& args) {
   };
 
   auto flush_carrier_writes = [&]() {
-    packet_io::flush_carrier_writes(carriers, epfd, ev);
+    packet_io::flush_carrier_writes(carriers, epfd, ev, nullptr,
+      [&](int fd, const char* reason) {
+        if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
+                         (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1, reason);
+      });
     if (carriers.empty() && !unacked_data.empty())
       retransmit_needed = true;
   };
@@ -420,7 +426,7 @@ int run_server(const Args& args) {
     while (c2s_extra_shard_gap_ns.size() > kMaxSpreadSamples) c2s_extra_shard_gap_ns.pop_front();
   };
   recv_cb.on_ping = [&](int fd, uint64_t id) { send_pong(fd, id); };  // client may still send PING for health
-  recv_cb.on_ack = [&](int /*fd*/, uint64_t acked_id) {
+  recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it = ack_send_time_ns.find(acked_id);
     if (it != ack_send_time_ns.end()) {
       uint64_t rtt = now_ns() - it->second;
@@ -428,6 +434,8 @@ int run_server(const Args& args) {
       if (rtt < 60000000000ULL) {
         server_recent_rtt_ns.push_back(rtt);
         while (server_recent_rtt_ns.size() > max_server_recent_rtt) server_recent_rtt_ns.pop_front();
+        auto cs = carriers.find(fd);
+        if (cs != carriers.end()) cs->second.last_rtt_ns = rtt;
       }
     }
     for (auto it_m = ack_send_time_ns.begin(); it_m != ack_send_time_ns.end(); )
@@ -585,24 +593,22 @@ int run_server(const Args& args) {
         bool carrier_removed = false;
         if (e & EPOLLIN) {
           if (!process_carrier_read(fd, it->second)) {
+            if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=read_error]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
-            if (dbg) { fprintf(dbg, "[carrier-close-read t=%llu fd=%d total=%zu]\n",
-                               (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
-                        fflush(dbg); }
             if (carriers.empty() && !unacked_data.empty())
               retransmit_needed = true;
             carrier_removed = true;
           }
         }
         if (!carrier_removed && (e & (EPOLLERR | EPOLLHUP))) {
+          if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=epoll_err_hup]\n",
+                           (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
-          if (dbg) { fprintf(dbg, "[carrier-close-err t=%llu fd=%d total=%zu]\n",
-                             (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
-                      fflush(dbg); }
           if (carriers.empty() && !unacked_data.empty())
             retransmit_needed = true;
         }
@@ -618,14 +624,17 @@ int run_server(const Args& args) {
         last_dbg_ns = now_ns_val;
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_data) unacked_bytes += ui.data.size();
-        fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu\n",
-                carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
-                (unsigned long long)next_deliver_id, backend_read_buf.size());
-        fprintf(dbg, "  rs_redundancy=%.2f small_packet_copies=%u\n",
-                runtime_rs_redundancy, runtime_small_packet_redundancy);
-        if (!rs_pending.empty()) {
+        if (rs_pending.empty()) {
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u\n",
+                  carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(),
+                  (unsigned long long)next_deliver_id, backend_read_buf.size(),
+                  (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy);
+        } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "  first rs_pending id=%llu shards=%zu k=%u n=%u\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
+                  carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
+                  (unsigned long long)next_deliver_id, backend_read_buf.size(),
+                  (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
                   (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
         }
         fflush(dbg);
@@ -638,12 +647,14 @@ int run_server(const Args& args) {
       uint64_t ping_idle_ns  = scaled_ns(2,  5000000000ULL, 30000000000ULL);  // send PING before dead_idle
       uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);
       uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);
-      std::vector<int> to_kill;
+      // Carriers that appear dead: send SUGGEST_CLOSE so the client closes them (server
+      // cannot open new connections; only the client reaps). Rate-limit to 1 suggestion per 10s.
+      std::vector<int> to_suggest;
       for (auto& [cfd, cs] : carriers) {
         if (now_ns_val - cs.connect_ns < grace_ns) continue;
         uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
         if (now_ns_val - last_activity > dead_idle_ns) {
-          to_kill.push_back(cfd);
+          to_suggest.push_back(cfd);
           continue;  // Carrier dead (no data, no PONG); skip PING
         }
         if (cs.write_buf.empty()
@@ -655,12 +666,41 @@ int run_server(const Args& args) {
           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
         }
       }
-      for (int cfd : to_kill) {
-        close(cfd);
-        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
-        carriers.erase(cfd);
-        if (carriers.empty() && !unacked_data.empty())
-          retransmit_needed = true;
+      for (int cfd : to_suggest) {
+        if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
+        last_suggest_close_ns = now_ns_val;
+        packet_io::append_suggest_close(carriers[cfd].write_buf);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = cfd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+        if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
+                         (unsigned long long)(now_ns_val/1000000ULL), cfd);
+      }
+
+      // RTT outlier: suggest closing the slowest carrier when it's 5× median and very high.
+      if (carriers.size() > 1 && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
+        std::vector<uint64_t> rtts;
+        for (const auto& [_, cs] : carriers)
+          if (cs.last_rtt_ns > 0) rtts.push_back(cs.last_rtt_ns);
+        if (rtts.size() >= 2) {
+          std::vector<uint64_t> sorted = rtts;
+          std::sort(sorted.begin(), sorted.end());
+          uint64_t median_rtt = sorted[sorted.size() / 2];
+          uint64_t very_high_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
+          int worst_fd = -1;
+          uint64_t worst_rtt = 0;
+          for (auto& [fd, cs] : carriers)
+            if (cs.last_rtt_ns > worst_rtt) { worst_rtt = cs.last_rtt_ns; worst_fd = fd; }
+          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_ns) {
+            last_suggest_close_ns = now_ns_val;
+            packet_io::append_suggest_close(carriers[worst_fd].write_buf);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = worst_fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, worst_fd, &ev);
+            if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), worst_fd);
+          }
+        }
       }
 
       // Update global receive timestamp from all live carriers.

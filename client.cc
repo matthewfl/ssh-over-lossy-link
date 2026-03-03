@@ -324,10 +324,12 @@ int run_client(const Args& args) {
   static constexpr size_t kMaxSpreadSamples = 100;
   // Shared map for recently decoded RS groups (to time extra shards).
   std::map<uint64_t, uint64_t> recently_decoded_ns;
-  // min carriers to keep during reaping (never drop below the initial configured count)
-  const unsigned min_carriers_floor = std::max(2u, args.config.connections);
+  const unsigned target_carriers = std::max(2u, args.config.connections);
+  std::vector<int> pending_reap;  // carriers to close once a replacement has connected (or slowly when above target)
   uint64_t last_reap_ns = 0;
+  uint64_t last_reduction_close_ns = 0;  // rate-limit: at most 1 close per 60s when reducing from above target
   const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
+  static constexpr uint64_t reduction_close_interval_ns = 60 * 1000000000ULL;  // 60s between reduction closes
 
   // RTT-scaled timeouts: use observed latency so low-latency links get tighter timeouts,
   // high-latency links get longer. Cold start uses rtt_hint_ms or 5 s conservative default.
@@ -569,8 +571,29 @@ int run_client(const Args& args) {
     return packet_io::process_carrier_read(fd, s, reassembly, rs_pending, recently_decoded_ns, next_deliver_id, recv_cb);
   };
 
+  auto do_carrier_cleanup = [&](int fd, const char* reason) {
+    if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1, reason);
+    carrier_pending_acks.erase(fd);
+    if (!args.unix_socket_connection.empty()) return;
+    auto idx_it = fd_to_ssh_index.find(fd);
+    if (idx_it != fd_to_ssh_index.end()) {
+      unsigned idx = idx_it->second;
+      auto pid_it = ssh_idx_to_pid.find(idx);
+      if (pid_it != ssh_idx_to_pid.end()) {
+        kill(pid_it->second, SIGTERM);
+        pids_to_reap.push_back(pid_it->second);
+        ssh_idx_to_pid.erase(pid_it);
+      }
+      unlink((client_dir + "/" + std::to_string(idx)).c_str());
+      fd_to_ssh_index.erase(idx_it);
+    }
+    if (carriers.size() == 1 && !unacked_sends.empty()) retransmit_needed = true;
+  };
   auto flush_carrier_writes = [&]() {
-    packet_io::flush_carrier_writes(carriers, epfd, ev, [](int, const CarrierState& s) { return s.connecting; });
+    packet_io::flush_carrier_writes(carriers, epfd, ev,
+        [](int, const CarrierState& s) { return s.connecting; },
+        [&](int fd, const char* reason) { do_carrier_cleanup(fd, reason); });
     for (auto it = carrier_pending_acks.begin(); it != carrier_pending_acks.end(); )
       if (carriers.count(it->first) == 0) it = carrier_pending_acks.erase(it);
       else ++it;
@@ -585,34 +608,26 @@ int run_client(const Args& args) {
   // Centralised carrier removal: closes the fd, removes from epoll, cleans up maps.
   // In SSH mode: kills the owning SSH process and unlinks its socket file so the
   // slot can be reused cleanly.  Flags retransmit when the last carrier is lost.
-  auto remove_carrier = [&](int fd) {
-    if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu]\n",
-                     (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
+  auto remove_carrier = [&](int fd, const char* reason) {
+    pending_reap.erase(std::remove(pending_reap.begin(), pending_reap.end(), fd), pending_reap.end());
+    do_carrier_cleanup(fd, reason);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     carriers.erase(fd);
-    carrier_pending_acks.erase(fd);
-    if (!args.unix_socket_connection.empty()) {
-      if (carriers.empty() && !unacked_sends.empty())
-        retransmit_needed = true;
-      return;
-    }
-    // SSH mode: kill the SSH process that owns this carrier slot so it doesn't
-    // linger as an orphan, and unlink its socket file so the index is reusable.
-    auto idx_it = fd_to_ssh_index.find(fd);
-    if (idx_it != fd_to_ssh_index.end()) {
-      unsigned idx = idx_it->second;
-      auto pid_it = ssh_idx_to_pid.find(idx);
-      if (pid_it != ssh_idx_to_pid.end()) {
-        kill(pid_it->second, SIGTERM);
-        pids_to_reap.push_back(pid_it->second);
-        ssh_idx_to_pid.erase(pid_it);
-      }
-      unlink((client_dir + "/" + std::to_string(idx)).c_str());
-      fd_to_ssh_index.erase(idx_it);
-    }
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
+  };
+
+  auto add_to_pending_reap = [&](int fd, const char* reason) {
+    if (!carriers.count(fd)) return;
+    if (std::find(pending_reap.begin(), pending_reap.end(), fd) != pending_reap.end()) return;
+    pending_reap.push_back(fd);
+    if (dbg) fprintf(dbg, "[pending-reap t=%llu fd=%d reason=%s total=%zu]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), fd, reason, pending_reap.size());
+  };
+
+  recv_cb.on_suggest_close = [&](int fd) {
+    add_to_pending_reap(fd, "server_suggest_close");
   };
 
 
@@ -647,8 +662,8 @@ int run_client(const Args& args) {
     // unix-socket carrier (observed: close() on proxy side takes up to one poll
     // cycle to propagate on some Linux configurations).
     int epoll_timeout_ms = 500;
-    if (carriers.size() < min_carriers_floor) {
-      // Below floor: use a much shorter timeout to reconnect promptly.
+    bool need_replacements = !pending_reap.empty() && carriers.size() <= target_carriers;
+    if (carriers.size() < target_carriers || need_replacements) {
       uint64_t elapsed = now_ns() - last_add_carrier_ns;
       uint64_t floor_interval = carriers.empty() ? 50000000ULL : add_carrier_interval_ns;
       if (elapsed >= floor_interval)
@@ -813,6 +828,11 @@ int run_client(const Args& args) {
           if (err == 0) {
             it->second.connecting = false;
             it->second.connect_ns = now_ns();
+            if (!pending_reap.empty()) {
+              int to_close = pending_reap.front();
+              pending_reap.erase(pending_reap.begin());
+              remove_carrier(to_close, "replaced");
+            }
             // Re-send any data that was in-flight on carriers that all died, using
             // the same send_ids so the receiver can combine with any partial shards
             // it already buffered — allowing RS groups to complete without data loss.
@@ -855,16 +875,16 @@ int run_client(const Args& args) {
               epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
             }
           } else if (err != EINPROGRESS && err != 0) {
-            remove_carrier(fd);
+            remove_carrier(fd, "connect_failed");
             continue;
           }
         }
         if (e & EPOLLIN) {
           if (!process_carrier_read(fd, it->second))
-            remove_carrier(fd);
+            remove_carrier(fd, "read_error");
         }
         if (carriers.count(fd) && (e & (EPOLLERR | EPOLLHUP))) {
-          remove_carrier(fd);
+          remove_carrier(fd, "epoll_err_hup");
         }
       }
     }
@@ -1077,7 +1097,17 @@ int run_client(const Args& args) {
           }
         }
         for (int cfd : to_kill)
-          remove_carrier(cfd);
+          add_to_pending_reap(cfd, "dead_idle");
+
+        // When above target: don't add replacements. Slowly close from pending (1 per 60s).
+        // Extra carriers were useful for traffic; keep them until they go idle, then slowly reduce.
+        if (carriers.size() > target_carriers && !pending_reap.empty()
+            && now_p - last_reduction_close_ns >= reduction_close_interval_ns) {
+          last_reduction_close_ns = now_p;
+          int to_close = pending_reap.front();
+          pending_reap.erase(pending_reap.begin());
+          remove_carrier(to_close, "slow_reduction");
+        }
 
         for (auto& [cfd, cs] : carriers)
           if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
@@ -1155,10 +1185,12 @@ int run_client(const Args& args) {
                                    && (effective_rs_redundancy > 0.4f)
                                    && (now - last_redundancy_pressure_add_ns >= REDUNDANCY_PRESSURE_ADD_INTERVAL_NS
                                        || last_redundancy_pressure_add_ns == 0);
+        bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;
         bool need_more = (total_write > backpressure_write_threshold)
                          || (rtt_outlier && !unacked_sends.empty())  // no replace-add when idle
                          || redundancy_pressure
-                         || any_rs_pending_pressure;
+                         || any_rs_pending_pressure
+                         || need_replacement;
         if (need_more) {
           last_add_carrier_ns = now;
           if (redundancy_pressure)
@@ -1212,27 +1244,19 @@ int run_client(const Args& args) {
         }
       }
 
-      // Carrier reaping: periodically close carriers that are clearly worse than their peers.
-      // Two criteria (either triggers a reap):
+      // Carrier reaping: add to pending_reap; close only when a replacement has connected.
+      // Two criteria (either triggers):
       //   1. RTT outlier: last_rtt_ns > 5× median AND > 3×RTT (stalled on client→server path).
       //   2. Silence: no shard received from server in N×RTT while other carriers are active
       //      (stalled on server→client path).
-      // Skip reaping during initial handshake: when we have unacked data and few RTT samples.
-      // Skip RTT outlier reap when idle: a slower carrier still works (PING/PONG keeps it alive).
-      //
-      // Never reap if it would bring us to the floor: require carriers.size() > min_carriers_floor + 1.
-      // Add logic above starts a replacement when we have an outlier; we only reap once that
-      // replacement has connected (carriers grew). This avoids briefly dropping below min.
+      // Skip during initial handshake (unacked data + few RTT samples).
+      // Skip RTT outlier when idle: a slower carrier still works (PING/PONG keeps it alive).
       const bool early_handshake = (unacked_sends.size() > 0 && rtt_samples.size() < 10);
       const bool idle = unacked_sends.empty();
-      const bool can_reap_without_dropping_below_min = (carriers.size() > min_carriers_floor + 1u);
-      if (!early_handshake && carriers.size() > min_carriers_floor && now - last_reap_ns >= reap_check_interval_ns) {
+      if (!early_handshake && now - last_reap_ns >= reap_check_interval_ns) {
         last_reap_ns = now;
 
-        // RTT-based reap: find worst carrier and reap if it's a clear outlier.
-        // When idle, skip—no benefit to replacing a marginally slower carrier.
-        // Only reap when we have a replacement (carriers > min+1); add logic started one above.
-        if (!idle && can_reap_without_dropping_below_min && rtt_samples.size() >= 2) {
+        if (!idle && rtt_samples.size() >= 2) {
           std::vector<uint64_t> sorted = rtt_samples;
           std::sort(sorted.begin(), sorted.end());
           uint64_t median_rtt = sorted[sorted.size() / 2];
@@ -1240,28 +1264,18 @@ int run_client(const Args& args) {
           uint64_t worst_rtt = 0;
           for (auto& [fd, st] : carriers)
             if (st.last_rtt_ns > worst_rtt) { worst_rtt = st.last_rtt_ns; worst_fd = fd; }
-          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_rtt_ns) {
-            remove_carrier(worst_fd);
-          }
+          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_rtt_ns)
+            add_to_pending_reap(worst_fd, "rtt_outlier");
         }
 
-        // Silence-based reap: carrier hasn't received in N×RTT while others have.
-        // Only reap when we have headroom so a replacement can be added first if needed.
-        if (can_reap_without_dropping_below_min) {
-          uint64_t latest_recv = 0;
+        uint64_t latest_recv = 0;
+        for (auto& [fd, st] : carriers)
+          if (st.last_recv_ns > latest_recv) latest_recv = st.last_recv_ns;
+        uint64_t silence_reap_ns = scaled_ns(4, 20000000000ULL, 60000000000ULL);
+        if (latest_recv + 5000000000ULL > now) {
           for (auto& [fd, st] : carriers)
-            if (st.last_recv_ns > latest_recv) latest_recv = st.last_recv_ns;
-          uint64_t silence_reap_ns = scaled_ns(4, 20000000000ULL, 60000000000ULL);
-          if (latest_recv + 5000000000ULL > now) {  // active server→client traffic in last 5s
-            std::vector<int> to_reap;
-            for (auto& [fd, st] : carriers)
-              if (st.last_recv_ns > 0 && st.last_recv_ns + silence_reap_ns < now)
-                to_reap.push_back(fd);
-            for (int fd : to_reap) {
-              if (carriers.size() <= min_carriers_floor + 1u) break;  // stop before we'd hit floor
-              remove_carrier(fd);
-            }
-          }
+            if (st.last_recv_ns > 0 && st.last_recv_ns + silence_reap_ns < now)
+              add_to_pending_reap(fd, "silence_reap");
         }
       }
     }
@@ -1337,14 +1351,17 @@ int run_client(const Args& args) {
       if (dbg) {
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) unacked_bytes += ui.data.size();
-        fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu\n",
-                carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
-                (unsigned long long)next_deliver_id, stdout_buf.size());
-        fprintf(dbg, "  rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
-                effective_rs_redundancy, effective_small_packet_redundancy, server_rs_pending_count);
-        if (!rs_pending.empty()) {
+        if (rs_pending.empty()) {
+          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
+                  carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(),
+                  (unsigned long long)next_deliver_id, stdout_buf.size(),
+                  (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count);
+        } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "  first rs_pending id=%llu shards=%zu k=%u n=%u\n",
+          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
+                  carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
+                  (unsigned long long)next_deliver_id, stdout_buf.size(),
+                  (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count,
                   (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
         }
         fflush(dbg);
@@ -1421,17 +1438,17 @@ int run_client(const Args& args) {
     }
 
     // ── Unconditional floor maintenance ─────────────────────────────────────
-    // Always try to keep at least min_carriers_floor connections alive,
-    // regardless of auto_adapt mode.  This also handles the case where ALL
-    // carriers have died: the auto_adapt block above is skipped when
-    // carriers.empty(), so we need a separate path here.
+    // Keep at least target_carriers connections. Add replacements when pending_reap
+    // non-empty and at or below target. When above target, we don't add—we slowly
+    // close from pending (in the ping-check block). When carriers.empty(), the
+    // auto_adapt block is skipped, so this path is essential.
     {
       const uint64_t now_f = now_ns();
-      // Use a faster re-add interval when critically low on carriers.
       const uint64_t floor_interval = carriers.empty()
                                         ? 50000000ULL          // 50 ms when all are gone
                                         : add_carrier_interval_ns;  // 100 ms otherwise
-      if (carriers.size() < min_carriers_floor
+      bool need_replacements = !pending_reap.empty() && carriers.size() <= target_carriers;
+      if ((carriers.size() < target_carriers || need_replacements)
           && now_f - last_add_carrier_ns >= floor_interval) {
         last_add_carrier_ns = now_f;
         if (!args.unix_socket_connection.empty()) {

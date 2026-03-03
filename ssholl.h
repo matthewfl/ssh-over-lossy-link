@@ -23,6 +23,7 @@ enum class PacketKind : uint8_t {
   SERVER_METRICS = 7,     // server -> client; observed link quality (max RTT etc.) for client adapt
   SERVER_CONFIG = 8,      // server -> client; server's current redundancy config (when server manages it)
   READY = 9,              // server -> client; sent when carrier connects, confirms link is up
+  SUGGEST_CLOSE = 10,     // server -> client; suggests client close this carrier (dead or slow)
 };
 
 #pragma pack(push, 1)

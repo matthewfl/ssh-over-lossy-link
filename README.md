@@ -169,6 +169,7 @@ enum packet_kind_e : uint8_t {
     PACKET_SERVER_METRICS = 7,    // server -> client; max RTT observed by server (server→client path) for client adapt
     PACKET_SERVER_CONFIG = 8,     // server -> client; server's current redundancy (when server manages it; auto_adapt)
     PACKET_READY = 9,             // server -> client; sent when carrier connects, confirms link is up before client sends
+    PACKET_SUGGEST_CLOSE = 10,   // server -> client; suggests client close this carrier (dead or slow); client does the actual close
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -205,6 +206,10 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 
 // PACKET_SERVER_CONFIG: server -> client. Same payload as packet_config (no auto_adapt).
 // When auto_adapt is on, server adapts redundancy and sends this so the client stays in sync.
+
+// PACKET_SUGGEST_CLOSE: server -> client. Header only. Server sends on a carrier it thinks is dead
+// (no data, no PONG) or very slow (RTT outlier). Client closes the carrier; server cannot open
+// new connections, so only the client reaps to avoid stalls.
 
 // PACKET_READY: server -> client. Header only. Sent when a carrier connects so the client
 // knows the bidirectional path is up before it sends data; avoids premature timeouts.

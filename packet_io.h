@@ -71,6 +71,8 @@ struct ReceiveCallbacks {
                      uint64_t avg_extra_shard_gap_ns, uint32_t rs_pending_count)> on_server_metrics;
   // Server -> client SERVER_CONFIG; server's current redundancy (client uses when auto_adapt).
   std::function<void(const PacketServerConfig&)> on_server_config;
+  // Server -> client SUGGEST_CLOSE; client should close this carrier (server thinks it's dead or slow).
+  std::function<void(int fd)> on_suggest_close;
 };
 
 // Process bytes from carrier read_buf: parse SMALL/REED_SOLOMON, update reassembly/rs_pending,
@@ -101,17 +103,20 @@ void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
 void append_pong(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
 void append_ready(std::vector<uint8_t>& out);
+void append_suggest_close(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
                            uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
                            uint32_t rs_pending_count);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).
+// on_removed: if non-null, called with (fd, reason) before removing due to write error (for logging/cleanup).
 void flush_carrier_writes(
   std::map<int, CarrierState>& carriers,
   int epfd,
   struct ::epoll_event& ev,
-  std::function<bool(int fd, const CarrierState&)> skip_write = nullptr);
+  std::function<bool(int fd, const CarrierState&)> skip_write = nullptr,
+  std::function<void(int fd, const char* reason)> on_removed = nullptr);
 
 }  // namespace packet_io
 }  // namespace ssholl
