@@ -15,7 +15,9 @@
 #include <string>
 #include <vector>
 #include <sys/epoll.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -72,10 +74,18 @@ void remove_client_dir(const std::string& dir_path) {
 // Launch server on remote host; read one line (socket path) from stdout. Returns path or empty on failure.
 std::string launch_server(const Args& args) {
   int pipefd[2];
+#ifdef __linux__
   if (pipe2(pipefd, O_CLOEXEC) < 0) {
+#else
+  if (pipe(pipefd) < 0) {
+#endif
     std::perror("ssh-oll client: pipe");
     return {};
   }
+#ifndef __linux__
+  fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+  fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+#endif
   pid_t pid = fork();
   if (pid < 0) {
     std::perror("ssh-oll client: fork");
@@ -201,8 +211,10 @@ int run_client(const Args& args) {
         return 1;
       }
       if (pid == 0) {
+#ifdef __linux__
         // Exit automatically if the parent (ssh-oll) dies for any reason.
         prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
         // Redirect stdout and stderr to /dev/null. stdout must never be written to—
         // the carrier inherits the ProxyCommand stdout; any output would corrupt the SSH stream.
         int dn = open("/dev/null", O_WRONLY);
@@ -1149,7 +1161,9 @@ int run_client(const Args& args) {
               std::string path = client_dir + "/" + std::to_string(free_idx);
               pid_t pid = fork();
               if (pid == 0) {
+#ifdef __linux__
                 prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
                 int dn = open("/dev/null", O_WRONLY);
                 if (dn >= 0) {
                   dup2(dn, STDOUT_FILENO);
@@ -1415,7 +1429,9 @@ int run_client(const Args& args) {
             std::string path = client_dir + "/" + std::to_string(free_idx);
             pid_t pid = fork();
             if (pid == 0) {
+#ifdef __linux__
               prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
               int dn = open("/dev/null", O_WRONLY);
               if (dn >= 0) {
                 dup2(dn, STDOUT_FILENO);

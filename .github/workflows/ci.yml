@@ -7,10 +7,24 @@ on:
     branches: [master]
 
 jobs:
-  build-and-test:
+  build-and-test-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Run tests
+        run: bash test_all.sh
+
+  build-and-test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install epoll-shim
+        run: brew install epoll-shim
 
       - name: Build
         run: make

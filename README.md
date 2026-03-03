@@ -26,10 +26,22 @@ The client runs as a ProxyCommand: the real SSH process talks to the client over
 ## Setup
 
 Install `ssh-oll` on both the client and the server.
-```
+
+**Linux:**
+```bash
 git clone https://github.com/matthewfl/ssh-over-lossy-link.git
+cd ssh-over-lossy-link
 make && make install
 ```
+
+**macOS:** Requires [epoll-shim](https://github.com/jiixyj/epoll-shim) (provides epoll on top of kqueue).
+```bash
+brew install epoll-shim
+git clone https://github.com/matthewfl/ssh-over-lossy-link.git
+cd ssh-over-lossy-link
+make && make install
+```
+On macOS, `make install` writes to `/usr/local/bin` (may require `sudo`). To install without sudo, copy the built `ssh-oll` binary to a directory in your PATH, e.g. `cp ssh-oll ~/bin/`.
 Then configure your `~/.ssh/config` as follows:
 ```
 Host lossy-ssh-connection
@@ -141,7 +153,7 @@ Security is not a primary focus of this layer: the payload is already an SSH ses
 
 ### Platform and dependencies
 
-The implementation uses **epoll** and is aimed at Linux. Dependencies include a Reed–Solomon (erasure coding) library; other build/runtime deps TBD as the codebase is implemented.
+The implementation uses **epoll** (Linux) or **epoll-shim** (macOS, kqueue-based). Supported platforms: Linux (native epoll), macOS (via [epoll-shim](https://github.com/jiixyj/epoll-shim), install with `brew install epoll-shim`). Dependencies include a Reed–Solomon (erasure coding) library (vendored); epoll-shim required on macOS.
 
 ## Packet format (wire protocol)
 
