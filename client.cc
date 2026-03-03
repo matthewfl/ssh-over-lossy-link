@@ -637,11 +637,18 @@ int run_client(const Args& args) {
         }
         while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
           const size_t block_size = effective_max_packet;
-          unsigned k = static_cast<unsigned>(std::min(stdin_buf.size() / block_size, static_cast<size_t>(255)));
-          if (k == 0) break;
           float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
+          // n = carriers: one shard per carrier so any k of them suffice to decode.
+          // k = floor(n / (1 + rs_frac)): max data shards within the carrier budget.
+          unsigned n_carriers = static_cast<unsigned>(std::min(carriers.size(), static_cast<size_t>(255)));
+          unsigned k = std::max(1u, static_cast<unsigned>(
+              static_cast<float>(n_carriers) / (1.0f + rs_frac)));
+          k = static_cast<unsigned>(std::min(static_cast<size_t>(k),
+                                             stdin_buf.size() / block_size));
+          if (k == 0) break;
           unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
-          unsigned n = std::min(k + m, 255u);
+          // Cap n to n_carriers so every shard goes on a different carrier.
+          unsigned n = std::min(k + m, n_carriers);
           m = n - k;
           std::vector<const uint8_t*> data_ptrs(k);
           for (unsigned i = 0; i < k; ++i)

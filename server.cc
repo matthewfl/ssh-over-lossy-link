@@ -790,63 +790,58 @@ int run_server(const Args& args) {
     }
     if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
       const size_t block_size = max_packet;
-      if (backend_read_buf.size() >= block_size) {
-        unsigned k = static_cast<unsigned>(std::min(backend_read_buf.size() / block_size, static_cast<size_t>(255)));
-        if (k >= 1) {
-          unsigned m = std::max(1u, static_cast<unsigned>(k * runtime_rs_redundancy + 0.5f));
-          unsigned n = std::min(k + m, 255u);
-          m = n - k;
-          std::vector<const uint8_t*> data_ptrs(k);
-          for (unsigned i = 0; i < k; ++i)
-            data_ptrs[i] = backend_read_buf.data() + i * block_size;
-          std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
-          std::vector<uint8_t*> parity_ptrs(m);
-          for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
-          reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
-          std::vector<int> carrier_fds;
-          for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
-          for (size_t i = 0; i < n; ++i) {
-            int fd = carrier_fds[(next_carrier_for_rs + i) % carrier_fds.size()];
-            const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
-            queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = fd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-          }
-          next_carrier_for_rs += n;
-          ack_send_time_ns[next_send_id] = now_ns();
-          // Save original bytes for retransmit if all carriers die before ACK.
-          {
-            UnackedItem ui;
-            ui.data.assign(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
-            ui.n = n;  ui.k = static_cast<unsigned>(k);
-            ui.block_size = static_cast<uint16_t>(block_size);
-            ui.is_small = false;
-            ui.send_ns = now_ns();
-            unacked_data[next_send_id] = std::move(ui);
-          }
-          next_send_id++;
-          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
-          // Send any sub-block_size remainder immediately in the same flush cycle.
-          if (!backend_read_buf.empty()) {
-            UnackedItem ui;
-            ui.data = backend_read_buf;
-            ui.is_small = true;
-            ui.send_ns = now_ns();
-            unacked_data[next_send_id] = std::move(ui);
-            queue_small_to_carriers(backend_read_buf.data(), backend_read_buf.size());
-            backend_read_buf.clear();
-          }
-        } else {
-          // Chunk < block_size: send as SMALL with small_packet_redundancy copies (no Reed–Solomon).
-          size_t chunk = std::min(backend_read_buf.size(), block_size);
-          { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
-            ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
-          queue_small_to_carriers(backend_read_buf.data(), chunk);
-          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+      // Each RS group uses exactly n_carriers shards (one per carrier) so that a slow or
+      // dead carrier never prevents decoding. k = floor(n / (1 + rs_redundancy)) data shards
+      // per group; the RS guarantee means any k of n shards suffice to reconstruct.
+      // Loop so that large buffers produce multiple correctly-sized groups rather than one
+      // oversized group that demands too many shards from each carrier.
+      while (backend_read_buf.size() >= block_size && !carriers.empty()) {
+        unsigned n_carriers = static_cast<unsigned>(std::min(carriers.size(), static_cast<size_t>(255)));
+        // k = floor(n / (1 + rs_frac)): the max data shards that still leave room for parity
+        // within the n_carriers budget.
+        unsigned k = std::max(1u, static_cast<unsigned>(
+            static_cast<float>(n_carriers) / (1.0f + runtime_rs_redundancy)));
+        // Cap by how many full blocks are actually in the buffer.
+        k = static_cast<unsigned>(std::min(static_cast<size_t>(k),
+                                           backend_read_buf.size() / block_size));
+        if (k < 1) break;
+        unsigned m = std::max(1u, static_cast<unsigned>(k * runtime_rs_redundancy + 0.5f));
+        // n must not exceed n_carriers so every shard lands on a different carrier.
+        unsigned n = std::min(k + m, n_carriers);
+        m = n - k;
+        std::vector<const uint8_t*> data_ptrs(k);
+        for (unsigned i = 0; i < k; ++i)
+          data_ptrs[i] = backend_read_buf.data() + i * block_size;
+        std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
+        std::vector<uint8_t*> parity_ptrs(m);
+        for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
+        reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
+        std::vector<int> carrier_fds;
+        for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
+        for (size_t i = 0; i < n; ++i) {
+          int fd = carrier_fds[(next_carrier_for_rs + i) % carrier_fds.size()];
+          const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
+          queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = fd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
         }
-      } else {
-        // Buffered data < block_size: SMALL with small_packet_redundancy copies.
+        next_carrier_for_rs += n;
+        ack_send_time_ns[next_send_id] = now_ns();
+        {
+          UnackedItem ui;
+          ui.data.assign(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
+          ui.n = n;  ui.k = static_cast<unsigned>(k);
+          ui.block_size = static_cast<uint16_t>(block_size);
+          ui.is_small = false;
+          ui.send_ns = now_ns();
+          unacked_data[next_send_id] = std::move(ui);
+        }
+        next_send_id++;
+        backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
+      }
+      // Any sub-block remainder: send as SMALL (no RS needed for < block_size).
+      if (!backend_read_buf.empty() && !carriers.empty()) {
         size_t chunk = backend_read_buf.size();
         { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.end());
           ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
