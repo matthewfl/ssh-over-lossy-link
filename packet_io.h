@@ -73,6 +73,9 @@ struct ReceiveCallbacks {
   std::function<void(const PacketServerConfig&)> on_server_config;
   // Server -> client SUGGEST_CLOSE; client should close this carrier (server thinks it's dead or slow).
   std::function<void(int fd)> on_suggest_close;
+  // When we have ≥2 copies of a small packet: gap_ns from first to median arrival.
+  // We don't know which copy would be dropped when reducing N→N-1; median is representative.
+  std::function<void(uint64_t gap_ns)> on_small_extra_copy;
 };
 
 // Process bytes from carrier read_buf: parse SMALL/REED_SOLOMON, update reassembly/rs_pending,
@@ -80,7 +83,8 @@ struct ReceiveCallbacks {
 // for control packets. Mutates s.read_buf, reassembly, rs_pending, next_deliver_id.
 // recently_decoded_ns: shared map of (id -> decode_time_ns) for recently decoded RS groups;
 //   used to detect and time "extra" shards that arrive after a group has already decoded.
-//   Caller must pass the same map across all calls for a session.
+// small_copy_arrival_times: (id -> arrival times of all copies) for small packets; used to measure first→median gap.
+//   Caller must pass the same maps across all calls for a session.
 // Returns false if the connection should be closed (eof or error).
 bool process_carrier_read(
   int fd,
@@ -88,6 +92,7 @@ bool process_carrier_read(
   std::map<uint64_t, std::vector<uint8_t>>& reassembly,
   std::map<uint64_t, RsPending>& rs_pending,
   std::map<uint64_t, uint64_t>& recently_decoded_ns,
+  std::map<uint64_t, std::vector<uint64_t>>& small_copy_arrival_times,
   uint64_t& next_deliver_id,
   const ReceiveCallbacks& callbacks);
 

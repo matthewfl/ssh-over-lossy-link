@@ -108,13 +108,17 @@ RS redundancy is adjusted every ~300 ms using two complementary timing signals m
 | > 5 % of groups struggling | Increase RS redundancy by +0.5 (aggressive) |
 | > 1 % struggling | Increase RS redundancy by +0.25 |
 
-**Decrease signal — extra-shard gap:** When a group decodes from its k-th shard, the arrival time of the (k+1)-th shard is recorded. If the 90th-percentile of recent k→(k+1) gaps is below 0.1 ms, it means an extra shard was essentially free nearly every time — the link has consistent headroom and parity can be reduced.
+**Decrease signal — extra-shard gap:** When a group decodes from its k-th shard, the arrival time of the (k+1)-th shard is recorded. If the 90th-percentile of recent k→(k+1) gaps is below 0.5 ms, it means an extra shard was essentially free nearly every time — the link has consistent headroom and parity can be reduced.
 
 | Condition | Action |
 |-----------|--------|
-| Extra-shard p90 < 0.1 ms **and** < 0.2 % struggling | Decrease RS redundancy by −0.05 (gradual) |
+| Extra-shard p90 < 0.5 ms **and** < 1 % struggling | Decrease RS redundancy by −0.02 (gradual) |
 
-RS redundancy is clamped to [0.1, 2.0] (minimum lowered from 0.2 since the extra-shard signal provides a safe lower bound). Both directions are monitored: the server reports c2s shard spread and average extra-shard gap to the client in `SERVER_METRICS` every 400 ms; the client measures s2c locally. In `--auto` mode the server manages its own redundancy and reports its chosen value via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
+RS redundancy is clamped to [0.1, 2.0]. Both directions are monitored: the server reports c2s shard spread and average extra-shard gap to the client in `SERVER_METRICS` every 400 ms; the client measures s2c locally.
+
+**Small-packet copies** use a separate decrease signal: when duplicate small packets (copy 2) arrive, the gap from copy 1→copy 2 is measured. If the 90th-percentile of these gaps is below 0.5 ms, going from N→N−1 copies would add negligible latency, so small_packet_redundancy is decreased. This is independent of the RS extra-shard signal — with 20 copies, the 20th copy matters less; we care whether the 2nd copy arrives promptly.
+
+In `--auto` mode the server manages its own redundancy and reports its chosen value via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
 
 #### RTT-scaled timeouts
 

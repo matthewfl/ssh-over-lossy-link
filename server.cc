@@ -188,7 +188,7 @@ int run_server(const Args& args) {
   // Shard-spread thresholds: what fraction of RS groups are "struggling" (spread > 2× floor).
   static constexpr float kFractionSlowIncreaseFast   = 0.05f;  // >5% struggling → big increase
   static constexpr float kFractionSlowIncreaseMedium = 0.01f;  // >1% struggling → medium increase
-  static constexpr float kFractionSlowDecrease       = 0.002f; // <0.2% struggling → decrease
+  static constexpr float kFractionSlowDecrease       = 0.01f;  // <1% struggling → decrease (0.2% too strict for low-packet interactive SSH)
   static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 RS groups decoded
   unsigned next_carrier_for_rs = 0;
 
@@ -208,9 +208,11 @@ int run_server(const Args& args) {
   std::deque<uint64_t> c2s_gap_final_ns;
   // extra_shard_gap: time from k-th shard to (k+1)-th shard (how much headroom we have).
   std::deque<uint64_t> c2s_extra_shard_gap_ns;
+  std::deque<uint64_t> c2s_small_extra_copy_gap_ns;  // copy 1->2 gap for small packets (c2s)
   static constexpr size_t kMaxSpreadSamples = 100;
   // Shared map for tracking when RS groups decoded so extra shards can be timed.
   std::map<uint64_t, uint64_t> recently_decoded_ns;
+  std::map<uint64_t, std::vector<uint64_t>> small_copy_arrival_times;
 
   // Unacked retransmit buffer: holds original bytes for each outstanding send_id
   // so we can re-encode and resend on a new carrier when all existing ones die.
@@ -425,6 +427,10 @@ int run_server(const Args& args) {
     c2s_extra_shard_gap_ns.push_back(gap_ns);
     while (c2s_extra_shard_gap_ns.size() > kMaxSpreadSamples) c2s_extra_shard_gap_ns.pop_front();
   };
+  recv_cb.on_small_extra_copy = [&](uint64_t gap_ns) {
+    c2s_small_extra_copy_gap_ns.push_back(gap_ns);
+    while (c2s_small_extra_copy_gap_ns.size() > kMaxSpreadSamples) c2s_small_extra_copy_gap_ns.pop_front();
+  };
   recv_cb.on_ping = [&](int fd, uint64_t id) { send_pong(fd, id); };  // client may still send PING for health
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it = ack_send_time_ns.find(acked_id);
@@ -451,6 +457,7 @@ int run_server(const Args& args) {
     if (max_packet == 0) max_packet = 800;
     runtime_small_packet_redundancy = pc.small_packet_redundancy;
     if (runtime_small_packet_redundancy == 0) runtime_small_packet_redundancy = 1;
+    runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
     runtime_rs_redundancy = pc.reed_solomon_redundancy;
     if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
     // When auto_adapt, send current config so client has initial sync; server will send again when it adapts.
@@ -470,7 +477,7 @@ int run_server(const Args& args) {
       return true;
     }
     s.read_buf.insert(s.read_buf.end(), buf, buf + n);
-    return packet_io::process_carrier_read(fd, s, reassembly, rs_pending, recently_decoded_ns, next_deliver_id, recv_cb);
+    return packet_io::process_carrier_read(fd, s, reassembly, rs_pending, recently_decoded_ns, small_copy_arrival_times, next_deliver_id, recv_cb);
   };
 
   std::vector<struct epoll_event> events(64);
@@ -842,33 +849,41 @@ int run_server(const Args& args) {
       float fraction_struggling = static_cast<float>(n_struggling)
                                   / static_cast<float>(c2s_shard_spread_ns.size());
 
-      // --- Decrease signal: extra_shard_gap ---
-      // If the (k+1)-th shard consistently arrives within 0.1ms of the k-th, we have
-      // a free spare nearly every time — safe to reduce parity by one step.
-      static constexpr uint64_t kExtraGapDecreaseThresholdNs = 100000ULL;  // 0.1 ms
-      bool can_decrease = false;
+      // --- Decrease signal (RS): extra shard (k+1) arrives within 0.5ms of k-th ---
+      static constexpr uint64_t kExtraGapDecreaseThresholdNs = 500000ULL;  // 0.5 ms
+      bool can_decrease_rs = false;
       if (c2s_extra_shard_gap_ns.size() >= 10) {
-        // Use 90th-percentile so occasional slow outliers don't block the decrease.
         std::vector<uint64_t> sorted_gap(c2s_extra_shard_gap_ns.begin(),
                                          c2s_extra_shard_gap_ns.end());
         std::sort(sorted_gap.begin(), sorted_gap.end());
         uint64_t p90 = sorted_gap[(sorted_gap.size() * 9) / 10];
-        can_decrease = (p90 < kExtraGapDecreaseThresholdNs);
+        can_decrease_rs = (p90 < kExtraGapDecreaseThresholdNs);
+      }
+
+      // --- Decrease signal (small packets): copy 2 arrives within 0.5ms of copy 1 ---
+      // For small packets with N copies, the 2nd copy is the relevant one; if it arrives
+      // within 0.5ms, going N->N-1 wouldn't add >0.5ms latency.
+      bool can_decrease_small = false;
+      if (c2s_small_extra_copy_gap_ns.size() >= 10) {
+        std::vector<uint64_t> sorted_sg(c2s_small_extra_copy_gap_ns.begin(),
+                                        c2s_small_extra_copy_gap_ns.end());
+        std::sort(sorted_sg.begin(), sorted_sg.end());
+        uint64_t p90 = sorted_sg[(sorted_sg.size() * 9) / 10];
+        can_decrease_small = (p90 < kExtraGapDecreaseThresholdNs);
       }
 
       if (fraction_struggling > kFractionSlowIncreaseFast) {
-        // >5% of groups had a clear bottleneck last shard: increase by +0.10 per cycle.
-        // At 300ms adapt interval this ramps from 0.1 to 0.5 in ~1.2 s if sustained.
         runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.10f);
         runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 1u);
       } else if (fraction_struggling > kFractionSlowIncreaseMedium) {
-        // 1–5% struggling: small nudge, let it accumulate over several cycles.
         runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.05f);
-      } else if (can_decrease && fraction_struggling < kFractionSlowDecrease) {
-        // Extra shard arrives quickly and link is not struggling: creep parity down.
-        runtime_rs_redundancy = std::max(0.1f, runtime_rs_redundancy - 0.02f);
-        runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
+      } else {
+        if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
+          runtime_rs_redundancy = std::max(0.1f, runtime_rs_redundancy - 0.02f);
+        if (can_decrease_small)
+          runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
       }
+      runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;

@@ -17,6 +17,7 @@ bool process_carrier_read(
   std::map<uint64_t, std::vector<uint8_t>>& reassembly,
   std::map<uint64_t, RsPending>& rs_pending,
   std::map<uint64_t, uint64_t>& recently_decoded_ns,
+  std::map<uint64_t, std::vector<uint64_t>>& small_copy_arrival_times,
   uint64_t& next_deliver_id,
   const ReceiveCallbacks& callbacks) {
   auto now_ns = []() -> uint64_t {
@@ -55,9 +56,21 @@ bool process_carrier_read(
       size_t total = sizeof(PacketHeader) + sizeof(uint16_t) + size;
       if (s.read_buf.size() < total) break;
       uint64_t id = h->id;
+      const uint64_t t = now_ns();
       if (id >= next_deliver_id && !reassembly.count(id)) {
         reassembly[id].assign(p->data, p->data + size);
-        s.last_recv_ns = now_ns();
+        s.last_recv_ns = t;
+        small_copy_arrival_times[id] = {t};
+      } else if (small_copy_arrival_times.count(id)) {
+        auto& times = small_copy_arrival_times[id];
+        times.push_back(t);
+        if (times.size() >= 2 && callbacks.on_small_extra_copy) {
+          std::vector<uint64_t> sorted = times;
+          std::sort(sorted.begin(), sorted.end());
+          uint64_t gap = sorted[sorted.size() / 2] - sorted[0];  // first → median
+          callbacks.on_small_extra_copy(gap);
+        }
+        small_copy_arrival_times.erase(id);
       }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total);
       while (reassembly.count(next_deliver_id)) {
@@ -66,6 +79,10 @@ bool process_carrier_read(
           callbacks.on_deliver(fd, next_deliver_id, vec.data(), vec.size());
         reassembly.erase(next_deliver_id);
         next_deliver_id++;
+      }
+      for (auto it = small_copy_arrival_times.begin(); it != small_copy_arrival_times.end(); ) {
+        if (it->first + 100 < next_deliver_id) it = small_copy_arrival_times.erase(it);
+        else ++it;
       }
       continue;
     }
