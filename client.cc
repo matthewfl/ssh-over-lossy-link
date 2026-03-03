@@ -289,11 +289,8 @@ int run_client(const Args& args) {
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
   // Only reap a carrier via RTT-outlier if its RTT is both much worse than its peers (5×
-  // median) AND absolutely very slow (5 s).  A 3×/1 s threshold is too aggressive: with
-  // natural link latency variance (e.g., 100–2000 ms random) the slowest carrier always
-  // looks like an outlier even when it is healthy, causing unnecessary churn that drops
-  // in-flight RS shards and creates multi-second stalls.
-  const uint64_t very_high_rtt_ns = 5000 * 1000000ULL;
+  // median) AND absolutely very slow. On high-latency links (5–10 s RTT), 5 s is too low—use 15 s.
+  const uint64_t very_high_rtt_ns = 15000 * 1000000ULL;
   // Fraction-slow thresholds (mirrors server.cc constants).
   static constexpr float kFractionSlowIncreaseFast   = 0.05f;
   static constexpr float kFractionSlowIncreaseMedium = 0.01f;
@@ -984,7 +981,12 @@ int run_client(const Args& args) {
       //   1. RTT outlier: last_rtt_ns > 3× median AND > 1s (stalled on client→server path).
       //   2. Silence: no shard received from server in 10s while other carriers are active
       //      (stalled on server→client path).
-      if (carriers.size() > min_carriers_floor && now - last_reap_ns >= reap_check_interval_ns) {
+      // Skip reaping during initial handshake: when we have unacked data and few RTT
+      // samples, we shouldn't kill carriers. The "silent" carriers (haven't received ACK)
+      // are often good—ACKs go only to the carrier that delivered; others are used for
+      // sending. Reaping them causes churn that stalls the handshake on high-latency links.
+      const bool early_handshake = (unacked_sends.size() > 0 && rtt_samples.size() < 10);
+      if (!early_handshake && carriers.size() > min_carriers_floor && now - last_reap_ns >= reap_check_interval_ns) {
         last_reap_ns = now;
 
         // RTT-based reap: find worst carrier and reap if it's a clear outlier.
@@ -1003,7 +1005,8 @@ int run_client(const Args& args) {
           }
         }
 
-        // Silence-based reap: carrier hasn't received a shard from server in 10s while others have.
+        // Silence-based reap: carrier hasn't received a shard from server in 20s while others have.
+        // Use 20s on high-latency links where RTT can be 5–10s; 10s was too aggressive.
         if (carriers.size() > min_carriers_floor) {
           uint64_t latest_recv = 0;
           for (auto& [fd, st] : carriers)
@@ -1011,7 +1014,7 @@ int run_client(const Args& args) {
           if (latest_recv + 5000000000ULL > now) {  // active server→client traffic in last 5s
             std::vector<int> to_reap;
             for (auto& [fd, st] : carriers)
-              if (st.last_recv_ns > 0 && st.last_recv_ns + 10000000000ULL < now)
+              if (st.last_recv_ns > 0 && st.last_recv_ns + 20000000000ULL < now)
                 to_reap.push_back(fd);
             for (int fd : to_reap) {
               if (carriers.size() <= min_carriers_floor) break;
@@ -1100,7 +1103,7 @@ int run_client(const Args& args) {
       if (!unacked_sends.empty() && !carriers.empty()
           && now_p - last_retransmit_check_ns >= 500000000ULL) {
         last_retransmit_check_ns = now_p;
-        static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 1000000000ULL;  // 1 s
+        static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;  // 3 s (README); high latency needs longer
         // Collect all ready (non-connecting) carriers for round-robin retransmit.
         // Spreading shards across multiple carriers means no single carrier failure
         // can wipe out a retransmit attempt.
