@@ -223,6 +223,23 @@ int run_server(const Args& args) {
   uint64_t last_retransmit_check_ns = 0;
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
+  // RTT-scaled timeouts: server observes server→client RTT from ACKs. Use 5 s default when unknown.
+  auto get_effective_rtt_ns = [&]() -> uint64_t {
+    if (server_recent_rtt_ns.size() >= 3) {
+      std::vector<uint64_t> sorted(server_recent_rtt_ns.begin(), server_recent_rtt_ns.end());
+      std::sort(sorted.begin(), sorted.end());
+      return sorted[static_cast<size_t>(sorted.size() * 0.9)];
+    }
+    return 5000000000ULL;  // 5 s conservative when unknown
+  };
+  auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
+    uint64_t rtt = get_effective_rtt_ns();
+    uint64_t v = static_cast<uint64_t>(mult) * rtt;
+    if (v < min_ns) return min_ns;
+    if (v > max_ns) return max_ns;
+    return v;
+  };
+
   auto connect_backend = [&]() {
     if (backend_fd >= 0) return;
     backend_fd = connect_tcp(args.remote_hostname, args.remote_port);
@@ -571,18 +588,18 @@ int run_server(const Args& args) {
     // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
     if (now_ns_val - last_ping_check_ns >= 1000000000ULL) {
       last_ping_check_ns = now_ns_val;
-      static constexpr uint64_t PING_IDLE_NS = 15000000000ULL;
-      static constexpr uint64_t DEAD_IDLE_NS = 20000000000ULL;
-      static constexpr uint64_t GRACE_NS     =  5000000000ULL;
+      uint64_t ping_idle_ns  = scaled_ns(3, 10000000000ULL, 60000000000ULL);
+      uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);
+      uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);
       std::vector<int> to_kill;
       for (auto& [cfd, cs] : carriers) {
-        if (now_ns_val - cs.connect_ns < GRACE_NS) continue;
+        if (now_ns_val - cs.connect_ns < grace_ns) continue;
         uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
-        if (now_ns_val - last_activity > DEAD_IDLE_NS) {
+        if (now_ns_val - last_activity > dead_idle_ns) {
           to_kill.push_back(cfd);
         } else if (cs.write_buf.empty()
-                   && now_ns_val - cs.last_send_ns > PING_IDLE_NS
-                   && now_ns_val - cs.last_recv_ns  > PING_IDLE_NS) {
+                   && now_ns_val - cs.last_send_ns > ping_idle_ns
+                   && now_ns_val - cs.last_recv_ns  > ping_idle_ns) {
           packet_io::append_ping(cs.write_buf, 0);
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
@@ -601,20 +618,19 @@ int run_server(const Args& args) {
       for (auto& [cfd, cs] : carriers)
         if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
-      // Global idle timeout: if nothing has been received from any carrier for
-      // 2 minutes the client is gone; exit so the server process doesn't linger.
-      static constexpr uint64_t SERVER_GLOBAL_IDLE_NS = 120000000000ULL;  // 2 min
-      if (now_ns_val - last_global_recv_ns > SERVER_GLOBAL_IDLE_NS) {
+      // Global idle timeout: if nothing from any carrier for 12×RTT the client is gone.
+      uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);
+      if (now_ns_val - last_global_recv_ns > global_idle_ns) {
         if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu]\n", (unsigned long long)(now_ns_val/1000000ULL));
         running = false;
       }
     }
 
-    // Timeout-based retransmit: re-send any group unACK'd for > 3s to all alive carriers.
+    // Timeout-based retransmit: re-send any group unACK'd for 4×RTT to all alive carriers.
     if (!unacked_data.empty() && !carriers.empty()
         && now_ns_val - last_retransmit_check_ns >= 500000000ULL) {
       last_retransmit_check_ns = now_ns_val;
-      static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 1000000000ULL;
+      uint64_t retransmit_timeout_ns = scaled_ns(4, 2000000000ULL, 60000000000ULL);
       // Collect ready carriers; distribute shards round-robin across all of them so
       // that no single carrier failure can wipe out a retransmit attempt.
       std::vector<int> rt_carriers;
@@ -623,7 +639,7 @@ int run_server(const Args& args) {
       if (!rt_carriers.empty()) {
         unsigned rt_idx = 0;
         for (auto& [uid, ui] : unacked_data) {
-          if (ui.send_ns == 0 || now_ns_val - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
+          if (ui.send_ns == 0 || now_ns_val - ui.send_ns < retransmit_timeout_ns) continue;
           if (ui.is_small) {
             int cfd = rt_carriers[rt_idx % rt_carriers.size()];
             packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
@@ -660,13 +676,13 @@ int run_server(const Args& args) {
 
     if (now_ns_val - last_rs_drain_ns >= 1000000000ULL) {
       last_rs_drain_ns = now_ns_val;
-      static constexpr uint64_t RS_STALE_NS = 10000000000ULL;
+      uint64_t rs_stale_ns = scaled_ns(4, 10000000000ULL, 60000000000ULL);
       // Collect only the IDs that were actually erased (had partial shards and
       // timed out).  We must never gap-jump past IDs that simply haven't received
       // any shard yet — those shards may still arrive.
       std::vector<uint64_t> drained_ids;
       for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > RS_STALE_NS) {
+        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > rs_stale_ns) {
           drained_ids.push_back(it->first);
           it = rs_pending.erase(it);
         } else
@@ -689,7 +705,7 @@ int run_server(const Args& args) {
           bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
           bool no_carriers        = carriers.empty();
           bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
-                                     now_ns_val - next_deliver_id_stuck_since_ns >= RS_STALE_NS);
+                                     now_ns_val - next_deliver_id_stuck_since_ns >= rs_stale_ns);
           if (explicitly_drained || no_carriers || gap_timed_out) {
             uint64_t nxt = UINT64_MAX;
             if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);

@@ -288,9 +288,7 @@ int run_client(const Args& args) {
   const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
-  // Only reap a carrier via RTT-outlier if its RTT is both much worse than its peers (5×
-  // median) AND absolutely very slow. On high-latency links (5–10 s RTT), 5 s is too low—use 15 s.
-  const uint64_t very_high_rtt_ns = 15000 * 1000000ULL;
+  // RTT outlier threshold: carrier must be both 5× median AND above this absolute. Scales with link.
   // Fraction-slow thresholds (mirrors server.cc constants).
   static constexpr float kFractionSlowIncreaseFast   = 0.05f;
   static constexpr float kFractionSlowIncreaseMedium = 0.01f;
@@ -304,6 +302,28 @@ int run_client(const Args& args) {
   const unsigned min_carriers_floor = std::max(2u, args.config.connections);
   uint64_t last_reap_ns = 0;
   const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
+
+  // RTT-scaled timeouts: use observed latency so low-latency links get tighter timeouts,
+  // high-latency links get longer. Cold start uses rtt_hint_ms or 5 s conservative default.
+  auto get_effective_rtt_ns = [&]() -> uint64_t {
+    uint64_t hint_ns = static_cast<uint64_t>(args.config.rtt_hint_ms) * 1000000ULL;
+    if (recent_rtt_ns.size() >= 3) {
+      std::vector<uint64_t> sorted(recent_rtt_ns.begin(), recent_rtt_ns.end());
+      std::sort(sorted.begin(), sorted.end());
+      uint64_t p90 = sorted[static_cast<size_t>(sorted.size() * 0.9)];
+      uint64_t observed = std::max(p90, server_reported_max_rtt_ns);
+      uint64_t fallback = hint_ns ? hint_ns : 5000000000ULL;
+      return std::max(observed, fallback);
+    }
+    return hint_ns ? hint_ns : 5000000000ULL;  // 5 s conservative when unknown
+  };
+  auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
+    uint64_t rtt = get_effective_rtt_ns();
+    uint64_t v = static_cast<uint64_t>(mult) * rtt;
+    if (v < min_ns) return min_ns;
+    if (v > max_ns) return max_ns;
+    return v;
+  };
 
   // Unacked-send retransmit buffer.  Holds the original pre-encoded data for
   // each outstanding send_id so that it can be re-encoded and re-sent on a
@@ -899,7 +919,8 @@ int run_client(const Args& args) {
           *std::max_element(rtt_samples.begin(), rtt_samples.end());
 
       // RTT outlier: a carrier is stalled when its RTT is both extremely high in absolute terms
-      // AND much worse than its peers (3× median). With a single carrier, skip the peer comparison.
+      // AND much worse than its peers (5× median). Threshold scales with link RTT.
+      uint64_t very_high_rtt_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
       bool rtt_outlier = false;
       if (max_carrier_rtt > very_high_rtt_ns) {
         if (rtt_samples.size() <= 1) {
@@ -1005,16 +1026,16 @@ int run_client(const Args& args) {
           }
         }
 
-        // Silence-based reap: carrier hasn't received a shard from server in 20s while others have.
-        // Use 20s on high-latency links where RTT can be 5–10s; 10s was too aggressive.
+        // Silence-based reap: carrier hasn't received in N×RTT while others have. Scales with link.
         if (carriers.size() > min_carriers_floor) {
           uint64_t latest_recv = 0;
           for (auto& [fd, st] : carriers)
             if (st.last_recv_ns > latest_recv) latest_recv = st.last_recv_ns;
+          uint64_t silence_reap_ns = scaled_ns(4, 15000000000ULL, 60000000000ULL);
           if (latest_recv + 5000000000ULL > now) {  // active server→client traffic in last 5s
             std::vector<int> to_reap;
             for (auto& [fd, st] : carriers)
-              if (st.last_recv_ns > 0 && st.last_recv_ns + 20000000000ULL < now)
+              if (st.last_recv_ns > 0 && st.last_recv_ns + silence_reap_ns < now)
                 to_reap.push_back(fd);
             for (int fd : to_reap) {
               if (carriers.size() <= min_carriers_floor) break;
@@ -1061,20 +1082,20 @@ int run_client(const Args& args) {
             unlink((client_dir + "/" + std::to_string(idx)).c_str());
           }
         }
-        static constexpr uint64_t PING_IDLE_NS =  15000000000ULL;  // 15 s (README: keepalive when idle)
-        static constexpr uint64_t DEAD_IDLE_NS =  20000000000ULL;  // 20 s (README: inactivity timeout)
-        static constexpr uint64_t GRACE_NS     =  10000000000ULL;  // 10 s post-connect grace (allows slow first RTT)
+        uint64_t ping_idle_ns  = scaled_ns(3, 10000000000ULL, 60000000000ULL);   // keepalive when idle
+        uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);   // inactivity timeout
+        uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);   // post-connect grace
         std::vector<int> to_kill;
         for (auto& [cfd, cs] : carriers) {
           if (cs.connecting) continue;
-          if (now_p - cs.connect_ns < GRACE_NS) continue;
+          if (now_p - cs.connect_ns < grace_ns) continue;
           // Use the later of connect_ns and last_recv_ns as "last activity".
           uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
-          if (now_p - last_activity > DEAD_IDLE_NS) {
+          if (now_p - last_activity > dead_idle_ns) {
             to_kill.push_back(cfd);
           } else if (cs.write_buf.empty()
-                     && now_p - cs.last_send_ns > PING_IDLE_NS
-                     && now_p - cs.last_recv_ns  > PING_IDLE_NS) {
+                     && now_p - cs.last_send_ns > ping_idle_ns
+                     && now_p - cs.last_recv_ns  > ping_idle_ns) {
             // Truly idle: send a keepalive ping.
             packet_io::append_ping(cs.write_buf, next_send_id);
             ev.events = EPOLLIN | EPOLLOUT;
@@ -1089,21 +1110,18 @@ int run_client(const Args& args) {
         for (auto& [cfd, cs] : carriers)
           if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
-        // Global idle timeout: if nothing has been received from the server for
-        // 1 min 50 s the connection is dead; exit so the SSH client gets a clean EOF.
-        static constexpr uint64_t CLIENT_GLOBAL_IDLE_NS = 110000000000ULL;  // 1 min 50 s
-        if (now_p - last_global_recv_ns > CLIENT_GLOBAL_IDLE_NS)
+        // Global idle timeout: if nothing from server for 12×RTT the connection is dead.
+        uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);  // min 60s, max 5min
+        if (now_p - last_global_recv_ns > global_idle_ns)
           running = false;
       }
 
-      // Timeout-based retransmit: if a send has been unACK'd for > 3s AND we have
-      // alive carriers, re-encode and resend all its shards to one carrier.  This
-      // recovers from the case where some (not all) carriers died, leaving the
-      // server's rs_pending incomplete without triggering retransmit_needed.
+      // Timeout-based retransmit: if a send has been unACK'd for 4×RTT AND we have
+      // alive carriers, re-encode and resend. Recovers when some carriers died.
       if (!unacked_sends.empty() && !carriers.empty()
           && now_p - last_retransmit_check_ns >= 500000000ULL) {
         last_retransmit_check_ns = now_p;
-        static constexpr uint64_t RETRANSMIT_TIMEOUT_NS = 3000000000ULL;  // 3 s (README); high latency needs longer
+        uint64_t retransmit_timeout_ns = scaled_ns(4, 2000000000ULL, 60000000000ULL);
         // Collect all ready (non-connecting) carriers for round-robin retransmit.
         // Spreading shards across multiple carriers means no single carrier failure
         // can wipe out a retransmit attempt.
@@ -1113,7 +1131,7 @@ int run_client(const Args& args) {
         if (!rt_carriers.empty()) {
           unsigned rt_idx = 0;  // round-robin index across rt_carriers
           for (auto& [uid, ui] : unacked_sends) {
-            if (ui.send_ns == 0 || now_p - ui.send_ns < RETRANSMIT_TIMEOUT_NS) continue;
+            if (ui.send_ns == 0 || now_p - ui.send_ns < retransmit_timeout_ns) continue;
             if (ui.is_small) {
               int cfd = rt_carriers[rt_idx % rt_carriers.size()];
               packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
@@ -1164,19 +1182,17 @@ int run_client(const Args& args) {
         fflush(dbg);
       }
 
-      // RS stale-group drain: safety net for RS groups that can never complete
-      // (e.g., all shards were on carriers that died before the retransmit arrived).
-      // After 10 s, drop the incomplete group and advance next_deliver_id past the
-      // gap so that later groups can be delivered.
+      // RS stale-group drain: safety net for RS groups that can never complete.
+      // After 4×RTT, drop incomplete group so later groups can be delivered. Scales with link.
       if (now_p - last_rs_drain_ns >= 1000000000ULL) {
         last_rs_drain_ns = now_p;
-        static constexpr uint64_t RS_STALE_NS = 10000000000ULL;  // 10 s
+        uint64_t rs_stale_ns = scaled_ns(4, 10000000000ULL, 60000000000ULL);
         // Collect IDs that are actually being erased (had partial shards but timed out).
         // We must only gap-jump past IDs that were genuinely stale — not past IDs that
         // simply haven't received any shard yet (e.g. a SMALL arrived before the RS shard).
         std::vector<uint64_t> drained_ids;
         for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > RS_STALE_NS) {
+          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > rs_stale_ns) {
             drained_ids.push_back(it->first);
             it = rs_pending.erase(it);
           } else
@@ -1190,10 +1206,9 @@ int run_client(const Args& args) {
         // Gap-jump rules (to avoid the RS+SMALL-split race):
         //  1. Always jump a gap that was explicitly stale-drained (partial shards timed out).
         //  2. Always jump when all carriers are dead (shards can never arrive).
-        //  3. Jump a gap that has been continuously present for > RS_STALE_NS —
-        //     this covers RS groups where NO shard ever arrived (e.g., carrier
-        //     died before delivering any shard) while giving enough time for
-        //     retransmission to succeed before we give up.
+        //  3. Jump a gap that has been continuously present for > rs_stale_ns —
+        //     this covers RS groups where NO shard ever arrived while giving
+        //     enough time for retransmission to succeed before we give up.
         //  Never jump a gap that just appeared (out-of-order SMALL/RS race).
         while (true) {
           auto ra = reassembly.find(next_deliver_id);
@@ -1215,7 +1230,7 @@ int run_client(const Args& args) {
             bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
             bool no_carriers        = carriers.empty();
             bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
-                                       now_p - next_deliver_id_stuck_since_ns >= RS_STALE_NS);
+                                       now_p - next_deliver_id_stuck_since_ns >= rs_stale_ns);
             if (explicitly_drained || no_carriers || gap_timed_out) {
               uint64_t nxt = UINT64_MAX;
               if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);

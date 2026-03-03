@@ -90,6 +90,7 @@ struct Config {
   unsigned small_packet_redundancy = 2;
   float rs_redundancy = 0.2f;
   float max_delay_ms = 1.0f;
+  unsigned rtt_hint_ms = 0;  // 0 = auto from observed latency; else hint for cold-start timeouts
 };
 
 // -----------------------------------------------------------------------------
