@@ -27,13 +27,14 @@ The client runs as a ProxyCommand: the real SSH process talks to the client over
 
 Install `ssh-oll` on both the client and the server.
 ```
-git clone ...
+git clone https://github.com/matthewfl/ssh-over-lossy-link.git
 make && make install
 ```
 Then configure your `~/.ssh/config` as follows:
 ```
 Host lossy-ssh-connection
     HostName ip/hostname of remote ssh host
+    ProxyJump hostname-of-jump-host
 
 Host good-ssh-connection
     ProxyCommand ssh-oll lossy-ssh-connection
@@ -203,3 +204,7 @@ Use `--unix-socket-connection` on the client to point at the proxy socket when d
 ## License
 
 MIT. See [LICENSE](LICENSE) in this repository.
+
+## Vibe coded warning
+
+This project is mostly vibe coded using Cursor with Composer 1.5 and Claude Sonnet 4.6.
