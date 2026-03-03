@@ -149,6 +149,7 @@ enum packet_kind_e : uint8_t {
     PACKET_ACK = 6,               // both directions; cumulative ack: all data up to and including header.id delivered (for latency measurement)
     PACKET_SERVER_METRICS = 7,    // server -> client; max RTT observed by server (server→client path) for client adapt
     PACKET_SERVER_CONFIG = 8,     // server -> client; server's current redundancy (when server manages it; auto_adapt)
+    PACKET_READY = 9,             // server -> client; sent when carrier connects, confirms link is up before client sends
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -185,6 +186,9 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 
 // PACKET_SERVER_CONFIG: server -> client. Same payload as packet_config (no auto_adapt).
 // When auto_adapt is on, server adapts redundancy and sends this so the client stays in sync.
+
+// PACKET_READY: server -> client. Header only. Sent when a carrier connects so the client
+// knows the bidirectional path is up before it sends data; avoids premature timeouts.
 
 ```
 

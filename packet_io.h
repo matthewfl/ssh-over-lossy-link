@@ -79,6 +79,7 @@ void append_server_config(std::vector<uint8_t>& out, uint16_t packet_size, uint1
 void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
 void append_pong(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
+void append_ready(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.

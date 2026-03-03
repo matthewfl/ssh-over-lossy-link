@@ -79,6 +79,10 @@ bool process_carrier_read(
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
       continue;
     }
+    if (h->packet_kind == PacketKind::READY) {
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      continue;  // header-only; last_recv_ns already updated; confirms server is ready
+    }
     if (h->packet_kind == PacketKind::SERVER_METRICS) {
       if (s.read_buf.size() < sizeof(PacketServerMetrics)) break;
       const auto* pm = reinterpret_cast<const PacketServerMetrics*>(s.read_buf.data());
@@ -237,6 +241,13 @@ void append_ping(std::vector<uint8_t>& out, uint64_t id) {
   PacketHeader h{};
   h.id = id;
   h.packet_kind = PacketKind::PING;
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+}
+
+void append_ready(std::vector<uint8_t>& out) {
+  PacketHeader h{};
+  h.id = 0;
+  h.packet_kind = PacketKind::READY;
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
 }
 

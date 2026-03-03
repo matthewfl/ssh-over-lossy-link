@@ -22,6 +22,7 @@ enum class PacketKind : uint8_t {
   ACK = 6,                // server -> client; cumulative ack: all data up to id delivered
   SERVER_METRICS = 7,     // server -> client; observed link quality (max RTT etc.) for client adapt
   SERVER_CONFIG = 8,      // server -> client; server's current redundancy config (when server manages it)
+  READY = 9,              // server -> client; sent when carrier connects, confirms link is up
 };
 
 #pragma pack(push, 1)

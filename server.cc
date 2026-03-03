@@ -464,6 +464,11 @@ int run_server(const Args& args) {
             if (dbg) { fprintf(dbg, "[carrier-open t=%llu fd=%d total=%zu]\n",
                                (unsigned long long)(now_ns()/1000000ULL), client, carriers.size());
                         fflush(dbg); }
+            // Send READY so client knows the link is up before it sends data.
+            packet_io::append_ready(carriers[client].write_buf);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = client;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);
             if (backend_fd < 0)
               connect_backend();
             // Re-send any data that was in-flight when all previous carriers died,
@@ -626,26 +631,29 @@ int run_server(const Args& args) {
       }
     }
 
-    // Timeout-based retransmit: re-send any group unACK'd for 4×RTT to all alive carriers.
+    // Timeout-based retransmit: re-send any group unACK'd for 4×RTT (or 2.5 s when no RTT) to carriers.
     if (!unacked_data.empty() && !carriers.empty()
         && now_ns_val - last_retransmit_check_ns >= 500000000ULL) {
       last_retransmit_check_ns = now_ns_val;
-      uint64_t retransmit_timeout_ns = scaled_ns(4, 2000000000ULL, 60000000000ULL);
-      // Collect ready carriers; distribute shards round-robin across all of them so
-      // that no single carrier failure can wipe out a retransmit attempt.
+      uint64_t retransmit_timeout_ns = (server_recent_rtt_ns.size() >= 2)
+          ? scaled_ns(4, 2000000000ULL, 60000000000ULL)
+          : 2500000000ULL;  // 2.5 s when no RTT known
       std::vector<int> rt_carriers;
       for (auto& [cfd, cs] : carriers)
         if (!cs.connecting) rt_carriers.push_back(cfd);
       if (!rt_carriers.empty()) {
         unsigned rt_idx = 0;
+        const unsigned small_rt_copies = std::max(1u, std::min(3u, static_cast<unsigned>(rt_carriers.size())));
         for (auto& [uid, ui] : unacked_data) {
           if (ui.send_ns == 0 || now_ns_val - ui.send_ns < retransmit_timeout_ns) continue;
           if (ui.is_small) {
-            int cfd = rt_carriers[rt_idx % rt_carriers.size()];
-            packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
-            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-            rt_idx++;
+            for (unsigned c = 0; c < small_rt_copies; ++c) {
+              int cfd = rt_carriers[(rt_idx + c) % rt_carriers.size()];
+              packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
+              ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            }
+            rt_idx += small_rt_copies;
           } else {
             std::vector<const uint8_t*> dptrs(ui.k);
             for (unsigned si = 0; si < ui.k; ++si) dptrs[si] = ui.data.data() + si * ui.block_size;
