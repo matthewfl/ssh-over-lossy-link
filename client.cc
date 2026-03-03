@@ -598,14 +598,16 @@ int run_client(const Args& args) {
     if (carriers.size() == 1 && !unacked_sends.empty()) retransmit_needed = true;
   };
   auto flush_carrier_writes = [&]() {
+    size_t carriers_before = carriers.size();
     packet_io::flush_carrier_writes(carriers, epfd, ev,
         [](int, const CarrierState& s) { return s.connecting; },
         [&](int fd, const char* reason) { do_carrier_cleanup(fd, reason); });
     for (auto it = carrier_pending_acks.begin(); it != carrier_pending_acks.end(); )
       if (carriers.count(it->first) == 0) it = carrier_pending_acks.erase(it);
       else ++it;
-    // packet_io::flush_carrier_writes may silently remove carriers on write error,
-    // bypassing remove_carrier.  Make sure retransmit is triggered in that case.
+    // Write-error removals: reset add throttle when dropping to 0 or below half target.
+    if (carriers_before > 0 && (carriers.empty() || carriers.size() <= target_carriers / 2))
+      last_add_carrier_ns = 0;
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
   };
@@ -620,9 +622,13 @@ int run_client(const Args& args) {
     do_carrier_cleanup(fd, reason);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
+    bool low_on_carriers = (carriers.size() <= 1 + target_carriers / 2);  // will be ≤ half after erase
     carriers.erase(fd);
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
+    // Mass death or drop below half: reset add throttle so floor maintenance can burst-add.
+    if (low_on_carriers)
+      last_add_carrier_ns = 0;
   };
 
   auto add_to_pending_reap = [&](int fd, const char* reason) {
@@ -1461,6 +1467,7 @@ int run_client(const Args& args) {
     // non-empty and at or below target. When above target, we don't add—we slowly
     // close from pending (in the ping-check block). When carriers.empty(), the
     // auto_adapt block is skipped, so this path is essential.
+    // On mass death (carriers.empty()), burst-add multiple to recover quickly.
     {
       const uint64_t now_f = now_ns();
       const uint64_t floor_interval = carriers.empty()
@@ -1470,9 +1477,14 @@ int run_client(const Args& args) {
       if ((carriers.size() < target_carriers || need_replacements)
           && now_f - last_add_carrier_ns >= floor_interval) {
         last_add_carrier_ns = now_f;
-        if (!args.unix_socket_connection.empty()) {
-          // Unix-socket mode: just dial a fresh connection.
-          if (carriers.size() < max_connections) {
+        // When well below target (≤ half), burst-add to recover quickly; otherwise add one at a time.
+        unsigned add_limit = (carriers.empty() || carriers.size() <= target_carriers / 2)
+          ? std::min(5u, target_carriers)
+          : 1u;
+        bool can_add = (add_limit > 1) || pending_carrier_paths.empty();
+        if (!can_add) { /* skip */ }
+        else if (!args.unix_socket_connection.empty()) {
+          for (unsigned j = 0; j < add_limit && carriers.size() < max_connections; ++j) {
             int fd = connect_unix(socket_path);
             if (dbg) fprintf(dbg, "[floor-add t=%llu carriers=%zu fd=%d errno=%d]\n",
                              (unsigned long long)(now_ns()/1000000ULL), carriers.size(), fd, fd<0?errno:0);
@@ -1485,10 +1497,10 @@ int run_client(const Args& args) {
                 close(fd);
             }
           }
-        } else if (pending_carrier_paths.empty()) {
-          // SSH mode: reuse a free index so we never permanently exhaust slots.
-          unsigned free_idx = find_free_ssh_index();
-          if (free_idx < max_connections) {
+        } else {
+          for (unsigned j = 0; j < add_limit; ++j) {
+            unsigned free_idx = find_free_ssh_index();
+            if (free_idx >= max_connections) break;
             std::string path = client_dir + "/" + std::to_string(free_idx);
             pid_t pid = fork();
             if (pid == 0) {
