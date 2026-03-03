@@ -418,6 +418,20 @@ int run_client(const Args& args) {
       next_send_id++;
   };
 
+  // Return carrier fds sorted by last_rtt_ns ascending (fastest first).
+  // Carriers with no RTT sample yet (last_rtt_ns == 0) sort last.
+  auto fastest_carriers = [&]() -> std::vector<int> {
+    std::vector<std::pair<uint64_t, int>> by_rtt;
+    by_rtt.reserve(carriers.size());
+    for (auto& [fd, cs] : carriers)
+      by_rtt.push_back({cs.last_rtt_ns == 0 ? UINT64_MAX : cs.last_rtt_ns, fd});
+    std::sort(by_rtt.begin(), by_rtt.end());
+    std::vector<int> result;
+    result.reserve(by_rtt.size());
+    for (auto& [rtt, fd] : by_rtt) result.push_back(fd);
+    return result;
+  };
+
   // Queue SET_CONFIG to one carrier (client -> server). Includes auto_adapt so server knows who manages redundancy.
   auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red, uint8_t auto_adapt_val) {
     auto it = carriers.find(fd);
@@ -705,10 +719,13 @@ int run_client(const Args& args) {
           next_carrier += num_shards;
           stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
         }
-        // Send any remainder smaller than one block as SMALL (no Reed–Solomon) with small_packet_redundancy copies.
+        // Send any remainder smaller than one block as SMALL (no Reed–Solomon).
+        // Use the fastest carriers (by RTT) so the copy most likely to arrive first
+        // does so as quickly as possible — no erasure coding fallback here.
         if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
           size_t chunk = stdin_buf.size();
-          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy));
+          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()),
+                                                           effective_small_packet_redundancy));
           {
             UnackedItem ui;
             ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
@@ -716,16 +733,14 @@ int run_client(const Args& args) {
             ui.send_ns = now_ns();
             unacked_sends[next_send_id] = std::move(ui);
           }
+          auto fast = fastest_carriers();
           for (unsigned i = 0; i < n_copies; ++i) {
-            auto it = carriers.begin();
-            std::advance(it, (next_carrier + i) % carriers.size());
-            queue_to_carrier(it->first, stdin_buf.data(), chunk, n_copies > 1);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = it->first;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+            int cfd = fast[i % fast.size()];
+            queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
+            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
           if (n_copies > 1) next_send_id++;
-          next_carrier += n_copies;
           stdin_buf.clear();
         }
         // Flush immediately so data reaches kernel (and thus server) in this
@@ -824,12 +839,19 @@ int run_client(const Args& args) {
           ui.send_ns = now_ns();
           unacked_sends[next_send_id] = std::move(ui);
         }
-        for (unsigned i = 0; i < n_copies; ++i) {
+        if (small_packet) {
+          auto fast = fastest_carriers();
+          for (unsigned i = 0; i < n_copies; ++i) {
+            int cfd = fast[i % fast.size()];
+            queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
+            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          }
+        } else {
           auto it = carriers.begin();
-          std::advance(it, (next_carrier + i) % carriers.size());
-          queue_to_carrier(it->first, stdin_buf.data(), chunk, small_packet && n_copies > 1);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = it->first;
+          std::advance(it, next_carrier % carriers.size());
+          queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
+          ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = it->first;
           epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
         }
         if (small_packet && n_copies > 1)

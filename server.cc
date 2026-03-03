@@ -191,7 +191,7 @@ int run_server(const Args& args) {
   static constexpr float kFractionSlowDecrease       = 0.002f; // <0.2% struggling → decrease
   static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 RS groups decoded
   unsigned next_carrier_for_rs = 0;
-  size_t next_carrier_for_small = 0;  // round-robin for small-packet redundancy
+
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
   auto now_ns = []() {
@@ -283,15 +283,23 @@ int run_server(const Args& args) {
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
 
-  // Send small chunk (< block_size) to runtime_small_packet_redundancy carriers only (not Reed–Solomon).
+  // Send small chunk (< block_size) to the fastest n_copies carriers (by last_rtt_ns).
+  // Preferring low-RTT carriers minimises latency: unlike RS packets there is no erasure
+  // coding fallback, so every copy counts and we want the quickest ones.
+  // Carriers with no RTT sample yet (last_rtt_ns == 0) sort last (unknown, not fast).
   auto queue_small_to_carriers = [&](const uint8_t* data, size_t len) {
     if (len == 0 || carriers.empty()) return;
     ack_send_time_ns[next_send_id] = now_ns();
-    const unsigned n_copies = std::max(1u, std::min(runtime_small_packet_redundancy, static_cast<unsigned>(carriers.size())));
-    std::vector<int> carrier_fds;
-    for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
+    const unsigned n_copies = std::max(1u, std::min(runtime_small_packet_redundancy,
+                                                     static_cast<unsigned>(carriers.size())));
+    // Sort carriers by RTT ascending; treat 0 (no sample) as slowest.
+    std::vector<std::pair<uint64_t, int>> by_rtt;
+    by_rtt.reserve(carriers.size());
+    for (auto& [fd, cs] : carriers)
+      by_rtt.push_back({cs.last_rtt_ns == 0 ? UINT64_MAX : cs.last_rtt_ns, fd});
+    std::sort(by_rtt.begin(), by_rtt.end());
     for (unsigned i = 0; i < n_copies; ++i) {
-      int fd = carrier_fds[(next_carrier_for_small + i) % carrier_fds.size()];
+      int fd = by_rtt[i].second;
       auto it = carriers.find(fd);
       if (it != carriers.end()) {
         packet_io::append_small(it->second.write_buf, next_send_id, data, len);
@@ -300,7 +308,6 @@ int run_server(const Args& args) {
         epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
       }
     }
-    next_carrier_for_small += n_copies;
     next_send_id++;
   };
 
