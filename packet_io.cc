@@ -87,7 +87,8 @@ bool process_carrier_read(
       if (s.read_buf.size() < sizeof(PacketServerMetrics)) break;
       const auto* pm = reinterpret_cast<const PacketServerMetrics*>(s.read_buf.data());
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerMetrics));
-      if (callbacks.on_server_metrics) callbacks.on_server_metrics(pm->max_rtt_ns);
+      if (callbacks.on_server_metrics)
+        callbacks.on_server_metrics(pm->max_rtt_ns, pm->avg_shard_spread_ns);
       continue;
     }
     if (h->packet_kind == PacketKind::SERVER_CONFIG) {
@@ -155,6 +156,10 @@ bool process_carrier_read(
             for (unsigned i = 0; i < k; ++i)
               reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
           }
+        }
+        if (callbacks.on_rs_decode) {
+          uint64_t spread_ns = now_ns() - rp.first_recv_ns;
+          callbacks.on_rs_decode(static_cast<unsigned>(rp.shards.size()), rp.n, spread_ns);
         }
         rs_pending.erase(id);
         while (reassembly.count(next_deliver_id)) {
@@ -251,11 +256,13 @@ void append_ready(std::vector<uint8_t>& out) {
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
 }
 
-void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns) {
+void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
+                           uint64_t avg_shard_spread_ns) {
   PacketServerMetrics pm{};
   pm.header.id = 0;
   pm.header.packet_kind = PacketKind::SERVER_METRICS;
   pm.max_rtt_ns = max_rtt_ns;
+  pm.avg_shard_spread_ns = avg_shard_spread_ns;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&pm);
   out.insert(out.end(), p, p + sizeof pm);
 }

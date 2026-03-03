@@ -61,10 +61,16 @@ struct PacketConfig {
   uint8_t auto_adapt;  // 1 = server may adapt and send SERVER_CONFIG; 0 = server only applies SET_CONFIG
 };
 
-// Server -> client: link quality observed by server (server→client path RTT) so client can adapt.
+// Server -> client: link quality observed by server so client can adapt.
+// avg_shard_spread_ns: rolling average of (time-from-first-shard-to-last-needed-shard) for
+//   RS groups received on the client→server path.  Zero means all shards arrived together
+//   (healthy); non-zero means the server had to wait for a lagging/lost shard.  Independent
+//   of the link's base RTT so the client can tell whether RS is struggling even on a
+//   high-latency link where RTTs are uniformly slow.
 struct PacketServerMetrics {
   PacketHeader header;
   uint64_t max_rtt_ns;
+  uint64_t avg_shard_spread_ns;  // avg shard spread for client→server RS groups
 };
 
 // Server -> client: server's current redundancy config (when auto_adapt; client stays in sync).

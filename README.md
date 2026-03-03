@@ -87,15 +87,19 @@ Conversely, a carrier is *reaped* in auto mode when: the carrier count is above 
 
 #### Reed-Solomon redundancy
 
-The client keeps a rolling window of the last 200 ACK RTTs. The 10th percentile is treated as the "fast path" baseline for the current link. Any RTT that is more than 2× the baseline is counted as "slow". The redundancy fraction is adjusted every ~500 ms:
+RS redundancy is adjusted every ~300 ms using a **shard-spread signal**: for each decoded RS group, the time between the *first* shard arriving and the *k*-th (last-needed) shard arriving is recorded. On a healthy link all shards arrive nearly simultaneously → spread ≈ 0. A non-zero spread means the group had to wait for a late or substitute parity shard — a direct sign that RS is under pressure.
+
+This metric is intentionally independent of the link's base RTT. A uniformly high-latency link where all shards arrive slow but *together* reads as zero spread and does not trigger a redundancy increase.
+
+The 10th percentile of recent spreads is treated as the fast-path baseline. A group is "struggling" if its spread is more than 2× the baseline (and above 1 ms absolute to avoid noise).
 
 | Condition | Action |
 |-----------|--------|
-| > 50 % slow | Increase RS redundancy by +0.5 (aggressive) |
-| > 30 % slow | Increase RS redundancy by +0.25 |
-| < 10 % slow (≥ 30 samples) | Decrease RS redundancy by −0.05 (gradual) |
+| > 5 % of groups struggling | Increase RS redundancy by +0.5 (aggressive) |
+| > 1 % struggling | Increase RS redundancy by +0.25 |
+| < 0.2 % struggling (≥ 30 samples) | Decrease RS redundancy by −0.05 (gradual) |
 
-RS redundancy is clamped to the range [0.2, 2.0]. In `--auto` mode the server manages its own redundancy and reports its chosen value back via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
+RS redundancy is clamped to [0.2, 2.0]. Both directions are monitored: the server tracks spread for the client→server path and reports a rolling average in `SERVER_METRICS` every 400 ms; the client tracks the server→client path locally. The worse of the two directions drives the redundancy adjustment. In `--auto` mode the server manages its own redundancy and reports its chosen value via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
 
 #### RTT-scaled timeouts
 

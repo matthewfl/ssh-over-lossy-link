@@ -50,8 +50,18 @@ struct ReceiveCallbacks {
   std::function<void(int fd, uint64_t acked_id)> on_ack;
   // Client -> server SET_CONFIG; server should apply config.
   std::function<void(const PacketConfig&)> on_set_config;
-  // Server -> client SERVER_METRICS; client uses for adapt (e.g. max RTT observed by server).
-  std::function<void(uint64_t max_rtt_ns)> on_server_metrics;
+  // Fired each time an RS group is fully decoded.
+  //   shards_received: how many shards arrived before decode was possible (>= k)
+  //   n:              total shards that were sent for this group
+  //   shard_spread_ns: time between the first shard arriving and the k-th (last-needed)
+  //                   shard arriving.  On a healthy link all k shards arrive nearly
+  //                   simultaneously → spread ≈ 0.  A spread > 0 means we had to wait
+  //                   for a slower/later shard, indicating a lagging or lossy carrier.
+  //                   This metric is independent of the link's base RTT.
+  std::function<void(unsigned shards_received, unsigned n, uint64_t shard_spread_ns)> on_rs_decode;
+  // Server -> client SERVER_METRICS; client uses for adapt.
+  // avg_shard_spread_ns is the server's measured shard spread for the client→server path.
+  std::function<void(uint64_t max_rtt_ns, uint64_t avg_shard_spread_ns)> on_server_metrics;
   // Server -> client SERVER_CONFIG; server's current redundancy (client uses when auto_adapt).
   std::function<void(const PacketServerConfig&)> on_server_config;
 };
@@ -80,7 +90,8 @@ void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
 void append_pong(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
 void append_ready(std::vector<uint8_t>& out);
-void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns);
+void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
+                           uint64_t avg_shard_spread_ns);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).

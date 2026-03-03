@@ -185,12 +185,11 @@ int run_server(const Args& args) {
   uint64_t last_adapt_ns = 0;
   const uint64_t adapt_interval_ns = 300 * 1000000ULL;
 
-  // Fraction-slow thresholds: what fraction of recent RTT samples are significantly
-  // above the minimum (fast-path floor) before we increase/decrease redundancy.
-  static constexpr float kFractionSlowIncreaseFast   = 0.05f;  // >5% slow → big increase
-  static constexpr float kFractionSlowIncreaseMedium = 0.01f;  // >1% slow → medium increase
-  static constexpr float kFractionSlowDecrease       = 0.002f; // <0.2% slow → decrease
-  static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 samples
+  // Shard-spread thresholds: what fraction of RS groups are "struggling" (spread > 2× floor).
+  static constexpr float kFractionSlowIncreaseFast   = 0.05f;  // >5% struggling → big increase
+  static constexpr float kFractionSlowIncreaseMedium = 0.01f;  // >1% struggling → medium increase
+  static constexpr float kFractionSlowDecrease       = 0.002f; // <0.2% struggling → decrease
+  static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 RS groups decoded
   unsigned next_carrier_for_rs = 0;
   size_t next_carrier_for_small = 0;  // round-robin for small-packet redundancy
 
@@ -203,6 +202,13 @@ int run_server(const Args& args) {
   const size_t max_server_recent_rtt = 50;
   const uint64_t metrics_interval_ns = 400 * 1000000ULL;  // 400ms
   uint64_t last_metrics_ns = 0;
+  // Rolling shard spread samples for the client→server direction.
+  // Each decoded RS group contributes one sample: time from first shard arriving to the
+  // k-th (last-needed) shard arriving.  On a healthy link this is near zero; it rises
+  // when a carrier is slow/lossy and we must wait for a parity shard.  Independent of
+  // the link's base RTT, so it doesn't fire just because the link is high-latency.
+  std::deque<uint64_t> c2s_shard_spread_ns;
+  static constexpr size_t kMaxSpreadSamples = 100;
 
   // Unacked retransmit buffer: holds original bytes for each outstanding send_id
   // so we can re-encode and resend on a new carrier when all existing ones die.
@@ -317,7 +323,13 @@ int run_server(const Args& args) {
   auto queue_server_metrics_to_carrier = [&](int fd, uint64_t max_rtt_ns) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
-    packet_io::append_server_metrics(it->second.write_buf, max_rtt_ns);
+    uint64_t avg_spread = 0;
+    if (!c2s_shard_spread_ns.empty()) {
+      uint64_t sum = 0;
+      for (uint64_t s : c2s_shard_spread_ns) sum += s;
+      avg_spread = sum / c2s_shard_spread_ns.size();
+    }
+    packet_io::append_server_metrics(it->second.write_buf, max_rtt_ns, avg_spread);
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -384,6 +396,11 @@ int run_server(const Args& args) {
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     }
+  };
+  recv_cb.on_rs_decode = [&](unsigned /*shards_received*/, unsigned /*n*/, uint64_t spread_ns) {
+    c2s_shard_spread_ns.push_back(spread_ns);
+    while (c2s_shard_spread_ns.size() > kMaxSpreadSamples)
+      c2s_shard_spread_ns.pop_front();
   };
   recv_cb.on_ping = [&](int fd, uint64_t id) { send_pong(fd, id); };  // client may still send PING for health
   recv_cb.on_ack = [&](int /*fd*/, uint64_t acked_id) {
@@ -735,33 +752,38 @@ int run_server(const Args& args) {
 
     // When auto_adapt, server manages its own redundancy and informs the client.
     if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns
-        && server_recent_rtt_ns.size() >= kMinSamplesForAdapt) {
+        && c2s_shard_spread_ns.size() >= kMinSamplesForAdapt) {
       last_adapt_ns = now_ns_val;
-      // Compute min-gap metric: what fraction of recent RTTs are significantly above
-      // the fast-path floor?  The 10th-percentile acts as a robust "minimum achievable
-      // RTT" estimate (insensitive to a few extreme outliers skewing the sample).
-      std::vector<uint64_t> sorted_rtt(server_recent_rtt_ns.begin(), server_recent_rtt_ns.end());
-      std::sort(sorted_rtt.begin(), sorted_rtt.end());
-      size_t p10_idx = std::max(size_t{0}, sorted_rtt.size() / 10);
-      uint64_t min_rtt = sorted_rtt[p10_idx];
-      // Only adapt when min_rtt is in a plausible range (1ms..30s).
-      if (min_rtt > 1000000ULL && min_rtt < 30000000000ULL) {
-        uint64_t slow_thr = min_rtt * 2;  // packets taking >2× the fast floor are "slow"
-        size_t n_slow = 0;
-        for (uint64_t r : server_recent_rtt_ns) if (r > slow_thr) n_slow++;
-        float fraction_slow = static_cast<float>(n_slow) / static_cast<float>(server_recent_rtt_ns.size());
 
-        if (fraction_slow > kFractionSlowIncreaseFast) {
-          runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.5f);
-          runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 3u);
-        } else if (fraction_slow > kFractionSlowIncreaseMedium) {
-          runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.25f);
-          runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 1u);
-        } else if (fraction_slow < kFractionSlowDecrease && sorted_rtt.size() >= 30) {
-          runtime_rs_redundancy = std::max(0.2f, runtime_rs_redundancy - 0.05f);
-          runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
-        }
+      // Shard-spread signal: time between the first and k-th (last-needed) shard for each
+      // RS group decoded in the client→server direction.  On a healthy link all shards
+      // arrive nearly simultaneously → spread ≈ 0.  A persistently non-zero spread means
+      // the group had to wait for a late or substitute parity shard — a direct sign that
+      // RS is under pressure, independent of the link's base RTT.
+      std::vector<uint64_t> sorted_spread(c2s_shard_spread_ns.begin(), c2s_shard_spread_ns.end());
+      std::sort(sorted_spread.begin(), sorted_spread.end());
+      size_t p10_idx = std::max(size_t{0}, sorted_spread.size() / 10);
+      uint64_t spread_floor = sorted_spread[p10_idx];  // fast-path baseline
+      // "Struggling" = spread more than 2× the fast-path floor AND above 1 ms absolute
+      // (avoids hair-trigger on links with near-zero jitter where 2× ≈ 0).
+      uint64_t spread_thr = std::max(spread_floor * 2, static_cast<uint64_t>(1000000ULL));
+      size_t n_struggling = 0;
+      for (uint64_t s : c2s_shard_spread_ns) if (s > spread_thr) n_struggling++;
+      float fraction_struggling = static_cast<float>(n_struggling)
+                                  / static_cast<float>(c2s_shard_spread_ns.size());
+
+      if (fraction_struggling > kFractionSlowIncreaseFast) {
+        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.5f);
+        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 3u);
+      } else if (fraction_struggling > kFractionSlowIncreaseMedium) {
+        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.25f);
+        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 1u);
+      } else if (fraction_struggling < kFractionSlowDecrease
+                 && sorted_spread.size() >= 30) {
+        runtime_rs_redundancy = std::max(0.2f, runtime_rs_redundancy - 0.05f);
+        runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
       }
+
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
         last_sent_small_packet_redundancy = runtime_small_packet_redundancy;
