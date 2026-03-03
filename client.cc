@@ -1031,10 +1031,10 @@ int run_client(const Args& args) {
         //      and restoring effective throughput.  Opening more carriers is the natural
         //      complement to raising parity: parity tolerates loss on existing carriers,
         //      more carriers grows k so more data goes through per RS group.
-        //      Threshold > 0.4 means more than ~29% of our bandwidth is parity overhead,
-        //      i.e. the link is genuinely lossy enough to warrant a new carrier.
+        //      In auto_adapt the baseline is 0.6; use > 0.65 so we only trigger when
+        //      we've actually increased redundancy due to detected loss (not on a clean link).
         bool redundancy_pressure = args.config.auto_adapt
-                                   && (effective_rs_redundancy > 0.4f)
+                                   && (effective_rs_redundancy > 0.65f)
                                    && within_carrier_cap;
         bool need_more = (total_write > backpressure_write_threshold)
                          || (rtt_outlier && within_carrier_cap)

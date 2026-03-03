@@ -81,7 +81,7 @@ In auto mode, extra connections (up to `floor × 3`) are opened when any of the 
 |---------|---------|
 | **Write backlog** | Total queued outgoing bytes across all carriers exceeds 150 × packet_size — the existing carriers can't keep up. |
 | **RTT outlier** | A carrier's measured ACK round-trip time is both above 1 s and more than 5× the median peer RTT — that carrier is stalled while others are fine. |
-| **Redundancy pressure** | RS redundancy has been raised above 0.4 due to packet loss. Because each RS group uses exactly `n_carriers` shards (one per carrier), every new carrier directly increases `k` (the data shards per group) and restores effective throughput. Raising parity and adding carriers are complementary responses to the same problem. |
+| **Redundancy pressure** | RS redundancy has been raised above 0.65 (above the auto-adapt baseline of 0.6) due to packet loss. Because each RS group uses exactly `n_carriers` shards (one per carrier), every new carrier directly increases `k` (the data shards per group) and restores effective throughput. Raising parity and adding carriers are complementary responses to the same problem. |
 
 Conversely, a carrier is *reaped* in auto mode when: the carrier count is above the floor, the carrier's RTT is above 3 s, and it is more than 3× the median peer RTT. The reap check runs every 2 s.
 
