@@ -1197,34 +1197,37 @@ int run_client(const Args& args) {
       //   1. RTT outlier: last_rtt_ns > 5× median AND > 3×RTT (stalled on client→server path).
       //   2. Silence: no shard received from server in N×RTT while other carriers are active
       //      (stalled on server→client path).
-      // Skip reaping during initial handshake: when we have unacked data and few RTT
-      // samples, we shouldn't kill carriers.
-      // Skip RTT outlier reap when idle: with no data in flight, a slower carrier still
-      // works (PING/PONG keeps it alive). Reaping and replacing causes churn for no benefit.
+      // Skip reaping during initial handshake: when we have unacked data and few RTT samples.
+      // Skip RTT outlier reap when idle: a slower carrier still works (PING/PONG keeps it alive).
+      //
+      // Never reap if it would bring us to the floor: require carriers.size() > min_carriers_floor + 1.
+      // Add logic above starts a replacement when we have an outlier; we only reap once that
+      // replacement has connected (carriers grew). This avoids briefly dropping below min.
       const bool early_handshake = (unacked_sends.size() > 0 && rtt_samples.size() < 10);
       const bool idle = unacked_sends.empty();
+      const bool can_reap_without_dropping_below_min = (carriers.size() > min_carriers_floor + 1u);
       if (!early_handshake && carriers.size() > min_carriers_floor && now - last_reap_ns >= reap_check_interval_ns) {
         last_reap_ns = now;
 
         // RTT-based reap: find worst carrier and reap if it's a clear outlier.
         // When idle, skip—no benefit to replacing a marginally slower carrier.
-        if (!idle && rtt_samples.size() >= 2) {
+        // Only reap when we have a replacement (carriers > min+1); add logic started one above.
+        if (!idle && can_reap_without_dropping_below_min && rtt_samples.size() >= 2) {
           std::vector<uint64_t> sorted = rtt_samples;
           std::sort(sorted.begin(), sorted.end());
           uint64_t median_rtt = sorted[sorted.size() / 2];
-          // Find carrier with worst RTT.
           int worst_fd = -1;
           uint64_t worst_rtt = 0;
           for (auto& [fd, st] : carriers)
             if (st.last_rtt_ns > worst_rtt) { worst_rtt = st.last_rtt_ns; worst_fd = fd; }
-          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_rtt_ns &&
-              carriers.size() > min_carriers_floor) {
+          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_rtt_ns) {
             remove_carrier(worst_fd);
           }
         }
 
-        // Silence-based reap: carrier hasn't received in N×RTT while others have. Scales with link.
-        if (carriers.size() > min_carriers_floor) {
+        // Silence-based reap: carrier hasn't received in N×RTT while others have.
+        // Only reap when we have headroom so a replacement can be added first if needed.
+        if (can_reap_without_dropping_below_min) {
           uint64_t latest_recv = 0;
           for (auto& [fd, st] : carriers)
             if (st.last_recv_ns > latest_recv) latest_recv = st.last_recv_ns;
@@ -1235,7 +1238,7 @@ int run_client(const Args& args) {
               if (st.last_recv_ns > 0 && st.last_recv_ns + silence_reap_ns < now)
                 to_reap.push_back(fd);
             for (int fd : to_reap) {
-              if (carriers.size() <= min_carriers_floor) break;
+              if (carriers.size() <= min_carriers_floor + 1u) break;  // stop before we'd hit floor
               remove_carrier(fd);
             }
           }
