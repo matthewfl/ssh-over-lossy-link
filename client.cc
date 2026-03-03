@@ -511,6 +511,14 @@ int run_client(const Args& args) {
     effective_small_packet_redundancy = (psc.small_packet_redundancy != 0) ? psc.small_packet_redundancy : 2u;
     backpressure_write_threshold = 150 * effective_max_packet;
   };
+  recv_cb.on_ping = [&](int fd, uint64_t id) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    packet_io::append_pong(it->second.write_buf, id);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+  };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it_p = carrier_pending_acks.find(fd);
     if (it_p == carrier_pending_acks.end()) return;
@@ -689,6 +697,23 @@ int run_client(const Args& args) {
           // Cap n to n_carriers so every shard goes on a different carrier.
           unsigned n = std::min(k + m, n_carriers);
           m = n - k;
+          if (m == 0) {
+            // Single carrier: can't do RS (need m>=1). Send block as SMALL.
+            size_t chunk = block_size;
+            UnackedItem ui;
+            ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
+            ui.is_small = true;
+            ui.send_ns = now_ns();
+            unacked_sends[next_send_id] = std::move(ui);
+            auto it = carriers.begin();
+            queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = it->first;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+            next_send_id++;
+            stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
+            continue;
+          }
           std::vector<const uint8_t*> data_ptrs(k);
           for (unsigned i = 0; i < k; ++i)
             data_ptrs[i] = stdin_buf.data() + i * block_size;
@@ -790,14 +815,18 @@ int run_client(const Args& args) {
                   for (unsigned si = 0; si < ui.k; ++si)
                     dptrs[si] = ui.data.data() + si * ui.block_size;
                   unsigned m = ui.n - ui.k;
-                  std::vector<std::vector<uint8_t>> par(m, std::vector<uint8_t>(ui.block_size));
-                  std::vector<uint8_t*> pptrs(m);
-                  for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
-                  reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
+                  std::vector<std::vector<uint8_t>> par;
+                  std::vector<uint8_t*> pptrs;
+                  if (m > 0) {
+                    par.resize(m, std::vector<uint8_t>(ui.block_size));
+                    pptrs.resize(m);
+                    for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
+                    reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
+                  }
                   for (unsigned si = 0; si < ui.n; ++si) {
                     const uint8_t* shard = (si < ui.k)
                         ? (ui.data.data() + si * ui.block_size)
-                        : par[si - ui.k].data();
+                        : par[si - ui.k].data();  // m>0 ensures par has parity when si>=k
                     packet_io::append_rs_shard(it->second.write_buf, uid,
                                                ui.n, ui.k, ui.block_size, si, shard);
                   }
@@ -983,6 +1012,67 @@ int run_client(const Args& args) {
       }
     }
 
+    // Ping + dead-carrier detection. Run BEFORE reap so we send PING first and give PONG
+    // time to arrive before considering silence-based reap.
+    {
+      const uint64_t now_p = now_ns();
+      if (now_p - last_ping_check_ns >= 1000000000ULL) {
+        last_ping_check_ns = now_p;
+
+        // Reap any SSH processes that have exited after receiving SIGTERM.
+        if (!pids_to_reap.empty()) {
+          pids_to_reap.erase(
+              std::remove_if(pids_to_reap.begin(), pids_to_reap.end(),
+                  [](pid_t p) { return waitpid(p, nullptr, WNOHANG) != 0; }),
+              pids_to_reap.end());
+        }
+        if (args.unix_socket_connection.empty()) {
+          std::vector<unsigned> dead_slots;
+          for (auto& [idx, pid] : ssh_idx_to_pid) {
+            bool active = false;
+            for (auto& [fd, fi] : fd_to_ssh_index) if (fi == idx) { active = true; break; }
+            if (active) continue;
+            if (waitpid(pid, nullptr, WNOHANG) != 0)
+              dead_slots.push_back(idx);
+          }
+          for (unsigned idx : dead_slots) {
+            ssh_idx_to_pid.erase(idx);
+            unlink((client_dir + "/" + std::to_string(idx)).c_str());
+          }
+        }
+        uint64_t ping_idle_ns  = scaled_ns(2,  5000000000ULL, 30000000000ULL);
+        uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);
+        uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);
+        std::vector<int> to_kill;
+        for (auto& [cfd, cs] : carriers) {
+          if (cs.connecting) continue;
+          if (now_p - cs.connect_ns < grace_ns) continue;
+          uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
+          if (now_p - last_activity > dead_idle_ns) {
+            to_kill.push_back(cfd);
+            continue;
+          }
+          if (cs.write_buf.empty()
+              && now_p - cs.last_send_ns > ping_idle_ns
+              && now_p - cs.last_recv_ns  > ping_idle_ns) {
+            packet_io::append_ping(cs.write_buf, next_send_id);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          }
+        }
+        for (int cfd : to_kill)
+          remove_carrier(cfd);
+
+        for (auto& [cfd, cs] : carriers)
+          if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
+
+        uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);
+        if (now_p - last_global_recv_ns > global_idle_ns)
+          running = false;
+      }
+    }
+
     if (args.config.auto_adapt && !carriers.empty()) {
       const uint64_t now = now_ns();
 
@@ -1122,7 +1212,7 @@ int run_client(const Args& args) {
           uint64_t latest_recv = 0;
           for (auto& [fd, st] : carriers)
             if (st.last_recv_ns > latest_recv) latest_recv = st.last_recv_ns;
-          uint64_t silence_reap_ns = scaled_ns(4, 15000000000ULL, 60000000000ULL);
+          uint64_t silence_reap_ns = scaled_ns(4, 20000000000ULL, 60000000000ULL);
           if (latest_recv + 5000000000ULL > now) {  // active server→client traffic in last 5s
             std::vector<int> to_reap;
             for (auto& [fd, st] : carriers)
@@ -1137,75 +1227,9 @@ int run_client(const Args& args) {
       }
     }
 
-    // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
+    // ── Timeout-based retransmit / RS stale-drain ────────────────────────────
     {
       const uint64_t now_p = now_ns();
-
-      // Ping + dead-carrier detection.  Run at most once per second to avoid overhead.
-      if (now_p - last_ping_check_ns >= 1000000000ULL) {
-        last_ping_check_ns = now_p;
-
-        // Reap any SSH processes that have exited after receiving SIGTERM.
-        if (!pids_to_reap.empty()) {
-          pids_to_reap.erase(
-              std::remove_if(pids_to_reap.begin(), pids_to_reap.end(),
-                  [](pid_t p) { return waitpid(p, nullptr, WNOHANG) != 0; }),
-              pids_to_reap.end());
-        }
-        // Also reap SSH processes that died on their own (e.g. remote refused the
-        // tunnel).  These are ssh_idx_to_pid entries not yet touched by remove_carrier.
-        // Pending-path cleanup is handled in the pending loop; here we handle the case
-        // where the fd was already connected and the SSH died without an epoll event.
-        if (!args.unix_socket_connection.empty()) {
-          // Unix-socket mode: no SSH processes to reap.
-        } else {
-          std::vector<unsigned> dead_slots;
-          for (auto& [idx, pid] : ssh_idx_to_pid) {
-            // Skip slots that have an active carrier (remove_carrier will handle those).
-            bool active = false;
-            for (auto& [fd, fi] : fd_to_ssh_index) if (fi == idx) { active = true; break; }
-            if (active) continue;
-            if (waitpid(pid, nullptr, WNOHANG) != 0)
-              dead_slots.push_back(idx);
-          }
-          for (unsigned idx : dead_slots) {
-            ssh_idx_to_pid.erase(idx);
-            unlink((client_dir + "/" + std::to_string(idx)).c_str());
-          }
-        }
-        uint64_t ping_idle_ns  = scaled_ns(3, 10000000000ULL, 60000000000ULL);   // keepalive when idle
-        uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);   // inactivity timeout
-        uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);   // post-connect grace
-        std::vector<int> to_kill;
-        for (auto& [cfd, cs] : carriers) {
-          if (cs.connecting) continue;
-          if (now_p - cs.connect_ns < grace_ns) continue;
-          // Use the later of connect_ns and last_recv_ns as "last activity".
-          uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
-          if (now_p - last_activity > dead_idle_ns) {
-            to_kill.push_back(cfd);
-          } else if (cs.write_buf.empty()
-                     && now_p - cs.last_send_ns > ping_idle_ns
-                     && now_p - cs.last_recv_ns  > ping_idle_ns) {
-            // Truly idle: send a keepalive ping.
-            packet_io::append_ping(cs.write_buf, next_send_id);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-          }
-        }
-        for (int cfd : to_kill)
-          remove_carrier(cfd);
-
-        // Update global receive timestamp from all live carriers.
-        for (auto& [cfd, cs] : carriers)
-          if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
-
-        // Global idle timeout: if nothing from server for 12×RTT the connection is dead.
-        uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);  // min 60s, max 5min
-        if (now_p - last_global_recv_ns > global_idle_ns)
-          running = false;
-      }
 
       // Timeout-based retransmit: if a send has been unACK'd AND we have alive carriers, resend.
       // When we have no RTT samples (cold start), use 2.5 s so we retransmit aggressively.
@@ -1240,16 +1264,20 @@ int run_client(const Args& args) {
               for (unsigned si = 0; si < ui.k; ++si)
                 dptrs[si] = ui.data.data() + si * ui.block_size;
               unsigned m2 = ui.n - ui.k;
-              std::vector<std::vector<uint8_t>> par2(m2, std::vector<uint8_t>(ui.block_size));
-              std::vector<uint8_t*> pptrs2(m2);
-              for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
-              reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
+              std::vector<std::vector<uint8_t>> par2;
+              std::vector<uint8_t*> pptrs2;
+              if (m2 > 0) {
+                par2.resize(m2, std::vector<uint8_t>(ui.block_size));
+                pptrs2.resize(m2);
+                for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
+                reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
+              }
               std::set<int> touched;
               for (unsigned si = 0; si < ui.n; ++si) {
                 int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
                 const uint8_t* shard = (si < ui.k)
                     ? (ui.data.data() + si * ui.block_size)
-                    : par2[si - ui.k].data();
+                    : par2[si - ui.k].data();  // m2>0 when si>=k
                 packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
                                            ui.n, ui.k, ui.block_size, si, shard);
                 touched.insert(cfd);

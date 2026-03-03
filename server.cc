@@ -518,10 +518,14 @@ int run_server(const Args& args) {
                   for (unsigned si = 0; si < ui.k; ++si)
                     dptrs[si] = ui.data.data() + si * ui.block_size;
                   unsigned m = ui.n - ui.k;
-                  std::vector<std::vector<uint8_t>> par(m, std::vector<uint8_t>(ui.block_size));
-                  std::vector<uint8_t*> pptrs(m);
-                  for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
-                  reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
+                  std::vector<std::vector<uint8_t>> par;
+                  std::vector<uint8_t*> pptrs;
+                  if (m > 0) {
+                    par.resize(m, std::vector<uint8_t>(ui.block_size));
+                    pptrs.resize(m);
+                    for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
+                    reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
+                  }
                   for (unsigned si = 0; si < ui.n; ++si) {
                     const uint8_t* shard = (si < ui.k)
                         ? (ui.data.data() + si * ui.block_size)
@@ -626,7 +630,7 @@ int run_server(const Args& args) {
     // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
     if (now_ns_val - last_ping_check_ns >= 1000000000ULL) {
       last_ping_check_ns = now_ns_val;
-      uint64_t ping_idle_ns  = scaled_ns(3, 10000000000ULL, 60000000000ULL);
+      uint64_t ping_idle_ns  = scaled_ns(2,  5000000000ULL, 30000000000ULL);  // send PING before dead_idle
       uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);
       uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);
       std::vector<int> to_kill;
@@ -635,9 +639,11 @@ int run_server(const Args& args) {
         uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
         if (now_ns_val - last_activity > dead_idle_ns) {
           to_kill.push_back(cfd);
-        } else if (cs.write_buf.empty()
-                   && now_ns_val - cs.last_send_ns > ping_idle_ns
-                   && now_ns_val - cs.last_recv_ns  > ping_idle_ns) {
+          continue;  // Carrier dead (no data, no PONG); skip PING
+        }
+        if (cs.write_buf.empty()
+            && now_ns_val - cs.last_send_ns > ping_idle_ns
+            && now_ns_val - cs.last_recv_ns  > ping_idle_ns) {
           packet_io::append_ping(cs.write_buf, 0);
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
@@ -691,10 +697,14 @@ int run_server(const Args& args) {
             std::vector<const uint8_t*> dptrs(ui.k);
             for (unsigned si = 0; si < ui.k; ++si) dptrs[si] = ui.data.data() + si * ui.block_size;
             unsigned rm = ui.n - ui.k;
-            std::vector<std::vector<uint8_t>> rpar(rm, std::vector<uint8_t>(ui.block_size));
-            std::vector<uint8_t*> rpptrs(rm);
-            for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
-            reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
+            std::vector<std::vector<uint8_t>> rpar;
+            std::vector<uint8_t*> rpptrs;
+            if (rm > 0) {
+              rpar.resize(rm, std::vector<uint8_t>(ui.block_size));
+              rpptrs.resize(rm);
+              for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
+              reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
+            }
             std::set<int> touched;
             for (unsigned si = 0; si < ui.n; ++si) {
               int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
@@ -862,6 +872,7 @@ int run_server(const Args& args) {
         // n must not exceed n_carriers so every shard lands on a different carrier.
         unsigned n = std::min(k + m, n_carriers);
         m = n - k;
+        if (m == 0) break;  // Single carrier: can't do RS (need m>=1). Wait for more carriers.
         std::vector<const uint8_t*> data_ptrs(k);
         for (unsigned i = 0; i < k; ++i)
           data_ptrs[i] = backend_read_buf.data() + i * block_size;
