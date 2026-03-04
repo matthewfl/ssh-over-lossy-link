@@ -1232,6 +1232,29 @@ int run_client(const Args& args) {
             last_redundancy_pressure_add_ns = now;
           if (any_rs_pending_pressure)
             last_rs_pending_pressure_add_ns = now;
+          // New carrier from redundancy pressure = more diversity; nudge RS/small down.
+          // Client sets config via SET_CONFIG; server applies and echoes SERVER_CONFIG.
+          if (redundancy_pressure && !carriers.empty()) {
+            if (effective_rs_redundancy > 0.3f) {
+              effective_rs_redundancy = std::max(0.1f, effective_rs_redundancy - 0.02f);
+              last_sent_rs_redundancy = effective_rs_redundancy;
+            }
+            if (effective_small_packet_redundancy > 4u) {
+              effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
+              last_sent_small_packet_redundancy = effective_small_packet_redundancy;
+            }
+            effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
+            int fd = carriers.begin()->first;
+            queue_config_to_carrier(fd,
+                                   static_cast<uint16_t>(effective_max_packet),
+                                   static_cast<uint16_t>(effective_small_packet_redundancy),
+                                   args.config.max_delay_ms,
+                                   effective_rs_redundancy,
+                                   1u);  // keep auto_adapt
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+          }
           if (!args.unix_socket_connection.empty()) {
             int fd = connect_unix(socket_path);
             if (fd >= 0) {
