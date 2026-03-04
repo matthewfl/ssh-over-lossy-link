@@ -860,16 +860,16 @@ int run_server(const Args& args) {
         can_decrease_rs = (p90 < kExtraGapDecreaseThresholdNs);
       }
 
-      // --- Decrease signal (small packets): copy 2 arrives within 0.5ms of copy 1 ---
-      // For small packets with N copies, the 2nd copy is the relevant one; if it arrives
-      // within 0.5ms, going N->N-1 wouldn't add >0.5ms latency.
+      // --- Decrease signal (small packets): first→median gap. Use 1.5ms threshold (looser than RS
+      // 0.5ms) so we aggressively come back down from high values when the link improves.
+      static constexpr uint64_t kSmallPacketGapDecreaseThresholdNs = 1500000ULL;  // 1.5 ms
       bool can_decrease_small = false;
-      if (c2s_small_extra_copy_gap_ns.size() >= 10) {
+      if (c2s_small_extra_copy_gap_ns.size() >= 5) {
         std::vector<uint64_t> sorted_sg(c2s_small_extra_copy_gap_ns.begin(),
                                         c2s_small_extra_copy_gap_ns.end());
         std::sort(sorted_sg.begin(), sorted_sg.end());
         uint64_t p90 = sorted_sg[(sorted_sg.size() * 9) / 10];
-        can_decrease_small = (p90 < kExtraGapDecreaseThresholdNs);
+        can_decrease_small = (p90 < kSmallPacketGapDecreaseThresholdNs);
       }
 
       if (fraction_struggling > kFractionSlowIncreaseFast) {
@@ -880,8 +880,12 @@ int run_server(const Args& args) {
       } else {
         if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
           runtime_rs_redundancy = std::max(0.1f, runtime_rs_redundancy - 0.02f);
-        if (can_decrease_small)
-          runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - 1u);
+      }
+      // Small packet decrease: always allow when copies arrive fast, independent of RS spread.
+      // Aggressive ramp-down when oversubscribed: -2 per cycle when >10 copies.
+      if (can_decrease_small) {
+        unsigned decr = (runtime_small_packet_redundancy > 10u) ? 2u : 1u;
+        runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - decr);
       }
       runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
 

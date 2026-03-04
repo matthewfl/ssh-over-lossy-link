@@ -1033,12 +1033,14 @@ int run_client(const Args& args) {
                                   && c2s_avg_extra_shard_gap_ns < kExtraGapDecreaseThresholdNs);
         bool can_decrease_rs = can_decrease_s2c || can_decrease_c2s;
 
-        // --- Decrease signal (small packets): copy 2 arrives within 0.5ms of copy 1 ---
+        // --- Decrease signal (small packets): first→median gap. Use 1.5ms threshold (looser than RS
+        // 0.5ms) so we aggressively come back down from high values when the link improves.
+        static constexpr uint64_t kSmallPacketGapDecreaseThresholdNs = 1500000ULL;  // 1.5 ms
         bool can_decrease_small = false;
-        if (s2c_small_extra_copy_gap_ns.size() >= 10) {
+        if (s2c_small_extra_copy_gap_ns.size() >= 5) {
           std::vector<uint64_t> sg(s2c_small_extra_copy_gap_ns.begin(), s2c_small_extra_copy_gap_ns.end());
           std::sort(sg.begin(), sg.end());
-          can_decrease_small = sg[(sg.size() * 9) / 10] < kExtraGapDecreaseThresholdNs;
+          can_decrease_small = sg[(sg.size() * 9) / 10] < kSmallPacketGapDecreaseThresholdNs;
         }
 
         if (fraction_struggling > kFractionSlowIncreaseFast) {
@@ -1049,8 +1051,11 @@ int run_client(const Args& args) {
         } else {
           if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
             effective_rs_redundancy = std::max(0.1f, effective_rs_redundancy - 0.02f);
-          if (can_decrease_small)
-            effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
+        }
+        // Small packet decrease: always allow when copies arrive fast, independent of RS spread.
+        if (can_decrease_small) {
+          unsigned decr = (effective_small_packet_redundancy > 10u) ? 2u : 1u;
+          effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - decr);
         }
         effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
       }
@@ -1479,9 +1484,11 @@ int run_client(const Args& args) {
           && now_f - last_add_carrier_ns >= floor_interval) {
         last_add_carrier_ns = now_f;
         // When below floor: burst to reach target quickly (e.g. 5→10). Cap at target so we don't overshoot.
-        // When at/above floor: add one at a time for replacements only.
-        unsigned to_floor = (carriers.size() < target_carriers)
-            ? static_cast<unsigned>(target_carriers - carriers.size()) : 0u;
+        // Count pending SSH connects—they take seconds to establish; without this we'd burst every 100ms
+        // and overshoot to 100+ when links are slow.
+        size_t in_flight = carriers.size() + pending_carrier_paths.size();
+        unsigned to_floor = (in_flight < target_carriers)
+            ? static_cast<unsigned>(target_carriers - in_flight) : 0u;
         unsigned add_limit = (to_floor > 0) ? std::min(5u, to_floor) : 1u;
         bool can_add = (add_limit > 1) || pending_carrier_paths.empty();
         if (!can_add) { /* skip */ }
