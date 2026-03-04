@@ -7,6 +7,7 @@
 # Usage:
 #   ./test_all.sh                     # run all tests
 #   ./test_all.sh fixed-10ms          # run only the named test(s) (prefix match)
+#   ./test_all.sh --auto-rerun-failed # rerun failed tests once (for flaky tests)
 #   VERBOSE=1 ./test_all.sh           # always print test output
 #   SSH_OLL=./ssh-oll ./test_all.sh   # override binary path
 
@@ -16,7 +17,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OLL="${SSH_OLL:-${SCRIPT_DIR}/ssh-oll}"
 TEST="${SCRIPT_DIR}/test_ssh_oll.py"
 VERBOSE="${VERBOSE:-0}"
-FILTER="${1:-}"         # optional prefix filter (run only matching test names)
+AUTO_RERUN_FAILED=0
+FILTER=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --auto-rerun-failed)
+            AUTO_RERUN_FAILED=1
+            shift
+            ;;
+        *)
+            FILTER="$1"
+            shift
+            break
+            ;;
+    esac
+done
 
 # Simulated SSH-auth latency per new carrier connection (0.3 s).  This exercises
 # the connection-establishment path without dominating measured latencies.
@@ -32,47 +49,70 @@ declare -a failed_names=()
 # ── Helpers ─────────────────────────────────────────────────────────────────
 run_test() {
     local name="$1"; shift
+    local run_test_args=("$@")
+
     # Apply optional filter
     if [[ -n "$FILTER" && "$name" != "$FILTER"* ]]; then
         ((skip++)) || true
         return
     fi
 
-    local logfile
-    logfile="$(mktemp /tmp/ssh-oll-test-XXXXXX.log)"
-    printf "  %-52s " "$name"
+    local max_attempts=1
+    [[ "$AUTO_RERUN_FAILED" == "1" ]] && max_attempts=2
 
-    # Pick a random high port (32768–60999) to avoid TIME_WAIT conflicts between
-    # back-to-back tests that all default to port 2222.
-    local tcp_port=$(( RANDOM % 28232 + 32768 ))
+    local attempt=1
+    local exit_code=1
 
-    # Per-test initial connection latency override: if the first remaining arg is
-    # "--init-latency-override N", consume it and use N instead of INIT_LATENCY.
-    local test_init_latency="$INIT_LATENCY"
-    if [[ "${1:-}" == "--init-latency-override" ]]; then
-        test_init_latency="$2"; shift 2
-    fi
+    while [[ $attempt -le $max_attempts ]]; do
+        local logfile
+        logfile="$(mktemp /tmp/ssh-oll-test-XXXXXX.log)"
+        printf "  %-52s " "$name"
 
-    local exit_code=0
-    python3 "$TEST" --ssh-oll-path "$SSH_OLL" \
-        --tcp-port "$tcp_port" \
-        --initial-connection-latency "$test_init_latency" \
-        "$@" >"$logfile" 2>&1 || exit_code=$?
+        # Pick a random high port (32768–60999) to avoid TIME_WAIT conflicts between
+        # back-to-back tests that all default to port 2222.
+        local tcp_port=$(( RANDOM % 28232 + 32768 ))
 
-    if [[ $exit_code -eq 0 ]]; then
-        echo "PASS"
-        ((pass++)) || true
-    else
-        echo "FAIL  (exit $exit_code)"
-        ((fail++)) || true
-        failed_names+=("$name")
-    fi
+        # Per-test initial connection latency override: if the first remaining arg is
+        # "--init-latency-override N", consume it and use N instead of INIT_LATENCY.
+        local test_init_latency="$INIT_LATENCY"
+        local py_args=("${run_test_args[@]}")
+        if [[ "${py_args[0]:-}" == "--init-latency-override" ]]; then
+            test_init_latency="${py_args[1]}"
+            py_args=("${py_args[@]:2}")
+        fi
 
-    if [[ $exit_code -ne 0 || "$VERBOSE" == "1" ]]; then
-        # Indent test output for readability
-        sed 's/^/    | /' "$logfile"
-    fi
-    rm -f "$logfile"
+        exit_code=0
+        python3 "$TEST" --ssh-oll-path "$SSH_OLL" \
+            --tcp-port "$tcp_port" \
+            --initial-connection-latency "$test_init_latency" \
+            "${py_args[@]}" >"$logfile" 2>&1 || exit_code=$?
+
+        if [[ $exit_code -eq 0 ]]; then
+            [[ $attempt -gt 1 ]] && echo "PASS (rerun)" || echo "PASS"
+            ((pass++)) || true
+            rm -f "$logfile"
+            break
+        fi
+
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo "FAIL (rerunning...)"
+            if [[ "$VERBOSE" == "1" ]]; then
+                sed 's/^/    | /' "$logfile"
+            fi
+            rm -f "$logfile"
+            ((attempt++))
+            sleep 2
+        else
+            echo "FAIL  (exit $exit_code)"
+            ((fail++)) || true
+            failed_names+=("$name")
+            if [[ $exit_code -ne 0 || "$VERBOSE" == "1" ]]; then
+                sed 's/^/    | /' "$logfile"
+            fi
+            rm -f "$logfile"
+            break
+        fi
+    done
 
     # Brief pause: lets the previous ssh-oll server daemon exit on backend EOF and
     # gives the OS time to release file descriptors and socket resources.

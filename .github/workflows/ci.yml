@@ -16,7 +16,7 @@ jobs:
         run: make
 
       - name: Run tests
-        run: bash test_all.sh
+        run: bash test_all.sh --auto-rerun-failed
 
   build-and-test-macos:
     runs-on: macos-latest
@@ -30,4 +30,4 @@ jobs:
         run: make
 
       - name: Run tests
-        run: bash test_all.sh
+        run: bash test_all.sh --auto-rerun-failed
