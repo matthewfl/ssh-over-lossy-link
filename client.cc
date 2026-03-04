@@ -326,6 +326,7 @@ int run_client(const Args& args) {
   std::vector<int> pending_reap;  // carriers to close once a replacement has connected (or slowly when above target)
   uint64_t last_reap_ns = 0;
   uint64_t last_reduction_close_ns = 0;  // rate-limit: at most 1 close per 60s when reducing from above target
+  uint64_t last_recovery_log_ns = 0;  // rate-limit: "still waiting" message when carriers.empty()
   const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
   static constexpr uint64_t reduction_close_interval_ns = 60 * 1000000000ULL;  // 60s between reduction closes
 
@@ -406,6 +407,8 @@ int run_client(const Args& args) {
     ev.data.fd = fd;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
       carriers[fd].connecting = true;
+      if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=initial]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
       if (args.unix_socket_connection.empty())
         fd_to_ssh_index[fd] = i;  // correct slot→fd mapping
     } else {
@@ -979,6 +982,8 @@ int run_client(const Args& args) {
         ev.data.fd = fd;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
           carriers[fd].connecting = true;
+          if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=ssh_connect]\n",
+                           (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
           // Record SSH index for later recycling.
           if (it->size() > prefix.size())
             fd_to_ssh_index[fd] = slot;
@@ -1229,15 +1234,23 @@ int run_client(const Args& args) {
           }
           if (!args.unix_socket_connection.empty()) {
             int fd = connect_unix(socket_path);
-            if (fd >= 0) {
-              ev.events = EPOLLIN | EPOLLOUT;
-              ev.data.fd = fd;
-              if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
-                carriers[fd].connecting = true;
-              else
-                close(fd);
-            }
-          } else if (pending_carrier_paths.empty()) {
+      if (fd >= 0) {
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = fd;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+          carriers[fd].connecting = true;
+          const char* add_reason =
+              (total_write > backpressure_write_threshold) ? "backpressure" :
+              (rtt_outlier && !unacked_sends.empty()) ? "rtt_outlier" :
+              redundancy_pressure ? "redundancy_pressure" :
+              any_rs_pending_pressure ? "rs_pending_pressure" :
+              need_replacement ? "need_replacement" : "need_more";
+          if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
+                           (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size(), add_reason);
+        } else
+          close(fd);
+      }
+    } else if (pending_carrier_paths.empty()) {
             unsigned free_idx = find_free_ssh_index();
             if (free_idx < max_connections) {
               std::string path = client_dir + "/" + std::to_string(free_idx);
@@ -1268,6 +1281,14 @@ int run_client(const Args& args) {
                 ssh_idx_to_pid[free_idx] = pid;
                 pending_carrier_paths.push_back(path);
                 if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
+                const char* add_reason =
+                    (total_write > backpressure_write_threshold) ? "backpressure" :
+                    (rtt_outlier && !unacked_sends.empty()) ? "rtt_outlier" :
+                    redundancy_pressure ? "redundancy_pressure" :
+                    any_rs_pending_pressure ? "rs_pending_pressure" :
+                    need_replacement ? "need_replacement" : "need_more";
+                if (dbg) fprintf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",
+                                 (unsigned long long)(now_ns()/1000000ULL), path.c_str(), add_reason);
               }
             }
           }
@@ -1483,20 +1504,27 @@ int run_client(const Args& args) {
         bool can_add = (add_limit > 1) || pending_carrier_paths.empty();
         if (!can_add) { /* skip */ }
         else if (!args.unix_socket_connection.empty()) {
+          if (dbg && carriers.empty())
+            fprintf(dbg, "[carrier-add-attempt t=%llu reason=mass_death connecting_to_socket trying=%u]\n",
+                    (unsigned long long)(now_ns()/1000000ULL), add_limit);
           for (unsigned j = 0; j < add_limit && carriers.size() < max_connections; ++j) {
             int fd = connect_unix(socket_path);
-            if (dbg) fprintf(dbg, "[floor-add t=%llu carriers=%zu fd=%d errno=%d]\n",
-                             (unsigned long long)(now_ns()/1000000ULL), carriers.size(), fd, fd<0?errno:0);
             if (fd >= 0) {
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;
-              if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0)
+              if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
                 carriers[fd].connecting = true;
-              else
+                const char* floor_reason = carriers.empty() ? "mass_death" : "below_floor";
+                if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
+                                 (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size(), floor_reason);
+              } else
                 close(fd);
             }
           }
         } else {
+          if (dbg && carriers.empty())
+            fprintf(dbg, "[carrier-add-attempt t=%llu reason=mass_death starting_ssh count=%u waiting_for_connect]\n",
+                    (unsigned long long)(now_ns()/1000000ULL), add_limit);
           for (unsigned j = 0; j < add_limit; ++j) {
             unsigned free_idx = find_free_ssh_index();
             if (free_idx >= max_connections) break;
@@ -1528,9 +1556,26 @@ int run_client(const Args& args) {
               ssh_idx_to_pid[free_idx] = pid;
               pending_carrier_paths.push_back(path);
               if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
+              const char* floor_reason = carriers.empty() ? "mass_death" : "below_floor";
+              if (dbg) fprintf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",
+                               (unsigned long long)(now_ns()/1000000ULL), path.c_str(), floor_reason);
             }
           }
         }
+      }
+    }
+
+    // When recovering from mass death (carriers.empty()), log periodically to debug file.
+    if (dbg && carriers.empty()) {
+      const uint64_t now_r = now_ns();
+      if (now_r - last_recovery_log_ns >= 5000000000ULL) {  // every 5 s
+        last_recovery_log_ns = now_r;
+        if (!pending_carrier_paths.empty())
+          fprintf(dbg, "[carrier-recovery-wait t=%llu pending=%zu waiting_for_ssh_connect]\n",
+                  (unsigned long long)(now_r/1000000ULL), pending_carrier_paths.size());
+        else if (!args.unix_socket_connection.empty())
+          fprintf(dbg, "[carrier-recovery-wait t=%llu retrying_unix_connect]\n",
+                  (unsigned long long)(now_r/1000000ULL));
       }
     }
 
