@@ -29,13 +29,29 @@ bool process_carrier_read(
     s.last_recv_ns = now_ns();
     const auto* h = reinterpret_cast<const PacketHeader*>(s.read_buf.data());
     if (h->packet_kind == PacketKind::PING) {
-      if (callbacks.on_ping) callbacks.on_ping(fd, h->id);
-      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      size_t payload_size = 0;
+      size_t consumed = sizeof(PacketHeader);
+      if (s.read_buf.size() >= sizeof(PacketHeader) + sizeof(uint16_t)) {
+        payload_size = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
+        if (payload_size <= MAX_PACKET_PAYLOAD && s.read_buf.size() >= consumed + sizeof(uint16_t) + payload_size) {
+          consumed += sizeof(uint16_t) + payload_size;
+        } else {
+          payload_size = 0;
+        }
+      }
+      if (callbacks.on_ping) callbacks.on_ping(fd, h->id, payload_size);
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + consumed);
       continue;
     }
     if (h->packet_kind == PacketKind::PONG) {
       uint64_t id = h->id;
-      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      size_t consumed = sizeof(PacketHeader);
+      if (s.read_buf.size() >= sizeof(PacketHeader) + sizeof(uint16_t)) {
+        uint16_t payload_size = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
+        if (payload_size <= MAX_PACKET_PAYLOAD && s.read_buf.size() >= consumed + sizeof(uint16_t) + payload_size)
+          consumed += sizeof(uint16_t) + payload_size;
+      }
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + consumed);
       if (callbacks.on_pong) callbacks.on_pong(fd, id);
       continue;
     }
@@ -308,11 +324,31 @@ void append_pong(std::vector<uint8_t>& out, uint64_t id) {
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
 }
 
+void append_pong(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload, size_t payload_len) {
+  PacketHeader h{};
+  h.id = id;
+  h.packet_kind = PacketKind::PONG;
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+  uint16_t sz = static_cast<uint16_t>(payload_len);
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&sz), reinterpret_cast<uint8_t*>(&sz) + sizeof sz);
+  if (payload && payload_len) out.insert(out.end(), payload, payload + payload_len);
+}
+
 void append_ping(std::vector<uint8_t>& out, uint64_t id) {
   PacketHeader h{};
   h.id = id;
   h.packet_kind = PacketKind::PING;
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+}
+
+void append_ping(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload, size_t payload_len) {
+  PacketHeader h{};
+  h.id = id;
+  h.packet_kind = PacketKind::PING;
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+  uint16_t sz = static_cast<uint16_t>(payload_len);
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&sz), reinterpret_cast<uint8_t*>(&sz) + sizeof sz);
+  if (payload && payload_len) out.insert(out.end(), payload, payload + payload_len);
 }
 
 void append_ready(std::vector<uint8_t>& out) {
@@ -373,7 +409,8 @@ void flush_carrier_writes(
       continue;
     }
     while (s.write_pos < s.write_buf.size()) {
-      ssize_t n = write(fd, s.write_buf.data() + s.write_pos, s.write_buf.size() - s.write_pos);
+      size_t to_write = s.write_buf.size() - s.write_pos;
+      ssize_t n = write(fd, s.write_buf.data() + s.write_pos, to_write);
       if (n <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           ev.events = EPOLLIN | EPOLLOUT;
@@ -388,6 +425,7 @@ void flush_carrier_writes(
         goto next;
       }
       s.write_pos += n;
+      s.bytes_sent_this_minute += static_cast<size_t>(n);
       s.last_send_ns = static_cast<uint64_t>(
           std::chrono::steady_clock::now().time_since_epoch().count());
     }

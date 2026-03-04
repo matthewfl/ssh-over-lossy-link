@@ -382,6 +382,7 @@ int run_client(const Args& args) {
 
   // Timing for periodic operations that don't depend on carrier events.
   uint64_t last_ping_check_ns       = 0;
+  uint64_t last_keepalive_check_ns  = 0;
   uint64_t last_client_metrics_ns    = 0;
   const uint64_t client_metrics_interval_ns = 400 * 1000000ULL;  // 400ms, match server SERVER_METRICS
   uint64_t last_rs_drain_ns                = 0;
@@ -567,10 +568,20 @@ int run_client(const Args& args) {
     effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
     backpressure_write_threshold = 150 * effective_max_packet;
   };
-  recv_cb.on_ping = [&](int fd, uint64_t id) {
+  std::mt19937 keepalive_gen(std::random_device{}());
+  recv_cb.on_ping = [&](int fd, uint64_t id, size_t payload_size) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
-    packet_io::append_pong(it->second.write_buf, id);
+    if (payload_size > 0) {
+      size_t pkt_max = effective_max_packet;
+      size_t len = std::min(payload_size, std::max(size_t(50), pkt_max));
+      std::vector<uint8_t> payload(len);
+      std::uniform_int_distribution<int> dist(0, 255);
+      for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(dist(keepalive_gen));
+      packet_io::append_pong(it->second.write_buf, id, payload.data(), len);
+    } else {
+      packet_io::append_pong(it->second.write_buf, id);
+    }
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -1128,6 +1139,33 @@ int run_client(const Args& args) {
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
         }
+
+        // --min-data-per-minute: send keepalive data every few seconds so links stay active.
+        const unsigned min_bpm = args.config.min_data_per_minute;
+        if (min_bpm > 0 && now_p - last_keepalive_check_ns >= 4000000000ULL) {
+          last_keepalive_check_ns = now_p;
+          const uint64_t minute_ns = 60 * 1000000000ULL;
+          for (auto& [cfd, cs] : carriers) {
+            if (cs.connecting) continue;
+            if (now_p - cs.last_minute_reset_ns >= minute_ns) {
+              cs.bytes_sent_this_minute = 0;
+              cs.last_minute_reset_ns = now_p;
+            }
+            if (cs.bytes_sent_this_minute < min_bpm && cs.write_buf.empty()) {
+              size_t pkt_max = effective_max_packet;
+              std::uniform_int_distribution<size_t> len_dist(50, std::max(size_t(50), pkt_max));
+              size_t len = len_dist(keepalive_gen);
+              std::vector<uint8_t> payload(len);
+              std::uniform_int_distribution<int> byte_dist(0, 255);
+              for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(byte_dist(keepalive_gen));
+              packet_io::append_ping(cs.write_buf, next_send_id, payload.data(), len);
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = cfd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            }
+          }
+        }
+
         for (int cfd : quality.dead_idle_fds)
           add_to_pending_reap(cfd, "dead_idle");
 

@@ -114,6 +114,7 @@ struct Config {
   float max_delay_ms = 1.0f;
   unsigned rtt_hint_ms = 0;  // 0 = auto from observed latency; else hint for cold-start timeouts
   unsigned connect_timeout_sec = 30;  // SSH ConnectTimeout; 0 = no timeout (wait indefinitely)
+  unsigned min_data_per_minute = 0;   // when >0, send keepalive data so each carrier sends ≥N bytes/min
 };
 
 // -----------------------------------------------------------------------------

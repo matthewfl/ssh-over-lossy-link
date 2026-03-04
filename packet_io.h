@@ -26,6 +26,8 @@ struct CarrierState {
   uint64_t last_recv_ns = 0;  // last time any packet arrived on this carrier
   uint64_t last_send_ns = 0;  // last time bytes were actually written to this carrier fd
   uint64_t connect_ns = 0;    // when this carrier finished connecting (set by caller)
+  uint64_t bytes_sent_this_minute = 0;  // for --min-data-per-minute keepalive
+  uint64_t last_minute_reset_ns = 0;    // when bytes_sent_this_minute was last reset
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -44,7 +46,8 @@ struct ReceiveCallbacks {
   // Server writes to backend and queues ACK on completing_fd; client writes to stdout and ACKs on completing_fd.
   std::function<void(int completing_fd, uint64_t id, const uint8_t* data, size_t len)> on_deliver;
   // Client -> server PING; server should send PONG. Server -> client PING; client should send PONG.
-  std::function<void(int fd, uint64_t id)> on_ping;
+  // payload_size: if >0, PING had keepalive payload; responder should send PONG with payload.
+  std::function<void(int fd, uint64_t id, size_t payload_size)> on_ping;
   // PONG received (response to our PING). Caller may record RTT (e.g. server measures server→client path).
   std::function<void(int fd, uint64_t id)> on_pong;
   // Server -> client ACK; client may record RTT.
@@ -110,7 +113,9 @@ void append_server_config(std::vector<uint8_t>& out, uint16_t packet_size, uint1
                          float max_delay_ms, float reed_solomon_redundancy);
 void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
 void append_pong(std::vector<uint8_t>& out, uint64_t id);
+void append_pong(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload, size_t payload_len);
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
+void append_ping(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload, size_t payload_len);
 void append_ready(std::vector<uint8_t>& out);
 void append_suggest_close(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
