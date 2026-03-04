@@ -875,8 +875,12 @@ int run_server(const Args& args) {
       if (fraction_struggling > kFractionSlowIncreaseFast) {
         runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.10f);
         runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 1u);
+        c2s_shard_spread_ns.clear();
+        c2s_gap_final_ns.clear();
       } else if (fraction_struggling > kFractionSlowIncreaseMedium) {
         runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.05f);
+        c2s_shard_spread_ns.clear();
+        c2s_gap_final_ns.clear();
       } else {
         if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
           runtime_rs_redundancy = std::max(0.1f, runtime_rs_redundancy - 0.02f);

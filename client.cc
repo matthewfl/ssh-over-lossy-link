@@ -1046,8 +1046,12 @@ int run_client(const Args& args) {
         if (fraction_struggling > kFractionSlowIncreaseFast) {
           effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + 0.10f);
           effective_small_packet_redundancy = std::min(20u, effective_small_packet_redundancy + 1u);
+          s2c_shard_spread_ns.clear();
+          s2c_gap_final_ns.clear();
         } else if (fraction_struggling > kFractionSlowIncreaseMedium) {
           effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + 0.05f);
+          s2c_shard_spread_ns.clear();
+          s2c_gap_final_ns.clear();
         } else {
           if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
             effective_rs_redundancy = std::max(0.1f, effective_rs_redundancy - 0.02f);
