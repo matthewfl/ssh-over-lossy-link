@@ -1,6 +1,7 @@
 #include "ssholl.h"
 #include "packet_io.h"
 #include "reed_solomon.h"
+#include "carrier_adapt.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -184,12 +185,6 @@ int run_server(const Args& args) {
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
   const uint64_t adapt_interval_ns = 300 * 1000000ULL;
-
-  // Shard-spread thresholds: what fraction of RS groups are "struggling" (spread > 2× floor).
-  static constexpr float kFractionSlowIncreaseFast   = 0.05f;  // >5% struggling → big increase
-  static constexpr float kFractionSlowIncreaseMedium = 0.01f;  // >1% struggling → medium increase
-  static constexpr float kFractionSlowDecrease       = 0.01f;  // <1% struggling → decrease (0.2% too strict for low-packet interactive SSH)
-  static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 RS groups decoded
   unsigned next_carrier_for_rs = 0;
 
 
@@ -210,6 +205,11 @@ int run_server(const Args& args) {
   std::deque<uint64_t> c2s_extra_shard_gap_ns;
   std::deque<uint64_t> c2s_small_extra_copy_gap_ns;  // copy 1->2 gap for small packets (c2s)
   static constexpr size_t kMaxSpreadSamples = 100;
+  // s2c metrics from CLIENT_METRICS (client measures server→client path).
+  float s2c_fraction_struggling = 0.0f;
+  bool s2c_can_decrease_rs = false;
+  bool s2c_can_decrease_small = false;
+  uint64_t s2c_last_received_ns = 0;
   // Shared map for tracking when RS groups decoded so extra shards can be timed.
   std::map<uint64_t, uint64_t> recently_decoded_ns;
   std::map<uint64_t, std::vector<uint64_t>> small_copy_arrival_times;
@@ -451,6 +451,17 @@ int run_server(const Args& args) {
     for (auto it_u = unacked_data.begin(); it_u != unacked_data.end() && it_u->first <= acked_id; )
       it_u = unacked_data.erase(it_u);
   };
+  recv_cb.on_client_metrics = [&](uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
+                                  float fraction_struggling, uint32_t rs_pending_count,
+                                  bool can_decrease_rs, bool can_decrease_small) {
+    (void)avg_shard_spread_ns;
+    (void)avg_extra_shard_gap_ns;
+    (void)rs_pending_count;
+    s2c_fraction_struggling = fraction_struggling;
+    s2c_can_decrease_rs = can_decrease_rs;
+    s2c_can_decrease_small = can_decrease_small;
+    s2c_last_received_ns = now_ns();
+  };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
     runtime_auto_adapt = (pc.auto_adapt != 0);
     max_packet = std::min(static_cast<size_t>(pc.packet_size), MAX_PACKET_PAYLOAD);
@@ -648,32 +659,34 @@ int run_server(const Args& args) {
       }
     }
 
-    // ── Ping / inactivity-check / RS stale-drain ────────────────────────────
+    // ── Ping / inactivity-check / carrier quality (suggest close) ───────────
     if (now_ns_val - last_ping_check_ns >= 1000000000ULL) {
       last_ping_check_ns = now_ns_val;
-      uint64_t ping_idle_ns  = scaled_ns(2,  5000000000ULL, 30000000000ULL);  // send PING before dead_idle
-      uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);
-      uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);
-      // Carriers that appear dead: send SUGGEST_CLOSE so the client closes them (server
-      // cannot open new connections; only the client reaps). Rate-limit to 1 suggestion per 10s.
-      std::vector<int> to_suggest;
+      uint64_t ping_idle_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
+
+      std::vector<carrier_adapt::CarrierInfo> carrier_infos;
       for (auto& [cfd, cs] : carriers) {
-        if (now_ns_val - cs.connect_ns < grace_ns) continue;
-        uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
-        if (now_ns_val - last_activity > dead_idle_ns) {
-          to_suggest.push_back(cfd);
-          continue;  // Carrier dead (no data, no PONG); skip PING
-        }
+        carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns});
+      }
+      auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
+
+      // Send PING to idle carriers; dead ones get SUGGEST_CLOSE (skip PING).
+      for (auto& [cfd, cs] : carriers) {
+        bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
+            != quality.dead_idle_fds.end();
+        if (is_dead) continue;
         if (cs.write_buf.empty()
             && now_ns_val - cs.last_send_ns > ping_idle_ns
-            && now_ns_val - cs.last_recv_ns  > ping_idle_ns) {
+            && now_ns_val - cs.last_recv_ns > ping_idle_ns) {
           packet_io::append_ping(cs.write_buf, 0);
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
         }
       }
-      for (int cfd : to_suggest) {
+
+      // SUGGEST_CLOSE: server cannot close; client performs actual close. Rate-limit 1 per 10s.
+      for (int cfd : quality.dead_idle_fds) {
         if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
         last_suggest_close_ns = now_ns_val;
         packet_io::append_suggest_close(carriers[cfd].write_buf);
@@ -683,31 +696,15 @@ int run_server(const Args& args) {
         if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
                          (unsigned long long)(now_ns_val/1000000ULL), cfd);
       }
-
-      // RTT outlier: suggest closing the slowest carrier when it's 5× median and very high.
-      if (carriers.size() > 1 && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
-        std::vector<uint64_t> rtts;
-        for (const auto& [_, cs] : carriers)
-          if (cs.last_rtt_ns > 0) rtts.push_back(cs.last_rtt_ns);
-        if (rtts.size() >= 2) {
-          std::vector<uint64_t> sorted = rtts;
-          std::sort(sorted.begin(), sorted.end());
-          uint64_t median_rtt = sorted[sorted.size() / 2];
-          uint64_t very_high_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
-          int worst_fd = -1;
-          uint64_t worst_rtt = 0;
-          for (auto& [fd, cs] : carriers)
-            if (cs.last_rtt_ns > worst_rtt) { worst_rtt = cs.last_rtt_ns; worst_fd = fd; }
-          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_ns) {
-            last_suggest_close_ns = now_ns_val;
-            packet_io::append_suggest_close(carriers[worst_fd].write_buf);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = worst_fd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, worst_fd, &ev);
-            if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
-                             (unsigned long long)(now_ns_val/1000000ULL), worst_fd);
-          }
-        }
+      if (quality.rtt_outlier_fd >= 0
+          && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
+        last_suggest_close_ns = now_ns_val;
+        packet_io::append_suggest_close(carriers[quality.rtt_outlier_fd].write_buf);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = quality.rtt_outlier_fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, quality.rtt_outlier_fd, &ev);
+        if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
+                         (unsigned long long)(now_ns_val/1000000ULL), quality.rtt_outlier_fd);
       }
 
       // Update global receive timestamp from all live carriers.
@@ -830,68 +827,28 @@ int run_server(const Args& args) {
 
     // When auto_adapt, server manages its own redundancy and informs the client.
     if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns
-        && c2s_shard_spread_ns.size() >= kMinSamplesForAdapt) {
+        && c2s_shard_spread_ns.size() >= carrier_adapt::kMinSamplesForAdapt) {
       last_adapt_ns = now_ns_val;
+      const uint64_t s2c_stale_ns = 2 * metrics_interval_ns;
 
-      // --- Increase signal: spread + gap_final ---
-      // When total spread > 2ms AND the final inter-shard gap is large relative to the
-      // rest of the spread, the last needed shard was a bottleneck.  The group barely
-      // decoded — a small increase in loss would have stalled it.
-      static constexpr uint64_t kSpreadIncreaseThresholdNs = 2000000ULL;  // 2 ms
-      size_t n_struggling = 0;
-      for (size_t i = 0; i < c2s_shard_spread_ns.size(); ++i) {
-        uint64_t spread = c2s_shard_spread_ns[i];
-        uint64_t gfinal = (i < c2s_gap_final_ns.size()) ? c2s_gap_final_ns[i] : 0;
-        // "Struggling" = spread > 2ms AND gap_final accounts for > half the spread.
-        if (spread > kSpreadIncreaseThresholdNs && gfinal > spread / 2)
-          n_struggling++;
-      }
-      float fraction_struggling = static_cast<float>(n_struggling)
-                                  / static_cast<float>(c2s_shard_spread_ns.size());
+      auto c2s = carrier_adapt::compute_from_deques(c2s_shard_spread_ns, c2s_gap_final_ns,
+                                                    c2s_extra_shard_gap_ns, c2s_small_extra_copy_gap_ns);
+      carrier_adapt::PathMetrics s2c;
+      s2c.fraction_struggling = s2c_fraction_struggling;
+      s2c.can_decrease_rs = s2c_can_decrease_rs;
+      s2c.can_decrease_small = s2c_can_decrease_small;
+      bool s2c_fresh = (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
+      auto merged = carrier_adapt::merge(c2s, s2c, s2c_fresh);
 
-      // --- Decrease signal (RS): extra shard (k+1) arrives within 0.5ms of k-th ---
-      static constexpr uint64_t kExtraGapDecreaseThresholdNs = 500000ULL;  // 0.5 ms
-      bool can_decrease_rs = false;
-      if (c2s_extra_shard_gap_ns.size() >= 10) {
-        std::vector<uint64_t> sorted_gap(c2s_extra_shard_gap_ns.begin(),
-                                         c2s_extra_shard_gap_ns.end());
-        std::sort(sorted_gap.begin(), sorted_gap.end());
-        uint64_t p90 = sorted_gap[(sorted_gap.size() * 9) / 10];
-        can_decrease_rs = (p90 < kExtraGapDecreaseThresholdNs);
-      }
-
-      // --- Decrease signal (small packets): first→median gap. Use 1.5ms threshold (looser than RS
-      // 0.5ms) so we aggressively come back down from high values when the link improves.
-      static constexpr uint64_t kSmallPacketGapDecreaseThresholdNs = 1500000ULL;  // 1.5 ms
-      bool can_decrease_small = false;
-      if (c2s_small_extra_copy_gap_ns.size() >= 5) {
-        std::vector<uint64_t> sorted_sg(c2s_small_extra_copy_gap_ns.begin(),
-                                        c2s_small_extra_copy_gap_ns.end());
-        std::sort(sorted_sg.begin(), sorted_sg.end());
-        uint64_t p90 = sorted_sg[(sorted_sg.size() * 9) / 10];
-        can_decrease_small = (p90 < kSmallPacketGapDecreaseThresholdNs);
-      }
-
-      if (fraction_struggling > kFractionSlowIncreaseFast) {
-        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.10f);
-        runtime_small_packet_redundancy = std::min(20u, runtime_small_packet_redundancy + 1u);
+      auto res = carrier_adapt::run_adapt(merged, runtime_rs_redundancy,
+                                          runtime_small_packet_redundancy,
+                                          static_cast<unsigned>(carriers.size()));
+      runtime_rs_redundancy = res.rs_redundancy;
+      runtime_small_packet_redundancy = res.small_packet_redundancy;
+      if (res.clear_spread) {
         c2s_shard_spread_ns.clear();
         c2s_gap_final_ns.clear();
-      } else if (fraction_struggling > kFractionSlowIncreaseMedium) {
-        runtime_rs_redundancy = std::min(2.0f, runtime_rs_redundancy + 0.05f);
-        c2s_shard_spread_ns.clear();
-        c2s_gap_final_ns.clear();
-      } else {
-        if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
-          runtime_rs_redundancy = std::max(0.1f, runtime_rs_redundancy - 0.02f);
       }
-      // Small packet decrease: always allow when copies arrive fast, independent of RS spread.
-      // Aggressive ramp-down when oversubscribed: -2 per cycle when >10 copies.
-      if (can_decrease_small) {
-        unsigned decr = (runtime_small_packet_redundancy > 10u) ? 2u : 1u;
-        runtime_small_packet_redundancy = std::max(2u, runtime_small_packet_redundancy - decr);
-      }
-      runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;

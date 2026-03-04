@@ -1,6 +1,7 @@
 #include "ssholl.h"
 #include "packet_io.h"
 #include "reed_solomon.h"
+#include "carrier_adapt.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -304,12 +305,6 @@ int run_client(const Args& args) {
   uint64_t last_redundancy_pressure_add_ns = 0;  // rate-limit: at most one add per 60s from rs ratio
   uint64_t last_rs_pending_pressure_add_ns = 0;  // rate-limit: add every 10s when rs_pending is very high
   // RTT outlier threshold: carrier must be both 5× median AND above this absolute. Scales with link.
-  // Fraction-slow thresholds (mirrors server.cc constants).
-  // Shard-spread thresholds: what fraction of RS groups are "struggling" (spread > 2× floor).
-  static constexpr float kFractionSlowIncreaseFast   = 0.05f;  // >5% struggling → big increase
-  static constexpr float kFractionSlowIncreaseMedium = 0.01f;  // >1% struggling → medium increase
-  static constexpr float kFractionSlowDecrease       = 0.01f;  // <1% struggling → decrease (0.2% too strict for low-packet interactive SSH)
-  static constexpr size_t kMinSamplesForAdapt = 20;            // need ≥20 RS groups decoded
   uint64_t backpressure_write_threshold = 150 * effective_max_packet;  // updated when effective_max_packet changes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
   unsigned last_sent_small_packet_redundancy = 0;
@@ -372,6 +367,8 @@ int run_client(const Args& args) {
 
   // Timing for periodic operations that don't depend on carrier events.
   uint64_t last_ping_check_ns       = 0;
+  uint64_t last_client_metrics_ns    = 0;
+  const uint64_t client_metrics_interval_ns = 400 * 1000000ULL;  // 400ms, match server SERVER_METRICS
   uint64_t last_rs_drain_ns                = 0;
   uint64_t next_deliver_id_stuck_since_ns  = 0;  // when gap at next_deliver_id first appeared
   uint64_t last_retransmit_check_ns = 0;
@@ -458,6 +455,22 @@ int run_client(const Args& args) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
     packet_io::append_config(it->second.write_buf, pkt_size, small_red, max_delay_ms, rs_red, auto_adapt_val);
+  };
+
+  // Queue CLIENT_METRICS to one carrier (s2c path quality for server's dual-direction adapt).
+  auto queue_client_metrics_to_carrier = [&](int fd) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    auto m = carrier_adapt::compute_from_deques(s2c_shard_spread_ns, s2c_gap_final_ns,
+                                                s2c_extra_shard_gap_ns, s2c_small_extra_copy_gap_ns);
+    packet_io::append_client_metrics(it->second.write_buf,
+                                    m.avg_shard_spread_ns, m.avg_extra_shard_gap_ns,
+                                    m.fraction_struggling,
+                                    static_cast<uint32_t>(rs_pending.size()),
+                                    m.can_decrease_rs, m.can_decrease_small);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
 
   // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
@@ -995,73 +1008,39 @@ int run_client(const Args& args) {
         ev.data.fd = fd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
       }
+      // Send s2c path metrics so server can merge with c2s for dual-direction adapt.
+      {
+        const uint64_t now = now_ns();
+        if (now - last_client_metrics_ns >= client_metrics_interval_ns) {
+          last_client_metrics_ns = now;
+          queue_client_metrics_to_carrier(carriers.begin()->first);
+        }
+      }
     } else if (!carriers.empty()) {
       const uint64_t now = now_ns();
       if (now - last_adapt_ns >= adapt_interval_ns
-          && s2c_shard_spread_ns.size() >= kMinSamplesForAdapt) {
+          && s2c_shard_spread_ns.size() >= carrier_adapt::kMinSamplesForAdapt) {
         last_adapt_ns = now;
 
-        static constexpr uint64_t kSpreadIncreaseThresholdNs   = 2000000ULL;  // 2 ms
-        static constexpr uint64_t kExtraGapDecreaseThresholdNs = 500000ULL;   // 0.5 ms
+        auto s2c = carrier_adapt::compute_from_deques(s2c_shard_spread_ns, s2c_gap_final_ns,
+                                                     s2c_extra_shard_gap_ns, s2c_small_extra_copy_gap_ns);
+        carrier_adapt::PathMetrics c2s;
+        c2s.fraction_struggling = carrier_adapt::approximate_fraction_struggling_from_avg_spread(c2s_avg_shard_spread_ns);
+        c2s.can_decrease_rs = (c2s_avg_extra_shard_gap_ns > 0
+                               && c2s_avg_extra_shard_gap_ns < carrier_adapt::kExtraGapDecreaseThresholdNs);
+        c2s.can_decrease_small = false;  // server doesn't report c2s small-packet gap
+        bool c2s_fresh = (c2s_avg_shard_spread_ns > 0 || server_rs_pending_count > 0);
+        auto merged = carrier_adapt::merge(s2c, c2s, c2s_fresh);  // primary s2c, merge with c2s when fresh
 
-        // --- Increase signal (s2c): spread > 2ms AND gap_final > half the spread ---
-        size_t n_struggling_s2c = 0;
-        for (size_t i = 0; i < s2c_shard_spread_ns.size(); ++i) {
-          uint64_t spread = s2c_shard_spread_ns[i];
-          uint64_t gfinal = (i < s2c_gap_final_ns.size()) ? s2c_gap_final_ns[i] : 0;
-          if (spread > kSpreadIncreaseThresholdNs && gfinal > spread / 2)
-            n_struggling_s2c++;
-        }
-        float s2c_struggling = static_cast<float>(n_struggling_s2c)
-                               / static_cast<float>(s2c_shard_spread_ns.size());
-
-        // --- Increase signal (c2s, from server report): treat non-trivial avg spread
-        //     as evidence the c2s path is under the same kind of pressure.
-        float c2s_struggling = (c2s_avg_shard_spread_ns > kSpreadIncreaseThresholdNs)
-                                ? kFractionSlowIncreaseFast * 2.0f : 0.0f;
-
-        float fraction_struggling = std::max(s2c_struggling, c2s_struggling);
-
-        // --- Decrease signal (RS): extra shard (k+1) arrives within 0.5ms of k-th ---
-        bool can_decrease_s2c = false;
-        if (s2c_extra_shard_gap_ns.size() >= 10) {
-          std::vector<uint64_t> sg(s2c_extra_shard_gap_ns.begin(), s2c_extra_shard_gap_ns.end());
-          std::sort(sg.begin(), sg.end());
-          can_decrease_s2c = sg[(sg.size() * 9) / 10] < kExtraGapDecreaseThresholdNs;
-        }
-        bool can_decrease_c2s = (c2s_avg_extra_shard_gap_ns > 0
-                                  && c2s_avg_extra_shard_gap_ns < kExtraGapDecreaseThresholdNs);
-        bool can_decrease_rs = can_decrease_s2c || can_decrease_c2s;
-
-        // --- Decrease signal (small packets): first→median gap. Use 1.5ms threshold (looser than RS
-        // 0.5ms) so we aggressively come back down from high values when the link improves.
-        static constexpr uint64_t kSmallPacketGapDecreaseThresholdNs = 1500000ULL;  // 1.5 ms
-        bool can_decrease_small = false;
-        if (s2c_small_extra_copy_gap_ns.size() >= 5) {
-          std::vector<uint64_t> sg(s2c_small_extra_copy_gap_ns.begin(), s2c_small_extra_copy_gap_ns.end());
-          std::sort(sg.begin(), sg.end());
-          can_decrease_small = sg[(sg.size() * 9) / 10] < kSmallPacketGapDecreaseThresholdNs;
-        }
-
-        if (fraction_struggling > kFractionSlowIncreaseFast) {
-          effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + 0.10f);
-          effective_small_packet_redundancy = std::min(20u, effective_small_packet_redundancy + 1u);
+        auto res = carrier_adapt::run_adapt(merged, effective_rs_redundancy,
+                                           effective_small_packet_redundancy,
+                                           static_cast<unsigned>(carriers.size()));
+        effective_rs_redundancy = res.rs_redundancy;
+        effective_small_packet_redundancy = res.small_packet_redundancy;
+        if (res.clear_spread) {
           s2c_shard_spread_ns.clear();
           s2c_gap_final_ns.clear();
-        } else if (fraction_struggling > kFractionSlowIncreaseMedium) {
-          effective_rs_redundancy = std::min(2.0f, effective_rs_redundancy + 0.05f);
-          s2c_shard_spread_ns.clear();
-          s2c_gap_final_ns.clear();
-        } else {
-          if (can_decrease_rs && fraction_struggling < kFractionSlowDecrease)
-            effective_rs_redundancy = std::max(0.1f, effective_rs_redundancy - 0.02f);
         }
-        // Small packet decrease: always allow when copies arrive fast, independent of RS spread.
-        if (can_decrease_small) {
-          unsigned decr = (effective_small_packet_redundancy > 10u) ? 2u : 1u;
-          effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - decr);
-        }
-        effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
       }
       if (effective_rs_redundancy != last_sent_rs_redundancy || effective_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = effective_rs_redundancy;
@@ -1107,28 +1086,30 @@ int run_client(const Args& args) {
             unlink((client_dir + "/" + std::to_string(idx)).c_str());
           }
         }
-        uint64_t ping_idle_ns  = scaled_ns(2,  5000000000ULL, 30000000000ULL);
-        uint64_t dead_idle_ns  = scaled_ns(5, 15000000000ULL, 120000000000ULL);
-        uint64_t grace_ns      = scaled_ns(2,  5000000000ULL,  30000000000ULL);
-        std::vector<int> to_kill;
+        uint64_t ping_idle_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
+
+        std::vector<carrier_adapt::CarrierInfo> carrier_infos;
         for (auto& [cfd, cs] : carriers) {
           if (cs.connecting) continue;
-          if (now_p - cs.connect_ns < grace_ns) continue;
-          uint64_t last_activity = std::max(cs.connect_ns, cs.last_recv_ns);
-          if (now_p - last_activity > dead_idle_ns) {
-            to_kill.push_back(cfd);
-            continue;
-          }
+          carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns});
+        }
+        auto quality = carrier_adapt::assess_carriers(carrier_infos, now_p, scaled_ns);
+
+        for (auto& [cfd, cs] : carriers) {
+          if (cs.connecting) continue;
+          bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
+              != quality.dead_idle_fds.end();
+          if (is_dead) continue;
           if (cs.write_buf.empty()
               && now_p - cs.last_send_ns > ping_idle_ns
-              && now_p - cs.last_recv_ns  > ping_idle_ns) {
+              && now_p - cs.last_recv_ns > ping_idle_ns) {
             packet_io::append_ping(cs.write_buf, next_send_id);
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
         }
-        for (int cfd : to_kill)
+        for (int cfd : quality.dead_idle_fds)
           add_to_pending_reap(cfd, "dead_idle");
 
         // When above target: don't add replacements. Slowly close from pending (1 per 60s).
@@ -1161,23 +1142,14 @@ int run_client(const Args& args) {
         total_write += st.write_buf.size();
         if (st.last_rtt_ns > 0) rtt_samples.push_back(st.last_rtt_ns);
       }
-      uint64_t max_carrier_rtt = rtt_samples.empty() ? 0 :
-          *std::max_element(rtt_samples.begin(), rtt_samples.end());
-
-      // RTT outlier: a carrier is stalled when its RTT is both extremely high in absolute terms
-      // AND much worse than its peers (5× median). Threshold scales with link RTT.
-      uint64_t very_high_rtt_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
-      bool rtt_outlier = false;
-      if (max_carrier_rtt > very_high_rtt_ns) {
-        if (rtt_samples.size() <= 1) {
-          rtt_outlier = true;
-        } else {
-          std::vector<uint64_t> sorted = rtt_samples;
-          std::sort(sorted.begin(), sorted.end());
-          uint64_t median_rtt = sorted[sorted.size() / 2];
-          rtt_outlier = (max_carrier_rtt > 5 * median_rtt);
-        }
+      // Carrier quality (same logic as server; client does the actual close).
+      std::vector<carrier_adapt::CarrierInfo> carrier_infos;
+      for (auto& [cfd, st] : carriers) {
+        if (st.connecting) continue;
+        carrier_infos.push_back({cfd, st.last_rtt_ns, st.last_recv_ns, st.connect_ns});
       }
+      auto quality = carrier_adapt::assess_carriers(carrier_infos, now, scaled_ns);
+      bool rtt_outlier = (quality.rtt_outlier_fd >= 0);
 
       // Carrier addition: when a carrier is stalled (clear RTT outlier), allow an add after
       // reap_check_interval_ns so the reap logic has time to run before we add another.
@@ -1314,17 +1286,8 @@ int run_client(const Args& args) {
       if (!early_handshake && now - last_reap_ns >= reap_check_interval_ns) {
         last_reap_ns = now;
 
-        if (!idle && rtt_samples.size() >= 2) {
-          std::vector<uint64_t> sorted = rtt_samples;
-          std::sort(sorted.begin(), sorted.end());
-          uint64_t median_rtt = sorted[sorted.size() / 2];
-          int worst_fd = -1;
-          uint64_t worst_rtt = 0;
-          for (auto& [fd, st] : carriers)
-            if (st.last_rtt_ns > worst_rtt) { worst_rtt = st.last_rtt_ns; worst_fd = fd; }
-          if (worst_fd >= 0 && worst_rtt > 5 * median_rtt && worst_rtt > very_high_rtt_ns)
-            add_to_pending_reap(worst_fd, "rtt_outlier");
-        }
+        if (!idle && quality.rtt_outlier_fd >= 0)
+          add_to_pending_reap(quality.rtt_outlier_fd, "rtt_outlier");
 
         uint64_t latest_recv = 0;
         for (auto& [fd, st] : carriers)

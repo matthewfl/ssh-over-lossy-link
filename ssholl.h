@@ -24,6 +24,7 @@ enum class PacketKind : uint8_t {
   SERVER_CONFIG = 8,      // server -> client; server's current redundancy config (when server manages it)
   READY = 9,              // server -> client; sent when carrier connects, confirms link is up
   SUGGEST_CLOSE = 10,     // server -> client; suggests client close this carrier (dead or slow)
+  CLIENT_METRICS = 11,    // client -> server; s2c path quality so server can adapt using both directions
 };
 
 #pragma pack(push, 1)
@@ -83,6 +84,17 @@ struct PacketServerConfig {
   uint16_t small_packet_redundancy;
   float max_delay_ms;
   float reed_solomon_redundancy;
+};
+
+// Client -> server: s2c path quality (server receives, client sends). Server merges with c2s for adapt.
+struct PacketClientMetrics {
+  PacketHeader header;
+  uint64_t avg_shard_spread_ns;
+  uint64_t avg_extra_shard_gap_ns;
+  float fraction_struggling;
+  uint32_t rs_pending_count;
+  uint8_t can_decrease_rs;    // p90 extra-shard gap < 0.5ms on s2c
+  uint8_t can_decrease_small; // p90 first→median gap < 1.5ms on s2c
 };
 
 #pragma pack(pop)
