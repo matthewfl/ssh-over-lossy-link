@@ -107,6 +107,12 @@ std::string launch_server(const Args& args) {
     std::vector<const char*> argv_vec;
     argv_vec.push_back("ssh");
     argv_vec.push_back("-n");
+    char ct_buf[64];
+    if (args.config.connect_timeout_sec > 0) {
+      snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
+      argv_vec.push_back("-o");
+      argv_vec.push_back(ct_buf);
+    }
     argv_vec.push_back(args.lossy_ssh_host.c_str());
     argv_vec.push_back(args.config.path_on_server.c_str());
     argv_vec.push_back("--server");
@@ -226,15 +232,23 @@ int run_client(const Args& args) {
           close(dn);
         }
         std::string spec = local_path + ":" + socket_path;
-        const char* argv[] = {
-          "ssh", "-n", "-N",
-          "-o", "ExitOnForwardFailure=yes",
-          // "-o", "ServerAliveInterval=10",
-          // "-o", "ServerAliveCountMax=3",
-          "-L", spec.c_str(),
-          args.lossy_ssh_host.c_str(), nullptr
-        };
-        execvp("ssh", const_cast<char* const*>(argv));
+        std::vector<const char*> argv_vec;
+        argv_vec.push_back("ssh");
+        argv_vec.push_back("-n");
+        argv_vec.push_back("-N");
+        argv_vec.push_back("-o");
+        argv_vec.push_back("ExitOnForwardFailure=yes");
+        char ct_buf[64];
+        if (args.config.connect_timeout_sec > 0) {
+          snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
+          argv_vec.push_back("-o");
+          argv_vec.push_back(ct_buf);
+        }
+        argv_vec.push_back("-L");
+        argv_vec.push_back(spec.c_str());
+        argv_vec.push_back(args.lossy_ssh_host.c_str());
+        argv_vec.push_back(nullptr);
+        execvp("ssh", const_cast<char* const*>(argv_vec.data()));
         _exit(127);
       }
       ssh_idx_to_pid[i] = pid;
@@ -1266,15 +1280,23 @@ int run_client(const Args& args) {
                   close(dn);
                 }
                 std::string spec = path + ":" + socket_path;
-                const char* argv[] = {
-                  "ssh", "-n", "-N",
-                  "-o", "ExitOnForwardFailure=yes",
-                  // "-o", "ServerAliveInterval=10",
-                  // "-o", "ServerAliveCountMax=3",
-                  "-L", spec.c_str(),
-                  args.lossy_ssh_host.c_str(), nullptr
-                };
-                execvp("ssh", const_cast<char* const*>(argv));
+                std::vector<const char*> argv_vec;
+                argv_vec.push_back("ssh");
+                argv_vec.push_back("-n");
+                argv_vec.push_back("-N");
+                argv_vec.push_back("-o");
+                argv_vec.push_back("ExitOnForwardFailure=yes");
+                char ct_buf[64];
+                if (args.config.connect_timeout_sec > 0) {
+                  snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
+                  argv_vec.push_back("-o");
+                  argv_vec.push_back(ct_buf);
+                }
+                argv_vec.push_back("-L");
+                argv_vec.push_back(spec.c_str());
+                argv_vec.push_back(args.lossy_ssh_host.c_str());
+                argv_vec.push_back(nullptr);
+                execvp("ssh", const_cast<char* const*>(argv_vec.data()));
                 _exit(127);
               }
               if (pid > 0) {
@@ -1541,15 +1563,23 @@ int run_client(const Args& args) {
                 close(dn);
               }
               std::string spec = path + ":" + socket_path;
-              const char* argv[] = {
-                "ssh", "-n", "-N",
-                "-o", "ExitOnForwardFailure=yes",
-                // "-o", "ServerAliveInterval=10",
-                // "-o", "ServerAliveCountMax=3",
-                "-L", spec.c_str(),
-                args.lossy_ssh_host.c_str(), nullptr
-              };
-              execvp("ssh", const_cast<char* const*>(argv));
+              std::vector<const char*> argv_vec;
+              argv_vec.push_back("ssh");
+              argv_vec.push_back("-n");
+              argv_vec.push_back("-N");
+              argv_vec.push_back("-o");
+              argv_vec.push_back("ExitOnForwardFailure=yes");
+              char ct_buf[64];
+              if (args.config.connect_timeout_sec > 0) {
+                snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
+                argv_vec.push_back("-o");
+                argv_vec.push_back(ct_buf);
+              }
+              argv_vec.push_back("-L");
+              argv_vec.push_back(spec.c_str());
+              argv_vec.push_back(args.lossy_ssh_host.c_str());
+              argv_vec.push_back(nullptr);
+              execvp("ssh", const_cast<char* const*>(argv_vec.data()));
               _exit(127);
             }
             if (pid > 0) {

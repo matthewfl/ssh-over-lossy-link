@@ -21,6 +21,7 @@ const struct option LONG_OPTS[] = {
   { "rs-redundancy",       required_argument, nullptr, 'R' },
   { "max-delay",            required_argument, nullptr, 'd' },
   { "rtt-ms",               required_argument, nullptr, 't' },
+  { "connect-timeout",      required_argument, nullptr, 'T' },
   { "server",               no_argument,       nullptr, 'S' },
   { "unix-socket-connection", required_argument, nullptr, 'u' },
   { "debug",                no_argument,       nullptr, 'D' },
@@ -76,6 +77,7 @@ void usage(const char* program_name) {
     << "  --rs-redundancy N             Extra Reed–Solomon packets as fraction. Default: 0.2\n"
     << "  --max-delay N                 Max delay (ms) waiting for buffer for RS. Default: 1\n"
     << "  --rtt-ms N                    Hint RTT (ms) for cold-start timeouts; 0 = auto from link. Default: 0\n"
+    << "  --connect-timeout N           SSH ConnectTimeout (seconds); 0 = no limit. Default: 30\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
     << "  --unix-socket-connection PATH Connect directly to Unix socket PATH instead of SSH -L\n"
     << "  --debug                       Write verbose debug logs to /tmp/ssh-oll-{client,server}-<pid>.log\n"
@@ -85,7 +87,7 @@ void usage(const char* program_name) {
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:Su:Dh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:Su:Dh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -117,6 +119,9 @@ bool parse_args(int argc, char* argv[], Args& out) {
           break;
         case 't':
           out.config.rtt_hint_ms = parse_unsigned(optarg, "--rtt-ms");
+          break;
+        case 'T':
+          out.config.connect_timeout_sec = parse_unsigned(optarg, "--connect-timeout");
           break;
         case 'S':
           out.server_mode = true;
