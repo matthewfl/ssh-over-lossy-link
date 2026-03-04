@@ -199,8 +199,9 @@ int run_client(const Args& args) {
     }
 
     const unsigned N = args.config.connections;
+    const unsigned initial_fork_count = std::min(5u, N);  // fork 5 initially; start connection sooner
 
-    for (unsigned i = 0; i < N; ++i) {
+    for (unsigned i = 0; i < initial_fork_count; ++i) {
       std::string local_path = client_dir + "/" + std::to_string(i);
       pid_t pid = fork();
       if (pid < 0) {
@@ -243,7 +244,7 @@ int run_client(const Args& args) {
     for (int wait_ms = 0; wait_ms < 30000; wait_ms += 200) {
       usleep(200 * 1000);
       bool any = false;
-      for (unsigned i = 0; i < N; ++i) {
+      for (unsigned i = 0; i < initial_fork_count; ++i) {
         std::string path = client_dir + "/" + std::to_string(i);
         if (access(path.c_str(), F_OK) == 0) { any = true; break; }
       }
@@ -394,7 +395,8 @@ int run_client(const Args& args) {
   ev.data.fd = STDIN_FILENO;
   epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
 
-  for (unsigned i = 0; i < N; ++i) {
+  const unsigned initial_connect_count = std::min(5u, args.config.connections);
+  for (unsigned i = 0; i < initial_connect_count; ++i) {
     std::string path = args.unix_socket_connection.empty() ? (client_dir + "/" + std::to_string(i)) : socket_path;
     int fd = connect_unix(path);
     if (fd < 0) {
@@ -605,8 +607,8 @@ int run_client(const Args& args) {
     for (auto it = carrier_pending_acks.begin(); it != carrier_pending_acks.end(); )
       if (carriers.count(it->first) == 0) it = carrier_pending_acks.erase(it);
       else ++it;
-    // Write-error removals: reset add throttle when dropping to 0 or below half target.
-    if (carriers_before > 0 && (carriers.empty() || carriers.size() <= target_carriers / 2))
+    // Write-error removals: reset add throttle when dropping below floor.
+    if (carriers_before > 0 && carriers.size() < target_carriers)
       last_add_carrier_ns = 0;
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
@@ -622,12 +624,11 @@ int run_client(const Args& args) {
     do_carrier_cleanup(fd, reason);
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
-    bool low_on_carriers = (carriers.size() <= 1 + target_carriers / 2);  // will be ≤ half after erase
     carriers.erase(fd);
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
-    // Mass death or drop below half: reset add throttle so floor maintenance can burst-add.
-    if (low_on_carriers)
+    // Below floor: reset add throttle so floor maintenance can burst back to target immediately.
+    if (carriers.size() < target_carriers)
       last_add_carrier_ns = 0;
   };
 
@@ -1477,10 +1478,11 @@ int run_client(const Args& args) {
       if ((carriers.size() < target_carriers || need_replacements)
           && now_f - last_add_carrier_ns >= floor_interval) {
         last_add_carrier_ns = now_f;
-        // When well below target (≤ half), burst-add to recover quickly; otherwise add one at a time.
-        unsigned add_limit = (carriers.empty() || carriers.size() <= target_carriers / 2)
-          ? std::min(5u, target_carriers)
-          : 1u;
+        // When below floor: burst to reach target quickly (e.g. 5→10). Cap at target so we don't overshoot.
+        // When at/above floor: add one at a time for replacements only.
+        unsigned to_floor = (carriers.size() < target_carriers)
+            ? static_cast<unsigned>(target_carriers - carriers.size()) : 0u;
+        unsigned add_limit = (to_floor > 0) ? std::min(5u, to_floor) : 1u;
         bool can_add = (add_limit > 1) || pending_carrier_paths.empty();
         if (!can_add) { /* skip */ }
         else if (!args.unix_socket_connection.empty()) {
