@@ -11,11 +11,11 @@ Ssh-oll solves this problem by layering a single SSH connection over several "ca
         |
         | (stdin/stdout via ProxyCommand)
         v
-  +------------------+                    +------------------+
+  +------------------+                    +-------------------+
   |  ssh-oll client  | ---- carrier 1 ---->|                  |
   |                  | ---- carrier 2 ---->|  ssh-oll server  | ----> localhost:22
-  |                  | ---- carrier N ---->|  (Unix socket)    |       (inner SSH)
-  +------------------+                    +------------------+
+  |                  | ---- carrier N ---->|  (Unix socket)   |       (inner SSH)
+  +------------------+                    +-------------------+
         ^                                        ^
         |                                        |
    lossy-ssh-host (multiple SSH sessions)   lossy-ssh-host
@@ -41,17 +41,34 @@ git clone https://github.com/matthewfl/ssh-over-lossy-link.git
 cd ssh-over-lossy-link
 make && make install
 ```
-On macOS, `make install` writes to `/usr/local/bin` (may require `sudo`). To install without sudo, copy the built `ssh-oll` binary to a directory in your PATH, e.g. `cp ssh-oll ~/bin/`.
-Then configure your `~/.ssh/config` as follows:
+
+Then configure your `~/.ssh/config` file as follows:
 ```
 Host lossy-ssh-connection
     HostName ip/hostname of remote ssh host
-    ProxyJump hostname-of-jump-host
+    ProxyJump hostname-of-jump-host                # can use ProxyJump or ProxyCommands on lossy host
+
+    # DO NOT have ControlMaster or ServerAliveInterval on the lossy connection
 
 Host good-ssh-connection
-    ProxyCommand ssh-oll lossy-ssh-connection
+    ProxyCommand ssh-oll lossy-ssh-connection     # configure ssh-oll as ProxyCommand
+    ConnectTimeout 120                            # initial connection may take longer than normal
+
+    ControlMaster auto                            # optional, reuse the same ssh connection for other sessions
+    ControlPath ~/.ssh/ssh-control-%C
+    ControlPersist 1m
+    ServerAliveInterval 15                        # optional, have ssh send keep alive pings
+    ServerAliveCountMax 10
 ```
 
+
+Then make sure you can ssh using the lossy connection without having to enter a password:
+```bash
+$ ssh-add                           # register ssh key with ssh agent
+$ ssh lossy-ssh-connection          # check that this works without entering a password
+
+$ ssh good-ssh-connection           # ssh connection now running over ssh-oll
+```
 
 ## Command line
 ```
@@ -60,10 +77,10 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --auto / --no-auto            Automatically adapt the number of carrier SSH connections and redundancy transmission rates. Default on
 --path-on-server              Path to the ssh-oll binary on the server.  Default to "ssh-oll" with the binary installed in the user's PATH.
 --connections [N]             How many carrier SSH connections to open initially.  Default 10 (a reasonable default for moderate loss; increase for worse links).
---max-connections [N]         Max number of carrier connections that can be opened.  Default 200
---packet-size [N]             The max bytes of a single "packet" sent across a connection.  Default 800
+--max-connections [N]         Max number of carrier connections that can be opened.  Default 50
+--packet-size [N]             The max bytes of a single "packet" sent across a connection.  Default 400
 --small-packet-redundancy [N] For buffered data smaller than packet-size, send N copies without Reed–Solomon. Default 2
---rs-redundancy [N]           Number of extra packets when using Reed–Solomon, as a fraction.  Default 0.2
+--rs-redundancy [N]           Number of extra packets when using Reed–Solomon, as a fraction.  Default 0.1
 --max-delay [N]               Max delay in ms for sending data while waiting for buffer to fill for Reed–Solomon.  Default 1ms
 --rtt-ms [N]                  Hint RTT (ms) for cold-start timeouts; 0 = auto from observed link latency. Use on high-latency links to avoid premature timeouts before first ACK. Default 0
 --server                      Start the server instance of ssh-oll.  Default off (client mode).
@@ -237,6 +254,8 @@ Example:
 ```
 
 Use `--unix-socket-connection` on the client to point at the proxy socket when driving the client manually.
+
+A collection of several tests can be run using `./test_all.sh`
 
 ## License
 

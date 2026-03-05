@@ -1,10 +1,14 @@
 #include "ssholl.h"
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <getopt.h>
 #include <iostream>
 #include <stdexcept>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace ssholl {
 
@@ -23,6 +27,7 @@ const struct option LONG_OPTS[] = {
   { "rtt-ms",               required_argument, nullptr, 't' },
   { "connect-timeout",      required_argument, nullptr, 'T' },
   { "min-data-per-minute",  required_argument, nullptr, 'M' },
+  { "file-lock",            required_argument, nullptr, 'F' },
   { "server",               no_argument,       nullptr, 'S' },
   { "unix-socket-connection", required_argument, nullptr, 'u' },
   { "debug",                no_argument,       nullptr, 'D' },
@@ -80,6 +85,7 @@ void usage(const char* program_name) {
     << "  --rtt-ms N                    Hint RTT (ms) for cold-start timeouts; 0 = auto from link. Default: 0\n"
     << "  --connect-timeout N           SSH ConnectTimeout (seconds); 0 = no limit. Default: 30\n"
     << "  --min-data-per-minute N       Send keepalive data so each carrier sends ≥N bytes/min. Default: 0\n"
+    << "  --file-lock PATH              Acquire exclusive lock on PATH before client start (15s timeout)\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
     << "  --unix-socket-connection PATH Connect directly to Unix socket PATH instead of SSH -L\n"
     << "  --debug                       Write verbose debug logs to /tmp/ssh-oll-{client,server}-<pid>.log\n"
@@ -89,7 +95,7 @@ void usage(const char* program_name) {
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:Su:Dh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:F:Su:Dh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -127,6 +133,9 @@ bool parse_args(int argc, char* argv[], Args& out) {
           break;
         case 'M':
           out.config.min_data_per_minute = parse_unsigned(optarg, "--min-data-per-minute");
+          break;
+        case 'F':
+          out.file_lock = optarg;
           break;
         case 'S':
           out.server_mode = true;
@@ -196,7 +205,33 @@ int main(int argc, char* argv[]) {
   ssholl::Args args;
   if (!ssholl::parse_args(argc, argv, args))
     return 1;
-  if (args.server_mode)
+  if (args.server_mode) {
     return ssholl::run_server(args);
+  }
+  if (!args.file_lock.empty()) {
+    int lock_fd = open(args.file_lock.c_str(), O_RDWR | O_CREAT, 0644);
+    if (lock_fd < 0) {
+      std::cerr << "ssh-oll: cannot open lock file: " << args.file_lock << "\n";
+      return 1;
+    }
+    const int timeout_sec = 15;
+    int elapsed = 0;
+    while (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+      if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        std::cerr << "ssh-oll: flock failed on " << args.file_lock << "\n";
+        close(lock_fd);
+        return 1;
+      }
+      if (elapsed >= timeout_sec) {
+        std::cerr << "ssh-oll: could not acquire lock on " << args.file_lock
+                  << " within " << timeout_sec << " seconds\n";
+        close(lock_fd);
+        return 1;
+      }
+      sleep(1);
+      elapsed++;
+    }
+    (void)lock_fd;  // hold lock for process lifetime; released on exit
+  }
   return ssholl::run_client(args);
 }

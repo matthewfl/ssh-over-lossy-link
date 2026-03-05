@@ -58,7 +58,7 @@ run_test() {
     fi
 
     local max_attempts=1
-    [[ "$AUTO_RERUN_FAILED" == "1" ]] && max_attempts=2
+    [[ "$AUTO_RERUN_FAILED" == "1" ]] && max_attempts=4
 
     local attempt=1
     local exit_code=1

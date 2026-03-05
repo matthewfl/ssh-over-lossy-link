@@ -107,7 +107,7 @@ struct Config {
   bool auto_adapt = true;
   std::string path_on_server = "ssh-oll";
   unsigned connections = 10;
-  unsigned max_connections = 200;
+  unsigned max_connections = 50;
   unsigned packet_size = 400;
   unsigned small_packet_redundancy = 2;
   float rs_redundancy = 0.1f;
@@ -129,6 +129,7 @@ struct Args {
   std::string remote_hostname = "localhost";
   uint16_t remote_port = 22;
   std::string unix_socket_connection;  // if non-empty, connect directly to this socket (no SSH -L)
+  std::string file_lock;              // if non-empty, acquire exclusive lock on this file before client start
 };
 
 // Parse argc/argv into Args. Returns true on success; otherwise prints usage
