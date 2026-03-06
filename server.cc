@@ -269,12 +269,16 @@ int run_server(const Args& args) {
     int err = get_so_error(backend_fd);
     if (err == 0) {
       backend_connected = true;
+      if (dbg) fprintf(dbg, "[backend-connected t=%llu]\n",
+                       (unsigned long long)(now_ns()/1000000ULL));
       int one = 1;
       setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
       ev.events = EPOLLIN;  // EPOLLOUT only when we have backend_pending data to write
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     } else if (err != EINPROGRESS && err != 0) {
+      if (dbg) fprintf(dbg, "[backend-connect-failed t=%llu errno=%d]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), err);
       close(backend_fd);
       backend_fd = -1;
     }
@@ -341,12 +345,18 @@ int run_server(const Args& args) {
         if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
                          (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1, reason);
       });
-    if (carriers.empty() && !unacked_data.empty())
+    if (carriers.empty() && !unacked_data.empty()) {
       retransmit_needed = true;
+      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_data.size());
+    }
     // If survivors remain after a write-error removal, force the retransmit check
     // to run on the next iteration so we retransmit onto survivors immediately.
-    if (any_removed && !carriers.empty() && !unacked_data.empty())
+    if (any_removed && !carriers.empty() && !unacked_data.empty()) {
       last_retransmit_check_ns = 0;
+      if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu survivors=%zu reason=write_error]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), carriers.size());
+    }
   };
 
   auto queue_ack_to_carrier = [&](int fd, uint64_t acked_id) {
@@ -511,6 +521,10 @@ int run_server(const Args& args) {
     runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
     runtime_rs_redundancy = pc.reed_solomon_redundancy;
     if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
+    if (dbg) fprintf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), max_packet,
+                     (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
+                     (int)runtime_auto_adapt);
     // When auto_adapt, send current config so client has initial sync; server will send again when it adapts.
     if (runtime_auto_adapt && !carriers.empty()) {
       last_sent_rs_redundancy = runtime_rs_redundancy;
@@ -573,6 +587,8 @@ int run_server(const Args& args) {
               retransmit_needed = false;
               auto& cs = carriers[client];
               const uint64_t retransmit_now = now_ns();
+              if (dbg) fprintf(dbg, "[retransmit-on-reconnect t=%llu fd=%d items=%zu]\n",
+                               (unsigned long long)(retransmit_now/1000000ULL), client, unacked_data.size());
               for (auto& [uid, ui] : unacked_data) {
                 if (ui.is_small) {
                   packet_io::append_small(cs.write_buf, uid, ui.data.data(), ui.data.size());
@@ -656,10 +672,16 @@ int run_server(const Args& args) {
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
-            if (carriers.empty() && !unacked_data.empty())
+            if (carriers.empty() && !unacked_data.empty()) {
               retransmit_needed = true;
-            if (!carriers.empty() && !unacked_data.empty())
+              if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
+                               (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd);
+            }
+            if (!carriers.empty() && !unacked_data.empty()) {
               last_retransmit_check_ns = 0;
+              if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
+                               (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
+            }
             carrier_removed = true;
           }
         }
@@ -669,10 +691,16 @@ int run_server(const Args& args) {
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
-          if (carriers.empty() && !unacked_data.empty())
+          if (carriers.empty() && !unacked_data.empty()) {
             retransmit_needed = true;
-          if (!carriers.empty() && !unacked_data.empty())
+            if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd);
+          }
+          if (!carriers.empty() && !unacked_data.empty()) {
             last_retransmit_check_ns = 0;
+            if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
+          }
         }
       }
     }
@@ -806,6 +834,9 @@ int run_server(const Args& args) {
         for (auto& [uid, ui] : unacked_data) {
           if (ui.send_ns == 0 || now_ns_val - ui.send_ns < retransmit_timeout_ns) continue;
           if (ui.is_small) {
+            if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
+                             (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL), small_rt_copies);
             for (unsigned c = 0; c < small_rt_copies; ++c) {
               int cfd = rt_carriers[(rt_idx + c) % rt_carriers.size()];
               packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
@@ -825,6 +856,10 @@ int run_server(const Args& args) {
               for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
               reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
             }
+            if (dbg) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
+                             (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL),
+                             ui.n, ui.k, rt_carriers.size());
             std::set<int> touched;
             for (unsigned si = 0; si < ui.n; ++si) {
               int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
@@ -855,9 +890,13 @@ int run_server(const Args& args) {
       uint64_t rs_stale_ns = scaled_ns(4, 10000000000ULL, 60000000000ULL);
       // Evict stale incomplete RS groups (memory management only — no gap-jump).
       for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > rs_stale_ns)
+        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > rs_stale_ns) {
+          if (dbg) fprintf(dbg, "[rs-stale-evict t=%llu id=%llu age_ms=%llu shards_had=%zu k=%u n=%u]\n",
+                           (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)it->first,
+                           (unsigned long long)((now_ns_val - it->second.first_recv_ns)/1000000ULL),
+                           it->second.shards.size(), it->second.k, it->second.n);
           it = rs_pending.erase(it);
-        else
+        } else
           ++it;
       }
       // Deliver any reassembly entries that are now contiguous from next_deliver_id.
@@ -876,8 +915,12 @@ int run_server(const Args& args) {
           // for the retransmit to fill it.
           bool has_higher = !reassembly.empty() || !rs_pending.empty();
           if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
-          if (next_deliver_id_stuck_since_ns == 0)
+          if (next_deliver_id_stuck_since_ns == 0) {
             next_deliver_id_stuck_since_ns = now_ns_val;
+            if (dbg) fprintf(dbg, "[gap-detected t=%llu next_deliver_id=%llu reassembly=%zu rs_pending=%zu]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)next_deliver_id,
+                             reassembly.size(), rs_pending.size());
+          }
           break;
         }
       }
@@ -911,6 +954,9 @@ int run_server(const Args& args) {
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
         last_sent_small_packet_redundancy = runtime_small_packet_redundancy;
+        if (dbg) fprintf(dbg, "[adapt-config-sent t=%llu rs_red=%.2f small_copies=%u carriers=%zu]\n",
+                         (unsigned long long)(now_ns_val/1000000ULL), (double)runtime_rs_redundancy,
+                         (unsigned)runtime_small_packet_redundancy, carriers.size());
         queue_server_config_to_carrier(carriers.begin()->first);
       }
     }

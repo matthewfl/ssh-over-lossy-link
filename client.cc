@@ -514,6 +514,8 @@ int run_client(const Args& args) {
           return;
         }
         // Unrecoverable write error (e.g. EPIPE): discard buffered output.
+        if (dbg) fprintf(dbg, "[stdout-write-err t=%llu errno=%d discarded=%zu]\n",
+                         (unsigned long long)(now_ns()/1000000ULL), errno, stdout_buf.size());
         stdout_buf.clear();
         if (stdout_in_epoll) {
           epoll_ctl(epfd, EPOLL_CTL_DEL, STDOUT_FILENO, nullptr);
@@ -568,6 +570,9 @@ int run_client(const Args& args) {
     effective_small_packet_redundancy = (psc.small_packet_redundancy != 0) ? psc.small_packet_redundancy : 2u;
     effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
     backpressure_write_threshold = 150 * effective_max_packet;
+    if (dbg) fprintf(dbg, "[server-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), effective_max_packet,
+                     (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy);
   };
   std::mt19937 keepalive_gen(std::random_device{}());
   recv_cb.on_ping = [&](int fd, uint64_t id, size_t payload_size) {
@@ -642,7 +647,11 @@ int run_client(const Args& args) {
       unlink((client_dir + "/" + std::to_string(idx)).c_str());
       fd_to_ssh_index.erase(idx_it);
     }
-    if (carriers.size() == 1 && !unacked_sends.empty()) retransmit_needed = true;
+    if (carriers.size() == 1 && !unacked_sends.empty()) {
+      retransmit_needed = true;
+      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=last_carrier_dying]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size());
+    }
   };
   auto flush_carrier_writes = [&]() {
     size_t carriers_before = carriers.size();
@@ -655,8 +664,11 @@ int run_client(const Args& args) {
     // Write-error removals: reset add throttle when dropping below floor.
     if (carriers_before > 0 && carriers.size() < target_carriers)
       last_add_carrier_ns = 0;
-    if (carriers.empty() && !unacked_sends.empty())
+    if (carriers.empty() && !unacked_sends.empty()) {
       retransmit_needed = true;
+      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size());
+    }
   };
 
   // fd_to_ssh_index is declared and populated above in the initial connect loop.
@@ -670,13 +682,19 @@ int run_client(const Args& args) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     carriers.erase(fd);
-    if (carriers.empty() && !unacked_sends.empty())
+    if (carriers.empty() && !unacked_sends.empty()) {
       retransmit_needed = true;
+      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(), fd);
+    }
     // If survivors remain, force the retransmit check to run on the next iteration
     // rather than waiting up to 500 ms for the periodic tick. Shards on the dead
     // carrier were almost certainly lost; the sooner we retransmit the better.
-    if (!carriers.empty() && !unacked_sends.empty())
+    if (!carriers.empty() && !unacked_sends.empty()) {
       last_retransmit_check_ns = 0;
+      if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(), fd, carriers.size());
+    }
     // Below floor: reset add throttle so floor maintenance can burst back to target immediately.
     if (carriers.size() < target_carriers)
       last_add_carrier_ns = 0;
@@ -741,6 +759,8 @@ int run_client(const Args& args) {
         // Signal interrupted the wait; re-check shutdown flag at the top of the loop.
         continue;
       }
+      if (dbg) fprintf(dbg, "[epoll-wait-error t=%llu errno=%d]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), errno);
       break;
     }
 
@@ -871,6 +891,8 @@ int run_client(const Args& args) {
       if (fd == STDOUT_FILENO) {
         if (e & (EPOLLERR | EPOLLHUP)) {
           // Write end of stdout pipe broken; discard remaining output.
+          if (dbg) fprintf(dbg, "[stdout-broken t=%llu discarded=%zu reason=epoll_err_hup]\n",
+                           (unsigned long long)(now_ns()/1000000ULL), stdout_buf.size());
           stdout_buf.clear();
           epoll_ctl(epfd, EPOLL_CTL_DEL, STDOUT_FILENO, nullptr);
           stdout_in_epoll = false;
@@ -902,6 +924,8 @@ int run_client(const Args& args) {
             if (retransmit_needed && !unacked_sends.empty()) {
               retransmit_needed = false;
               const uint64_t retransmit_now = now_ns();
+              if (dbg) fprintf(dbg, "[retransmit-on-reconnect t=%llu fd=%d items=%zu]\n",
+                               (unsigned long long)(retransmit_now/1000000ULL), fd, unacked_sends.size());
               for (auto& [uid, ui] : unacked_sends) {
                 if (ui.is_small) {
                   packet_io::append_small(it->second.write_buf, uid,
@@ -1202,8 +1226,13 @@ int run_client(const Args& args) {
           if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
         uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);
-        if (now_p - last_global_recv_ns > global_idle_ns)
+        if (now_p - last_global_recv_ns > global_idle_ns) {
+          if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu last_recv_ms=%llu threshold_ms=%llu]\n",
+                           (unsigned long long)(now_p/1000000ULL),
+                           (unsigned long long)(last_global_recv_ns/1000000ULL),
+                           (unsigned long long)(global_idle_ns/1000000ULL));
           running = false;
+        }
       }
     }
 
@@ -1430,6 +1459,9 @@ int run_client(const Args& args) {
           for (auto& [uid, ui] : unacked_sends) {
             if (ui.send_ns == 0 || now_p - ui.send_ns < retransmit_timeout_ns) continue;
             if (ui.is_small) {
+              if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
+                               (unsigned long long)(now_p/1000000ULL), (unsigned long long)uid,
+                               (unsigned long long)((now_p - ui.send_ns)/1000000ULL), small_rt_copies);
               for (unsigned c = 0; c < small_rt_copies; ++c) {
                 int cfd = rt_carriers[(rt_idx + c) % rt_carriers.size()];
                 packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
@@ -1450,6 +1482,10 @@ int run_client(const Args& args) {
                 for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
                 reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
               }
+              if (dbg) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu]\n",
+                               (unsigned long long)(now_p/1000000ULL), (unsigned long long)uid,
+                               (unsigned long long)((now_p - ui.send_ns)/1000000ULL),
+                               ui.n, ui.k, rt_carriers.size());
               std::set<int> touched;
               for (unsigned si = 0; si < ui.n; ++si) {
                 int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
@@ -1504,9 +1540,13 @@ int run_client(const Args& args) {
         // When the sender retransmits, fresh shards will repopulate rs_pending and
         // the group will decode normally once k shards accumulate.
         for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > rs_stale_ns)
+          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > rs_stale_ns) {
+            if (dbg) fprintf(dbg, "[rs-stale-evict t=%llu id=%llu age_ms=%llu shards_had=%zu k=%u n=%u]\n",
+                             (unsigned long long)(now_p/1000000ULL), (unsigned long long)it->first,
+                             (unsigned long long)((now_p - it->second.first_recv_ns)/1000000ULL),
+                             it->second.shards.size(), it->second.k, it->second.n);
             it = rs_pending.erase(it);
-          else
+          } else
             ++it;
         }
         // Deliver any reassembly entries that are now contiguous from next_deliver_id.
@@ -1525,8 +1565,12 @@ int run_client(const Args& args) {
             // Do NOT jump — wait for the retransmit to fill it.
             bool has_higher = !reassembly.empty() || !rs_pending.empty();
             if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
-            if (next_deliver_id_stuck_since_ns == 0)
+            if (next_deliver_id_stuck_since_ns == 0) {
               next_deliver_id_stuck_since_ns = now_p;
+              if (dbg) fprintf(dbg, "[gap-detected t=%llu next_deliver_id=%llu reassembly=%zu rs_pending=%zu]\n",
+                               (unsigned long long)(now_p/1000000ULL), (unsigned long long)next_deliver_id,
+                               reassembly.size(), rs_pending.size());
+            }
             break;
           }
         }
@@ -1670,8 +1714,11 @@ int run_client(const Args& args) {
       } else {
         can_reconnect = (find_free_ssh_index() < max_connections);
       }
-      if (!can_reconnect)
+      if (!can_reconnect) {
+        if (dbg) fprintf(dbg, "[client-exit-no-reconnect t=%llu carriers=%zu]\n",
+                         (unsigned long long)(now_ns()/1000000ULL), carriers.size());
         running = false;
+      }
     }
   }
 
