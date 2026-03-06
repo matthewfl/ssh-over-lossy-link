@@ -938,7 +938,24 @@ int run_server(const Args& args) {
         // n must not exceed n_carriers so every shard lands on a different carrier.
         unsigned n = std::min(k + m, n_carriers);
         m = n - k;
-        if (m == 0) break;  // Single carrier: can't do RS (need m>=1). Wait for more carriers.
+        if (m == 0) {
+          // Single carrier: can't do RS (need m>=1). Send one block as SMALL and continue
+          // draining, matching the client-side behaviour. Do NOT break — falling through to
+          // the "sub-block remainder" path would send the entire (potentially huge) buffer
+          // as one SMALL packet, whose size field can exceed MAX_PACKET_PAYLOAD and cause
+          // the receiver to close the connection (READ_BUF_SIZE=65536 > MAX_PACKET_PAYLOAD=16384).
+          size_t chunk = block_size;
+          {
+            UnackedItem ui;
+            ui.data.assign(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+            ui.is_small = true;
+            ui.send_ns = now_ns();
+            unacked_data[next_send_id] = std::move(ui);
+          }
+          queue_small_to_carriers(backend_read_buf.data(), chunk);
+          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+          continue;
+        }
         std::vector<const uint8_t*> data_ptrs(k);
         for (unsigned i = 0; i < k; ++i)
           data_ptrs[i] = backend_read_buf.data() + i * block_size;
