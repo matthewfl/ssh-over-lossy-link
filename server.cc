@@ -385,27 +385,44 @@ int run_server(const Args& args) {
   std::deque<BackendItem> backend_pending;
 
   auto flush_backend_pending = [&]() {
-    if (backend_fd < 0 || !backend_connected || backend_pending.empty()) return;
-    auto& front = backend_pending.front();
-    ssize_t n = write(backend_fd, front.data.data(), front.data.size());
-    if (n <= 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    // Drain as many items as possible in one call. This matters when many RS groups
+    // decode simultaneously (e.g. 40 carriers all delivering at once): queuing each
+    // item and returning after only one write would leave the backlog growing unboundedly
+    // and delay ACKs by O(backlog) epoll iterations.
+    while (backend_fd >= 0 && backend_connected && !backend_pending.empty()) {
+      auto& front = backend_pending.front();
+      ssize_t n = write(backend_fd, front.data.data(), front.data.size());
+      if (n <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          // Kernel buffer full: re-arm EPOLLOUT so we resume when space is available.
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = backend_fd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+        } else {
+          // Real write error (EPIPE, ECONNRESET, etc.): backend connection is broken.
+          // Close it now so we stop trying to write on every iteration. The server
+          // will detect no usable backend on the next iteration and stop running.
+          if (dbg) fprintf(dbg, "[backend-write-err t=%llu errno=%d]\n",
+                           (unsigned long long)(now_ns()/1000000ULL), errno);
+          epoll_ctl(epfd, EPOLL_CTL_DEL, backend_fd, nullptr);
+          close(backend_fd);
+          backend_fd = -1;
+          backend_connected = false;
+        }
+        return;
+      }
+      front.data.erase(front.data.begin(), front.data.begin() + n);
+      if (!front.data.empty()) {
+        // Partial write: kernel buffer accepted some bytes but not all. Re-arm EPOLLOUT
+        // so we resume writing the remainder when space is available.
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = backend_fd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+        return;
       }
-      return;
-    }
-    front.data.erase(front.data.begin(), front.data.begin() + n);
-    if (front.data.empty()) {
       uint64_t acked_id = front.id;
       int cfd = front.completing_fd;
       backend_pending.pop_front();
-      if (backend_pending.empty()) {
-        ev.events = EPOLLIN;
-        ev.data.fd = backend_fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
-      }
       // ACK on the completing carrier: gives the client accurate per-carrier RTT with no extra packets.
       // Fall back to any available carrier if completing_fd was already closed.
       if (!carriers.empty()) {
@@ -415,6 +432,11 @@ int run_server(const Args& args) {
         ev.data.fd = cfd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
       }
+    }
+    if (backend_fd >= 0 && backend_pending.empty()) {
+      ev.events = EPOLLIN;
+      ev.data.fd = backend_fd;
+      epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     }
   };
 
@@ -998,6 +1020,13 @@ int run_server(const Args& args) {
     }
     flush_backend_pending();
     flush_carrier_writes();
+    // If the backend write failed and was closed, stop running — there's nowhere to
+    // deliver client data and no way to send sshd's responses to the client.
+    if (backend_fd < 0 && backend_connected == false && !backend_pending.empty()) {
+      if (dbg) fprintf(dbg, "[backend-closed-with-pending t=%llu pending=%zu]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), backend_pending.size());
+      running = false;
+    }
     if (dbg) {
       static uint64_t loop_count = 0;
       static uint64_t last_log_ns = 0;
