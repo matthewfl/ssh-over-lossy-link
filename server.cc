@@ -840,10 +840,13 @@ int run_server(const Args& args) {
           bool has_higher = !reassembly.empty() || !rs_pending.empty();
           if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
           bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
-          bool no_carriers        = carriers.empty();
           bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
                                      now_ns_val - next_deliver_id_stuck_since_ns >= rs_stale_ns);
-          if (explicitly_drained || no_carriers || gap_timed_out) {
+          // NOTE: do NOT jump on no_carriers alone. When all carriers die the
+          // client retransmits on reconnect (within ~1-2s on typical links).
+          // Jumping immediately races against that retransmit and silently
+          // drops data that was simply lost in transit on the dead carriers.
+          if (explicitly_drained || gap_timed_out) {
             uint64_t nxt = UINT64_MAX;
             if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
             if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);

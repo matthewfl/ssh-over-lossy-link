@@ -1492,11 +1492,13 @@ int run_client(const Args& args) {
         //
         // Gap-jump rules (to avoid the RS+SMALL-split race):
         //  1. Always jump a gap that was explicitly stale-drained (partial shards timed out).
-        //  2. Always jump when all carriers are dead (shards can never arrive).
-        //  3. Jump a gap that has been continuously present for > rs_stale_ns —
+        //  2. Jump a gap that has been continuously present for > rs_stale_ns —
         //     this covers RS groups where NO shard ever arrived while giving
         //     enough time for retransmission to succeed before we give up.
         //  Never jump a gap that just appeared (out-of-order SMALL/RS race).
+        //  Never jump on no_carriers alone: when all carriers die the peer
+        //  retransmits on reconnect; jumping immediately races that retransmit
+        //  and silently drops data lost in transit on the dead carriers.
         while (true) {
           auto ra = reassembly.find(next_deliver_id);
           if (ra != reassembly.end()) {
@@ -1515,10 +1517,9 @@ int run_client(const Args& args) {
               break;
             }
             bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
-            bool no_carriers        = carriers.empty();
             bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
                                        now_p - next_deliver_id_stuck_since_ns >= rs_stale_ns);
-            if (explicitly_drained || no_carriers || gap_timed_out) {
+            if (explicitly_drained || gap_timed_out) {
               uint64_t nxt = UINT64_MAX;
               if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
               if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
