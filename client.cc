@@ -600,10 +600,13 @@ int run_client(const Args& args) {
     if (rtt_ns != 0) {
       auto it_c = carriers.find(fd);
       if (it_c != carriers.end()) it_c->second.last_rtt_ns = rtt_ns;
-      if (args.config.auto_adapt) {
-        recent_rtt_ns.push_back(rtt_ns);
-        while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
-      }
+      // Always record RTT samples regardless of auto_adapt. RTT drives all timeout
+      // scaling (retransmit, dead_idle, ping, rs_stale) — not just carrier adaptation.
+      // Without this, non-auto_adapt mode uses the conservative 5s default for all
+      // timeouts and the 2.5s hardcoded retransmit, mismatching the server which always
+      // scales from measured RTT.
+      recent_rtt_ns.push_back(rtt_ns);
+      while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
     }
     // Data confirmed delivered: no longer need to retransmit.
     for (auto it_u = unacked_sends.begin(); it_u != unacked_sends.end() && it_u->first <= acked_id; )

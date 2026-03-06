@@ -1010,7 +1010,11 @@ int run_server(const Args& args) {
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
       }
       // Any sub-block remainder: send as SMALL (no RS needed for < block_size).
-      if (!backend_read_buf.empty() && !carriers.empty()) {
+      // The RS loop above exits only when backend_read_buf.size() < block_size (natural
+      // exit) or carriers.empty() (early exit). The explicit size check matches the
+      // equivalent guard on the client side and prevents a too-large SMALL packet if
+      // somehow a full block remains (e.g. future code change removes the m==0 continue).
+      if (!backend_read_buf.empty() && backend_read_buf.size() < block_size && !carriers.empty()) {
         size_t chunk = backend_read_buf.size();
         { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.end());
           ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
