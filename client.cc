@@ -792,11 +792,10 @@ int run_client(const Args& args) {
             ui.send_ns = now_ns();
             unacked_sends[next_send_id] = std::move(ui);
             auto it = carriers.begin();
-            queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
+            queue_to_carrier(it->first, stdin_buf.data(), chunk, false);  // increments next_send_id
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = it->first;
             epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
-            next_send_id++;
             stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
             continue;
           }

@@ -13,7 +13,7 @@ namespace ssholl {
 
 namespace packet_io {
 
-const size_t MAX_PACKET_PAYLOAD = 65536;
+const size_t MAX_PACKET_PAYLOAD = 16384;
 const size_t READ_BUF_SIZE = 65536;
 // Sanity limit: reject packet ids this far ahead of next_deliver_id (guards against bogus ids).
 constexpr uint64_t MAX_ID_AHEAD = 10000000ULL;
