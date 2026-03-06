@@ -334,13 +334,19 @@ int run_server(const Args& args) {
   };
 
   auto flush_carrier_writes = [&]() {
+    bool any_removed = false;
     packet_io::flush_carrier_writes(carriers, epfd, ev, nullptr,
       [&](int fd, const char* reason) {
+        any_removed = true;
         if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
                          (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1, reason);
       });
     if (carriers.empty() && !unacked_data.empty())
       retransmit_needed = true;
+    // If survivors remain after a write-error removal, force the retransmit check
+    // to run on the next iteration so we retransmit onto survivors immediately.
+    if (any_removed && !carriers.empty() && !unacked_data.empty())
+      last_retransmit_check_ns = 0;
   };
 
   auto queue_ack_to_carrier = [&](int fd, uint64_t acked_id) {
@@ -652,6 +658,8 @@ int run_server(const Args& args) {
             carriers.erase(it);
             if (carriers.empty() && !unacked_data.empty())
               retransmit_needed = true;
+            if (!carriers.empty() && !unacked_data.empty())
+              last_retransmit_check_ns = 0;
             carrier_removed = true;
           }
         }
@@ -663,6 +671,8 @@ int run_server(const Args& args) {
           carriers.erase(it);
           if (carriers.empty() && !unacked_data.empty())
             retransmit_needed = true;
+          if (!carriers.empty() && !unacked_data.empty())
+            last_retransmit_check_ns = 0;
         }
       }
     }
@@ -782,9 +792,11 @@ int run_server(const Args& args) {
     if (!unacked_data.empty() && !carriers.empty()
         && now_ns_val - last_retransmit_check_ns >= 500000000ULL) {
       last_retransmit_check_ns = now_ns_val;
+      // 4×RTT, floored at 500 ms. Mirrors the client change: the old 2 s floor caused
+      // multi-second stalls after carrier death on low-latency test links.
       uint64_t retransmit_timeout_ns = (server_recent_rtt_ns.size() >= 2)
-          ? scaled_ns(4, 2000000000ULL, 60000000000ULL)
-          : 2500000000ULL;  // 2.5 s when no RTT known
+          ? scaled_ns(4, 500000000ULL, 60000000000ULL)
+          : 2500000000ULL;  // 2.5 s when no RTT known yet (cold start)
       std::vector<int> rt_carriers;
       for (auto& [cfd, cs] : carriers)
         if (!cs.connecting) rt_carriers.push_back(cfd);
@@ -833,21 +845,22 @@ int run_server(const Args& args) {
       }
     }
 
+    // RS stale-group drain: evict incomplete groups from memory after 4×RTT (min 10 s).
+    // We do NOT jump next_deliver_id. Jumping introduces a hole in the SSH byte stream,
+    // which SSH detects as a MAC failure and closes the connection. Instead we wait for
+    // the retransmit path to fill the gap; if the sender is truly gone, global_idle_ns
+    // will close the connection cleanly.
     if (now_ns_val - last_rs_drain_ns >= 1000000000ULL) {
       last_rs_drain_ns = now_ns_val;
       uint64_t rs_stale_ns = scaled_ns(4, 10000000000ULL, 60000000000ULL);
-      // Collect only the IDs that were actually erased (had partial shards and
-      // timed out).  We must never gap-jump past IDs that simply haven't received
-      // any shard yet — those shards may still arrive.
-      std::vector<uint64_t> drained_ids;
+      // Evict stale incomplete RS groups (memory management only — no gap-jump).
       for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > rs_stale_ns) {
-          drained_ids.push_back(it->first);
+        if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > rs_stale_ns)
           it = rs_pending.erase(it);
-        } else
+        else
           ++it;
       }
-      std::set<uint64_t> drained_set(drained_ids.begin(), drained_ids.end());
+      // Deliver any reassembly entries that are now contiguous from next_deliver_id.
       while (true) {
         auto ra = reassembly.find(next_deliver_id);
         if (ra != reassembly.end()) {
@@ -856,34 +869,16 @@ int run_server(const Args& args) {
           next_deliver_id++;
           next_deliver_id_stuck_since_ns = 0;
         } else if (rs_pending.count(next_deliver_id)) {
-          next_deliver_id_stuck_since_ns = 0;
+          next_deliver_id_stuck_since_ns = 0;  // decoding in progress, not stuck
           break;
         } else {
+          // Gap: ID absent from both reassembly and rs_pending. Do NOT jump — wait
+          // for the retransmit to fill it.
           bool has_higher = !reassembly.empty() || !rs_pending.empty();
           if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
-          bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
-          bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
-                                     now_ns_val - next_deliver_id_stuck_since_ns >= rs_stale_ns);
-          // NOTE: do NOT jump on no_carriers alone. When all carriers die the
-          // client retransmits on reconnect (within ~1-2s on typical links).
-          // Jumping immediately races against that retransmit and silently
-          // drops data that was simply lost in transit on the dead carriers.
-          if (explicitly_drained || gap_timed_out) {
-            uint64_t nxt = UINT64_MAX;
-            if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
-            if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
-            if (nxt > next_deliver_id + MAX_ID_AHEAD) break;  // sanity: prevent bogus jump
-            if (nxt > next_deliver_id && nxt < UINT64_MAX) {
-              next_deliver_id = nxt;
-              next_deliver_id_stuck_since_ns = 0;
-            } else {
-              break;
-            }
-          } else {
-            if (next_deliver_id_stuck_since_ns == 0)
-              next_deliver_id_stuck_since_ns = now_ns_val;
-            break;
-          }
+          if (next_deliver_id_stuck_since_ns == 0)
+            next_deliver_id_stuck_since_ns = now_ns_val;
+          break;
         }
       }
     }

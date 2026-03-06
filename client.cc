@@ -672,6 +672,11 @@ int run_client(const Args& args) {
     carriers.erase(fd);
     if (carriers.empty() && !unacked_sends.empty())
       retransmit_needed = true;
+    // If survivors remain, force the retransmit check to run on the next iteration
+    // rather than waiting up to 500 ms for the periodic tick. Shards on the dead
+    // carrier were almost certainly lost; the sooner we retransmit the better.
+    if (!carriers.empty() && !unacked_sends.empty())
+      last_retransmit_check_ns = 0;
     // Below floor: reset add throttle so floor maintenance can burst back to target immediately.
     if (carriers.size() < target_carriers)
       last_add_carrier_ns = 0;
@@ -1406,9 +1411,13 @@ int run_client(const Args& args) {
       if (!unacked_sends.empty() && !carriers.empty()
           && now_p - last_retransmit_check_ns >= 500000000ULL) {
         last_retransmit_check_ns = now_p;
+        // 4×RTT, floored at 500 ms (not 2 s). On the test link (50 ms latency, ~100 ms RTT)
+        // the old 2 s floor meant a dying carrier caused a 2+ s stall before retransmit.
+        // 500 ms is still 5× the one-way latency on that link — conservative enough to
+        // avoid duplicate traffic on healthy connections, aggressive enough to recover fast.
         uint64_t retransmit_timeout_ns = (recent_rtt_ns.size() >= 2)
-            ? scaled_ns(4, 2000000000ULL, 60000000000ULL)
-            : 2500000000ULL;  // 2.5 s when no RTT known
+            ? scaled_ns(4, 500000000ULL, 60000000000ULL)
+            : 2500000000ULL;  // 2.5 s when no RTT known yet (cold start)
         // Collect all ready (non-connecting) carriers for round-robin retransmit.
         // Spreading shards across multiple carriers means no single carrier failure
         // can wipe out a retransmit attempt.
@@ -1483,73 +1492,42 @@ int run_client(const Args& args) {
         fflush(dbg);
       }
 
-      // RS stale-group drain: safety net for RS groups that can never complete.
-      // After 4×RTT, drop incomplete group so later groups can be delivered. Scales with link.
+      // RS stale-group drain: evict incomplete groups from memory after 4×RTT (min 10 s).
+      // We do NOT jump next_deliver_id here. Jumping would introduce a hole in the SSH
+      // byte stream, which SSH detects as a MAC failure and closes the connection — exactly
+      // the "stall is the last thing" symptom. Instead we wait for the retransmit path
+      // to fill any gap. If the sender is truly dead, global_idle_ns closes the connection.
       if (now_p - last_rs_drain_ns >= 1000000000ULL) {
         last_rs_drain_ns = now_p;
         uint64_t rs_stale_ns = scaled_ns(4, 10000000000ULL, 60000000000ULL);
-        // Collect IDs that are actually being erased (had partial shards but timed out).
-        // We must only gap-jump past IDs that were genuinely stale — not past IDs that
-        // simply haven't received any shard yet (e.g. a SMALL arrived before the RS shard).
-        std::vector<uint64_t> drained_ids;
+        // Evict stale incomplete RS groups (memory management only — no gap-jump).
+        // When the sender retransmits, fresh shards will repopulate rs_pending and
+        // the group will decode normally once k shards accumulate.
         for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
-          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > rs_stale_ns) {
-            drained_ids.push_back(it->first);
+          if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > rs_stale_ns)
             it = rs_pending.erase(it);
-          } else
+          else
             ++it;
         }
-        // Build a set of drained IDs for O(1) lookup in the loop below.
-        std::set<uint64_t> drained_set(drained_ids.begin(), drained_ids.end());
-        // Advance next_deliver_id past any gaps left by the drain, delivering
-        // any reassembly entries that were previously blocked behind them.
-        //
-        // Gap-jump rules (to avoid the RS+SMALL-split race):
-        //  1. Always jump a gap that was explicitly stale-drained (partial shards timed out).
-        //  2. Jump a gap that has been continuously present for > rs_stale_ns —
-        //     this covers RS groups where NO shard ever arrived while giving
-        //     enough time for retransmission to succeed before we give up.
-        //  Never jump a gap that just appeared (out-of-order SMALL/RS race).
-        //  Never jump on no_carriers alone: when all carriers die the peer
-        //  retransmits on reconnect; jumping immediately races that retransmit
-        //  and silently drops data lost in transit on the dead carriers.
+        // Deliver any reassembly entries that are now contiguous from next_deliver_id.
         while (true) {
           auto ra = reassembly.find(next_deliver_id);
           if (ra != reassembly.end()) {
             recv_cb.on_deliver(-1, next_deliver_id, ra->second.data(), ra->second.size());
             reassembly.erase(ra);
             next_deliver_id++;
-            next_deliver_id_stuck_since_ns = 0;  // gap resolved
+            next_deliver_id_stuck_since_ns = 0;
           } else if (rs_pending.count(next_deliver_id)) {
-            next_deliver_id_stuck_since_ns = 0;  // waiting normally, not stuck
+            next_deliver_id_stuck_since_ns = 0;  // decoding in progress, not stuck
             break;
           } else {
-            // Gap: next_deliver_id is absent from both reassembly and rs_pending.
+            // Gap: ID is absent from both reassembly and rs_pending.
+            // Do NOT jump — wait for the retransmit to fill it.
             bool has_higher = !reassembly.empty() || !rs_pending.empty();
-            if (!has_higher) {
-              next_deliver_id_stuck_since_ns = 0;
-              break;
-            }
-            bool explicitly_drained = drained_set.count(next_deliver_id) > 0;
-            bool gap_timed_out      = (next_deliver_id_stuck_since_ns > 0 &&
-                                       now_p - next_deliver_id_stuck_since_ns >= rs_stale_ns);
-            if (explicitly_drained || gap_timed_out) {
-              uint64_t nxt = UINT64_MAX;
-              if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
-              if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
-              if (nxt > next_deliver_id + MAX_ID_AHEAD) break;  // sanity: prevent bogus jump
-              if (nxt > next_deliver_id && nxt < UINT64_MAX) {
-                next_deliver_id = nxt;
-                next_deliver_id_stuck_since_ns = 0;
-              } else {
-                break;
-              }
-            } else {
-              // Gap just appeared or retransmit still in flight — start/continue timer.
-              if (next_deliver_id_stuck_since_ns == 0)
-                next_deliver_id_stuck_since_ns = now_p;
-              break;
-            }
+            if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
+            if (next_deliver_id_stuck_since_ns == 0)
+              next_deliver_id_stuck_since_ns = now_p;
+            break;
           }
         }
       }
