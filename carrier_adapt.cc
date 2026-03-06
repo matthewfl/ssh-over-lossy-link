@@ -101,7 +101,11 @@ CarrierQualityResult assess_carriers(
 
   for (const auto& c : carriers) {
     if (now_ns - c.connect_ns < grace_ns) continue;
-    uint64_t last_activity = std::max(c.connect_ns, c.last_recv_ns);
+    // Use the most recent of connect, last recv, or last send.
+    // Including last_send prevents falsely closing a carrier that is actively
+    // pushing data outward but hasn't received a response yet (e.g. full write
+    // buffer suppressing PINGs on both sides under heavy bidirectional load).
+    uint64_t last_activity = std::max({c.connect_ns, c.last_recv_ns, c.last_send_ns});
     if (now_ns - last_activity > dead_idle_ns)
       res.dead_idle_fds.push_back(c.fd);
   }

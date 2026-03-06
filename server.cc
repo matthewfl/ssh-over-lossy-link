@@ -678,7 +678,7 @@ int run_server(const Args& args) {
 
       std::vector<carrier_adapt::CarrierInfo> carrier_infos;
       for (auto& [cfd, cs] : carriers) {
-        carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns});
+        carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns, cs.last_send_ns});
       }
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
 

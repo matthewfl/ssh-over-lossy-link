@@ -1121,7 +1121,7 @@ int run_client(const Args& args) {
         std::vector<carrier_adapt::CarrierInfo> carrier_infos;
         for (auto& [cfd, cs] : carriers) {
           if (cs.connecting) continue;
-          carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns});
+          carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns, cs.last_send_ns});
         }
         auto quality = carrier_adapt::assess_carriers(carrier_infos, now_p, scaled_ns);
 
@@ -1166,11 +1166,22 @@ int run_client(const Args& args) {
           }
         }
 
-        for (int cfd : quality.dead_idle_fds)
-          add_to_pending_reap(cfd, "dead_idle");
+        for (int cfd : quality.dead_idle_fds) {
+          if (carriers.size() > target_carriers) {
+            // Above target and dead: close immediately so floor maintenance can add
+            // fresh replacements without waiting for the 60s slow-reduction rate limit.
+            // Keeping dead fds in carriers.size() would block new connections for minutes.
+            remove_carrier(cfd, "dead_idle");
+          } else {
+            // At or below target: wait for a replacement to connect before closing,
+            // so we don't drop below the carrier floor during reconnection.
+            add_to_pending_reap(cfd, "dead_idle");
+          }
+        }
 
-        // When above target: don't add replacements. Slowly close from pending (1 per 60s).
-        // Extra carriers were useful for traffic; keep them until they go idle, then slowly reduce.
+        // When above target: slowly close HEALTHY pending-reap carriers (1 per 60s).
+        // Dead carriers above target are handled immediately above; this path only
+        // applies to live-but-scheduled-for-replacement carriers (e.g. rtt_outlier).
         if (carriers.size() > target_carriers && !pending_reap.empty()
             && now_p - last_reduction_close_ns >= reduction_close_interval_ns) {
           last_reduction_close_ns = now_p;
@@ -1203,7 +1214,7 @@ int run_client(const Args& args) {
       std::vector<carrier_adapt::CarrierInfo> carrier_infos;
       for (auto& [cfd, st] : carriers) {
         if (st.connecting) continue;
-        carrier_infos.push_back({cfd, st.last_rtt_ns, st.last_recv_ns, st.connect_ns});
+        carrier_infos.push_back({cfd, st.last_rtt_ns, st.last_recv_ns, st.connect_ns, st.last_send_ns});
       }
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now, scaled_ns);
       bool rtt_outlier = (quality.rtt_outlier_fd >= 0);

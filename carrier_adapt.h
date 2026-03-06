@@ -62,6 +62,7 @@ struct CarrierInfo {
   uint64_t last_rtt_ns;
   uint64_t last_recv_ns;
   uint64_t connect_ns;
+  uint64_t last_send_ns = 0;
 };
 
 struct CarrierQualityResult {
