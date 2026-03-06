@@ -73,10 +73,6 @@ bool process_carrier_read(
       if (s.read_buf.size() < total) break;
       uint64_t id = h->id;
       const uint64_t t = now_ns();
-      if (id > next_deliver_id + MAX_ID_AHEAD) {
-        s.read_buf.clear();
-        return false;
-      }
       if (id >= next_deliver_id && !reassembly.count(id)) {
         reassembly[id].assign(p->data, p->data + size);
         s.last_recv_ns = t;
@@ -164,10 +160,6 @@ bool process_carrier_read(
       size_t total_rs = rs_fixed + block_sz;
       if (block_sz == 0 || block_sz > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
       uint64_t id = h->id;
-      if (id > next_deliver_id + MAX_ID_AHEAD) {
-        s.read_buf.clear();
-        return false;
-      }
       unsigned n = prs->n, k = prs->k;
       if (id < next_deliver_id) {
         // Group already decoded; this is an "extra" shard arriving late.
@@ -262,9 +254,7 @@ bool process_carrier_read(
       }
       continue;
     }
-    // Unrecognized packet kind: likely corrupt or version mismatch. Consuming bytes could
-    // desync (next parse would read payload as header, yielding bogus ids). Close connection.
-    return false;
+    s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
   }
   return true;
 }

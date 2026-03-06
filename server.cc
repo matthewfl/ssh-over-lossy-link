@@ -31,7 +31,6 @@ namespace {
 using packet_io::CarrierState;
 using packet_io::RsPending;
 using packet_io::MAX_PACKET_PAYLOAD;
-using packet_io::MAX_ID_AHEAD;
 using packet_io::READ_BUF_SIZE;
 const int LISTEN_BACKLOG = 64;
 
@@ -847,7 +846,6 @@ int run_server(const Args& args) {
             uint64_t nxt = UINT64_MAX;
             if (!reassembly.empty())  nxt = std::min(nxt, reassembly.begin()->first);
             if (!rs_pending.empty())  nxt = std::min(nxt, rs_pending.begin()->first);
-            if (nxt > next_deliver_id + MAX_ID_AHEAD) break;  // sanity: prevent bogus jump
             if (nxt > next_deliver_id && nxt < UINT64_MAX) {
               next_deliver_id = nxt;
               next_deliver_id_stuck_since_ns = 0;

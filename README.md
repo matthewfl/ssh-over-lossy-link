@@ -58,7 +58,7 @@ Host good-ssh-connection
     ControlPath ~/.ssh/ssh-control-%C
     ControlPersist 1m
     ServerAliveInterval 15                        # optional, have ssh send keep alive pings
-    ServerAliveCountMax 3
+    ServerAliveCountMax 10
 ```
 
 
