@@ -187,7 +187,8 @@ int run_server(const Args& args) {
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
   const uint64_t adapt_interval_ns = 300 * 1000000ULL;
-  unsigned next_carrier_for_rs = 0;
+  // Round-robin index shared by both SMALL packets and RS shards (server→client).
+  unsigned next_rr = 0;
 
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
@@ -304,31 +305,30 @@ int run_server(const Args& args) {
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
 
-  // Send small chunk (< block_size) to the fastest n_copies carriers (by last_rtt_ns).
-  // Preferring low-RTT carriers minimises latency: unlike RS packets there is no erasure
-  // coding fallback, so every copy counts and we want the quickest ones.
-  // Carriers with no RTT sample yet (last_rtt_ns == 0) sort last (unknown, not fast).
+  // Send small chunk (< block_size) to n_copies carriers using round-robin across the
+  // carrier set. With redundancy N and C carriers, copies for successive packets walk
+  // across the carrier indices:
+  //   packet 1: rr, rr+1, ..., rr+N-1
+  //   packet 2: rr+N, rr+N+1, ...
+  // (indices wrap mod C). This matches the client's SMALL/RS round-robin.
   auto queue_small_to_carriers = [&](const uint8_t* data, size_t len) {
     if (len == 0 || carriers.empty()) return;
     ack_send_time_ns[next_send_id] = now_ns();
     const unsigned n_copies = std::max(1u, std::min(runtime_small_packet_redundancy,
                                                      static_cast<unsigned>(carriers.size())));
-    // Sort carriers by RTT ascending; treat 0 (no sample) as slowest.
-    std::vector<std::pair<uint64_t, int>> by_rtt;
-    by_rtt.reserve(carriers.size());
-    for (auto& [fd, cs] : carriers)
-      by_rtt.push_back({cs.last_rtt_ns == 0 ? UINT64_MAX : cs.last_rtt_ns, fd});
-    std::sort(by_rtt.begin(), by_rtt.end());
-    for (unsigned i = 0; i < n_copies; ++i) {
-      int fd = by_rtt[i].second;
-      auto it = carriers.find(fd);
-      if (it != carriers.end()) {
-        packet_io::append_small(it->second.write_buf, next_send_id, data, len);
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-      }
+    size_t n_carriers = carriers.size();
+    for (unsigned i = 0; i < n_copies && n_carriers > 0; ++i) {
+      unsigned idx = (next_rr + i) % static_cast<unsigned>(n_carriers);
+      auto it = carriers.begin();
+      std::advance(it, idx);
+      int fd = it->first;
+      packet_io::append_small(it->second.write_buf, next_send_id, data, len);
+      ev.events = EPOLLIN | EPOLLOUT;
+      ev.data.fd = fd;
+      epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
     }
+    if (!carriers.empty())
+      next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
     next_send_id++;
   };
 
@@ -1034,14 +1034,15 @@ int run_server(const Args& args) {
         std::vector<int> carrier_fds;
         for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
         for (size_t i = 0; i < n; ++i) {
-          int fd = carrier_fds[(next_carrier_for_rs + i) % carrier_fds.size()];
+          int fd = carrier_fds[(next_rr + i) % carrier_fds.size()];
           const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
           queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = fd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
         }
-        next_carrier_for_rs += n;
+        if (!carrier_fds.empty())
+          next_rr = (next_rr + static_cast<unsigned>(n)) % static_cast<unsigned>(carrier_fds.size());
         ack_send_time_ns[next_send_id] = now_ns();
         {
           UnackedItem ui;

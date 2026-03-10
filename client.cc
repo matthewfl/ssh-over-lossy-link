@@ -299,7 +299,8 @@ int run_client(const Args& args) {
   bool stdout_in_epoll = false; // tracks whether STDOUT_FILENO is registered with epoll
   // Max bytes we buffer from stdin before pausing reads (avoids spinning when carriers are dead).
   static constexpr size_t STDIN_THROTTLE_BYTES = 256 * 1024;
-  unsigned next_carrier = 0;
+  // Round-robin index shared by both SMALL packets and RS shards (client→server).
+  unsigned next_rr = 0;
   size_t effective_max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   if (effective_max_packet == 0) effective_max_packet = 800;
   auto now_ns = []() {
@@ -470,20 +471,6 @@ int run_client(const Args& args) {
     packet_io::append_small(it->second.write_buf, next_send_id, data, len);
     if (!same_id)
       next_send_id++;
-  };
-
-  // Return carrier fds sorted by last_rtt_ns ascending (fastest first).
-  // Carriers with no RTT sample yet (last_rtt_ns == 0) sort last.
-  auto fastest_carriers = [&]() -> std::vector<int> {
-    std::vector<std::pair<uint64_t, int>> by_rtt;
-    by_rtt.reserve(carriers.size());
-    for (auto& [fd, cs] : carriers)
-      by_rtt.push_back({cs.last_rtt_ns == 0 ? UINT64_MAX : cs.last_rtt_ns, fd});
-    std::sort(by_rtt.begin(), by_rtt.end());
-    std::vector<int> result;
-    result.reserve(by_rtt.size());
-    for (auto& [rtt, fd] : by_rtt) result.push_back(fd);
-    return result;
   };
 
   // Queue SET_CONFIG to one carrier (client -> server). Includes auto_adapt so server knows who manages redundancy.
@@ -874,7 +861,7 @@ int run_client(const Args& args) {
           size_t num_shards = n;
           for (size_t i = 0; i < num_shards; ++i) {
             auto it = carriers.begin();
-            std::advance(it, (next_carrier + i) % carriers.size());
+            std::advance(it, (next_rr + i) % carriers.size());
             const uint8_t* shard = (i < k) ? (stdin_buf.data() + i * block_size) : parity[i - k].data();
             queue_rs_shard_to_carrier(it->first, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
             ev.events = EPOLLIN | EPOLLOUT;
@@ -892,12 +879,11 @@ int run_client(const Args& args) {
             unacked_sends[next_send_id] = std::move(ui);
           }
           next_send_id++;
-          next_carrier += num_shards;
+          if (!carriers.empty())
+            next_rr = (next_rr + static_cast<unsigned>(num_shards)) % static_cast<unsigned>(carriers.size());
           stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
         }
         // Send any remainder smaller than one block as SMALL (no Reed–Solomon).
-        // Use the fastest carriers (by RTT) so the copy most likely to arrive first
-        // does so as quickly as possible — no erasure coding fallback here.
         if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
           size_t chunk = stdin_buf.size();
           const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()),
@@ -909,13 +895,20 @@ int run_client(const Args& args) {
             ui.send_ns = now_ns();
             unacked_sends[next_send_id] = std::move(ui);
           }
-          auto fast = fastest_carriers();
-          for (unsigned i = 0; i < n_copies; ++i) {
-            int cfd = fast[i % fast.size()];
+          // Round-robin SMALL packets across carriers using the same index as RS shards.
+          size_t n_carriers = carriers.size();
+          for (unsigned i = 0; i < n_copies && n_carriers > 0; ++i) {
+            unsigned idx = (next_rr + i) % static_cast<unsigned>(n_carriers);
+            auto it = carriers.begin();
+            std::advance(it, idx);
+            int cfd = it->first;
             queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
-            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
+          if (!carriers.empty())
+            next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
           if (n_copies > 1) next_send_id++;
           stdin_buf.clear();
         }
@@ -1029,16 +1022,25 @@ int run_client(const Args& args) {
           unacked_sends[next_send_id] = std::move(ui);
         }
         if (small_packet) {
-          auto fast = fastest_carriers();
-          for (unsigned i = 0; i < n_copies; ++i) {
-            int cfd = fast[i % fast.size()];
+          // Round-robin SMALL packets across carriers using the same index as RS shards.
+          // With redundancy N and C carriers, copies for each logical packet go to
+          // consecutive carriers and RS shards continue from where SMALL left off.
+          size_t n_carriers = carriers.size();
+          for (unsigned i = 0; i < n_copies && n_carriers > 0; ++i) {
+            unsigned idx = (next_rr + i) % static_cast<unsigned>(n_carriers);
+            auto it = carriers.begin();
+            std::advance(it, idx);
+            int cfd = it->first;
             queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
-            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
+          if (!carriers.empty())
+            next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
         } else {
           auto it = carriers.begin();
-          std::advance(it, next_carrier % carriers.size());
+          std::advance(it, next_rr % carriers.size());
           queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
           ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = it->first;
           epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
@@ -1046,7 +1048,8 @@ int run_client(const Args& args) {
         if (small_packet && n_copies > 1)
           next_send_id++;
         stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
-        next_carrier += n_copies;
+        if (!carriers.empty())
+          next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
       }
     }
 
