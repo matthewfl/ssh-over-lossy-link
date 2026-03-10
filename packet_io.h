@@ -23,6 +23,7 @@ struct CarrierState {
   std::vector<uint8_t> read_buf;
   std::vector<uint8_t> write_buf;
   size_t write_pos = 0;
+  uint64_t carrier_id = 0;   // logical, monotonically increasing id; distinct from OS fd
   bool connecting = false;    // client: true until connect() completes
   uint64_t last_rtt_ns = 0;   // last RTT measured via ACK on this carrier
   uint64_t last_recv_ns = 0;  // last time any packet arrived on this carrier

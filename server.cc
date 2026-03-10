@@ -226,9 +226,15 @@ int run_server(const Args& args) {
     uint16_t block_size = 0;
     bool is_small = false;
     uint64_t send_ns = 0;
+    // Track which carriers have already carried this logical send so retransmits
+    // avoid resending the same packet/shard on the same carrier. For SMALL packets
+    // we record logical carrier_ids; for RS we track per-shard which carrier_ids have seen it.
+    std::set<uint64_t> small_sent_on;
+    std::map<unsigned, std::set<uint64_t>> rs_shard_sent_on;  // shard_index -> carrier_ids
   };
   std::map<uint64_t, UnackedItem> unacked_data;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
+  uint64_t next_carrier_id_global = 1;
 
   uint64_t last_ping_check_ns       = 0;
   uint64_t last_keepalive_check_ns  = 0;
@@ -323,6 +329,8 @@ int run_server(const Args& args) {
       std::advance(it, idx);
       int fd = it->first;
       packet_io::append_small(it->second.write_buf, next_send_id, data, len);
+      // Record that this SMALL packet id has been carried on this logical carrier.
+      unacked_data[next_send_id].small_sent_on.insert(it->second.carrier_id);
       ev.events = EPOLLIN | EPOLLOUT;
       ev.data.fd = fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -518,8 +526,9 @@ int run_server(const Args& args) {
     max_packet = std::min(static_cast<size_t>(pc.packet_size), MAX_PACKET_PAYLOAD);
     if (max_packet == 0) max_packet = 800;
     runtime_small_packet_redundancy = pc.small_packet_redundancy;
-    if (runtime_small_packet_redundancy == 0) runtime_small_packet_redundancy = 1;
-    runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
+    if (runtime_small_packet_redundancy == 0) runtime_small_packet_redundancy = 2;
+    if (runtime_small_packet_redundancy < 2u) runtime_small_packet_redundancy = 2u;
+    runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(2u, static_cast<unsigned>(carriers.size())));
     runtime_rs_redundancy = pc.reed_solomon_redundancy;
     if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
     runtime_reconnect_timeout_sec = pc.reconnect_timeout_sec;
@@ -572,7 +581,9 @@ int run_server(const Args& args) {
           ev.events = EPOLLIN;
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
-            carriers[client].connect_ns = now_ns();
+            CarrierState& cs = carriers[client];
+            if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
+            cs.connect_ns = now_ns();
             if (dbg) { fprintf(dbg, "[carrier-open t=%llu fd=%d total=%zu]\n",
                                (unsigned long long)(now_ns()/1000000ULL), client, carriers.size());
                         fflush(dbg); }
@@ -594,6 +605,7 @@ int run_server(const Args& args) {
               for (auto& [uid, ui] : unacked_data) {
                 if (ui.is_small) {
                   packet_io::append_small(cs.write_buf, uid, ui.data.data(), ui.data.size());
+                  ui.small_sent_on.insert(client);
                 } else {
                   std::vector<const uint8_t*> dptrs(ui.k);
                   for (unsigned si = 0; si < ui.k; ++si)
@@ -612,6 +624,7 @@ int run_server(const Args& args) {
                         ? (ui.data.data() + si * ui.block_size)
                         : par[si - ui.k].data();
                     packet_io::append_rs_shard(cs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
+                    ui.rs_shard_sent_on[si].insert(client);
                   }
                 }
                 // Reset timer so the periodic 3 s retransmit doesn't immediately
@@ -839,16 +852,30 @@ int run_server(const Args& args) {
         for (auto& [uid, ui] : unacked_data) {
           if (ui.send_ns == 0 || now_ns_val - ui.send_ns < retransmit_timeout_ns) continue;
           if (ui.is_small) {
-            if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
-                             (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
-                             (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL), small_rt_copies);
-            for (unsigned c = 0; c < small_rt_copies; ++c) {
-              int cfd = rt_carriers[(rt_idx + c) % rt_carriers.size()];
-              packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
-              ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            // Only retransmit SMALL on carriers that have not yet carried this uid.
+            std::vector<int> candidates;
+            for (int cfd : rt_carriers) {
+              auto itc = carriers.find(cfd);
+              if (itc == carriers.end()) continue;
+              uint64_t cid = itc->second.carrier_id;
+              if (!ui.small_sent_on.count(cid)) candidates.push_back(cfd);
             }
-            rt_idx += small_rt_copies;
+            if (!candidates.empty()) {
+              unsigned copies = std::min(small_rt_copies, static_cast<unsigned>(candidates.size()));
+              if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
+                               (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
+                               (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL), copies);
+              for (unsigned c = 0; c < copies; ++c) {
+                int cfd = candidates[(rt_idx + c) % candidates.size()];
+                auto itc = carriers.find(cfd);
+                if (itc == carriers.end()) continue;
+                ui.small_sent_on.insert(itc->second.carrier_id);
+                packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
+                ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+                epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+              }
+              rt_idx += copies;
+            }
           } else {
             std::vector<const uint8_t*> dptrs(ui.k);
             for (unsigned si = 0; si < ui.k; ++si) dptrs[si] = ui.data.data() + si * ui.block_size;
@@ -861,19 +888,32 @@ int run_server(const Args& args) {
               for (unsigned si = 0; si < rm; ++si) rpptrs[si] = rpar[si].data();
               reed_solomon::encode(ui.k, rm, dptrs.data(), rpptrs.data(), ui.block_size);
             }
-            if (dbg) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu]\n",
-                             (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
-                             (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL),
-                             ui.n, ui.k, rt_carriers.size());
             std::set<int> touched;
             for (unsigned si = 0; si < ui.n; ++si) {
-              int cfd = rt_carriers[(rt_idx + si) % rt_carriers.size()];
+              auto& sent_set = ui.rs_shard_sent_on[si];
+              std::vector<int> shard_candidates;
+              for (int cfd : rt_carriers) {
+                auto itc = carriers.find(cfd);
+                if (itc == carriers.end()) continue;
+                uint64_t cid = itc->second.carrier_id;
+                if (!sent_set.count(cid)) shard_candidates.push_back(cfd);
+              }
+              if (shard_candidates.empty())
+                continue;
+              int cfd = shard_candidates[(rt_idx + si) % shard_candidates.size()];
+              auto itc = carriers.find(cfd);
+              if (itc == carriers.end()) continue;
               const uint8_t* shard = (si < ui.k)
                   ? (ui.data.data() + si * ui.block_size) : rpar[si - ui.k].data();
               packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
                                          ui.n, ui.k, ui.block_size, si, shard);
+              sent_set.insert(itc->second.carrier_id);
               touched.insert(cfd);
             }
+            if (dbg && !touched.empty()) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu unique_cfds=%zu]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
+                             (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL),
+                             ui.n, ui.k, rt_carriers.size(), touched.size());
             for (int cfd : touched) {
               ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
               epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -1033,8 +1073,12 @@ int run_server(const Args& args) {
         reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
         std::vector<int> carrier_fds;
         for (auto& [fd, _] : carriers) carrier_fds.push_back(fd);
+        std::vector<uint64_t> shard_carriers(n);
         for (size_t i = 0; i < n; ++i) {
           int fd = carrier_fds[(next_rr + i) % carrier_fds.size()];
+          auto itc = carriers.find(fd);
+          if (itc == carriers.end()) continue;
+          shard_carriers[i] = itc->second.carrier_id;
           const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
           queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
           ev.events = EPOLLIN | EPOLLOUT;
@@ -1051,6 +1095,9 @@ int run_server(const Args& args) {
           ui.block_size = static_cast<uint16_t>(block_size);
           ui.is_small = false;
           ui.send_ns = now_ns();
+          for (unsigned si = 0; si < n; ++si) {
+            ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
+          }
           unacked_data[next_send_id] = std::move(ui);
         }
         next_send_id++;
