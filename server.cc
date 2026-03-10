@@ -734,7 +734,8 @@ int run_server(const Args& args) {
     }
 
     // ── Ping / inactivity-check / carrier quality (suggest close) ───────────
-    if (now_ns_val - last_ping_check_ns >= 1000000000ULL) {
+    // 500 ms: detect dead carriers promptly so we send SUGGEST_CLOSE and client can recover quickly.
+    if (now_ns_val - last_ping_check_ns >= 500000000ULL) {
       last_ping_check_ns = now_ns_val;
       uint64_t ping_idle_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
 

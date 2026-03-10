@@ -346,18 +346,31 @@ int run_client(const Args& args) {
   static constexpr uint64_t reduction_close_interval_ns = 60 * 1000000000ULL;  // 60s between reduction closes
 
   // RTT-scaled timeouts: use observed latency so low-latency links get tighter timeouts,
-  // high-latency links get longer. Cold start uses rtt_hint_ms or 5 s conservative default.
+  // high-latency links get longer. Cold start uses rtt_hint_ms or 5 s conservative default,
+  // but once RTT is measured we rely on the observed p90/server-reported max instead of the
+  // conservative 5 s floor (otherwise all timeouts behave as if RTT≥5 s forever).
   auto get_effective_rtt_ns = [&]() -> uint64_t {
     uint64_t hint_ns = static_cast<uint64_t>(args.config.rtt_hint_ms) * 1000000ULL;
-    if (recent_rtt_ns.size() >= 3) {
-      std::vector<uint64_t> sorted(recent_rtt_ns.begin(), recent_rtt_ns.end());
-      std::sort(sorted.begin(), sorted.end());
-      uint64_t p90 = sorted[static_cast<size_t>(sorted.size() * 0.9)];
-      uint64_t observed = std::max(p90, server_reported_max_rtt_ns);
-      uint64_t fallback = hint_ns ? hint_ns : 5000000000ULL;
-      return std::max(observed, fallback);
+    bool have_observed = (recent_rtt_ns.size() >= 3) || (server_reported_max_rtt_ns > 0);
+    if (have_observed) {
+      uint64_t observed = server_reported_max_rtt_ns;
+      if (recent_rtt_ns.size() >= 3) {
+        std::vector<uint64_t> sorted(recent_rtt_ns.begin(), recent_rtt_ns.end());
+        std::sort(sorted.begin(), sorted.end());
+        uint64_t p90 = sorted[static_cast<size_t>(sorted.size() * 0.9)];
+        observed = std::max(observed, p90);
+      }
+      if (observed == 0) {
+        // Should not normally happen, but fall back to hint/default if it does.
+        return hint_ns ? hint_ns : 5000000000ULL;
+      }
+      // When a hint is provided, treat it as a lower bound for RTT; otherwise just
+      // use the observed value so low-latency links get appropriately short timeouts.
+      return hint_ns ? std::max(observed, hint_ns) : observed;
     }
-    return hint_ns ? hint_ns : 5000000000ULL;  // 5 s conservative when unknown
+    // Cold start: no RTT samples and no server metrics yet. Use hint when provided,
+    // otherwise a conservative 5 s default until RTT is measured.
+    return hint_ns ? hint_ns : 5000000000ULL;
   };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
     uint64_t rtt = get_effective_rtt_ns();
@@ -380,6 +393,10 @@ int run_client(const Args& args) {
   };
   std::map<uint64_t, UnackedItem> unacked_sends;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
+
+  // Track outstanding PINGs so we can debug long RTTs / missing PONGs.
+  // Keyed by (fd, ping_id) -> send_time_ns.
+  std::map<std::pair<int, uint64_t>, uint64_t> outstanding_pings;
 
   // Timing for periodic operations that don't depend on carrier events.
   uint64_t last_ping_check_ns       = 0;
@@ -593,6 +610,20 @@ int run_client(const Args& args) {
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
+  recv_cb.on_pong = [&](int fd, uint64_t id) {
+    auto key = std::make_pair(fd, id);
+    auto it = outstanding_pings.find(key);
+    if (it == outstanding_pings.end()) return;
+    uint64_t rtt_ns = now_ns() - it->second;
+    outstanding_pings.erase(it);
+    if (dbg && rtt_ns > 5000000000ULL) {  // > 5 s
+      fprintf(dbg, "[ping-rtt-high t=%llu fd=%d id=%llu rtt_ms=%llu]\n",
+              (unsigned long long)(now_ns()/1000000ULL),
+              fd,
+              (unsigned long long)id,
+              (unsigned long long)(rtt_ns/1000000ULL));
+    }
+  };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it_p = carrier_pending_acks.find(fd);
     if (it_p == carrier_pending_acks.end()) return;
@@ -683,6 +714,11 @@ int run_client(const Args& args) {
     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     carriers.erase(fd);
+    // Drop any outstanding PING records for this fd so we don't log against a closed carrier.
+    for (auto it = outstanding_pings.begin(); it != outstanding_pings.end(); ) {
+      if (it->first.first == fd) it = outstanding_pings.erase(it);
+      else ++it;
+    }
     if (carriers.empty() && !unacked_sends.empty()) {
       retransmit_needed = true;
       if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
@@ -1125,7 +1161,9 @@ int run_client(const Args& args) {
     // time to arrive before considering silence-based reap.
     {
       const uint64_t now_p = now_ns();
-      if (now_p - last_ping_check_ns >= 1000000000ULL) {
+      // 500 ms: detect dead carriers promptly so we can reap and open new connections quickly
+      // (e.g. after WiFi is turned back on); 1 s added unnecessary delay to recovery.
+      if (now_p - last_ping_check_ns >= 500000000ULL) {
         last_ping_check_ns = now_p;
 
         // Reap any SSH processes that have exited after receiving SIGTERM.
@@ -1167,6 +1205,7 @@ int run_client(const Args& args) {
               && now_p - cs.last_send_ns > ping_idle_ns
               && now_p - cs.last_recv_ns > ping_idle_ns) {
             packet_io::append_ping(cs.write_buf, next_send_id);
+            outstanding_pings[{cfd, next_send_id}] = now_p;
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -1192,9 +1231,24 @@ int run_client(const Args& args) {
               std::uniform_int_distribution<int> byte_dist(0, 255);
               for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(byte_dist(keepalive_gen));
               packet_io::append_ping(cs.write_buf, next_send_id, payload.data(), len);
+              outstanding_pings[{cfd, next_send_id}] = now_p;
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = cfd;
               epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            }
+          }
+        }
+
+        // Debug: log any outstanding PINGs that have not received a PONG for >5 s.
+        if (dbg && !outstanding_pings.empty()) {
+          for (const auto& [key, sent_ns] : outstanding_pings) {
+            uint64_t age_ns = now_p - sent_ns;
+            if (age_ns > 5000000000ULL) {
+              int fd = key.first;
+              fprintf(dbg, "[ping-unacked t=%llu fd=%d age_ms=%llu]\n",
+                      (unsigned long long)(now_p/1000000ULL),
+                      fd,
+                      (unsigned long long)(age_ns/1000000ULL));
             }
           }
         }

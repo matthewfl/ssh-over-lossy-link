@@ -95,7 +95,9 @@ CarrierQualityResult assess_carriers(
   CarrierQualityResult res;
   if (carriers.empty()) return res;
 
-  uint64_t dead_idle_ns = scaled_ns(5, 15000000000ULL, 120000000000ULL);
+  // 5×RTT, min 3 s (was 15 s): when WiFi/link drops we need to declare carriers dead
+  // quickly so floor maintenance can open new connections; 15 s caused very slow recovery.
+  uint64_t dead_idle_ns = scaled_ns(5, 3000000000ULL, 120000000000ULL);
   uint64_t grace_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
   uint64_t very_high_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
 
