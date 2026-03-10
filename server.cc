@@ -182,6 +182,7 @@ int run_server(const Args& args) {
   float runtime_rs_redundancy = args.config.rs_redundancy;
   unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
   bool runtime_auto_adapt = false;  // set from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
+  uint32_t runtime_reconnect_timeout_sec = (uint32_t)args.config.reconnect_timeout_sec;
   float last_sent_rs_redundancy = -1.0f;
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
@@ -521,10 +522,11 @@ int run_server(const Args& args) {
     runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
     runtime_rs_redundancy = pc.reed_solomon_redundancy;
     if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
-    if (dbg) fprintf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d]\n",
+    runtime_reconnect_timeout_sec = pc.reconnect_timeout_sec;
+    if (dbg) fprintf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d reconnect_timeout_sec=%u]\n",
                      (unsigned long long)(now_ns()/1000000ULL), max_packet,
                      (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
-                     (int)runtime_auto_adapt);
+                     (int)runtime_auto_adapt, (unsigned)runtime_reconnect_timeout_sec);
     // When auto_adapt, send current config so client has initial sync; server will send again when it adapts.
     if (runtime_auto_adapt && !carriers.empty()) {
       last_sent_rs_redundancy = runtime_rs_redundancy;
@@ -809,7 +811,9 @@ int run_server(const Args& args) {
         if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
       // Global idle timeout: if nothing from any carrier for 12×RTT the client is gone.
-      uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);
+      uint64_t global_idle_ns = (runtime_reconnect_timeout_sec > 0)
+          ? (uint64_t)runtime_reconnect_timeout_sec * 1000000000ULL
+          : scaled_ns(12, 60000000000ULL, 300000000000ULL);
       if (now_ns_val - last_global_recv_ns > global_idle_ns) {
         if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu]\n", (unsigned long long)(now_ns_val/1000000ULL));
         running = false;

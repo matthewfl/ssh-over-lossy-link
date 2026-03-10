@@ -61,6 +61,9 @@ struct PacketConfig {
   float max_delay_ms;
   float reed_solomon_redundancy;
   uint8_t auto_adapt;  // 1 = server may adapt and send SERVER_CONFIG; 0 = server only applies SET_CONFIG
+  // Reconnect/idle timeout in seconds. 0 = use adaptive formula (12×RTT, min 60 s, max 300 s).
+  // When non-zero, both sides use this fixed value as their global_idle_ns threshold.
+  uint32_t reconnect_timeout_sec;
 };
 
 // Server -> client: link quality observed by server so client can adapt.
@@ -115,6 +118,7 @@ struct Config {
   unsigned rtt_hint_ms = 0;  // 0 = auto from observed latency; else hint for cold-start timeouts
   unsigned connect_timeout_sec = 30;  // SSH ConnectTimeout; 0 = no timeout (wait indefinitely)
   unsigned min_data_per_minute = 0;   // when >0, send keepalive data so each carrier sends ≥N bytes/min
+  unsigned reconnect_timeout_sec = 0; // global idle timeout; 0 = adaptive (12×RTT, min 60 s, max 300 s)
 };
 
 // -----------------------------------------------------------------------------

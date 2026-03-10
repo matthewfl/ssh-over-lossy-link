@@ -290,7 +290,8 @@ void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigne
 }
 
 void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
-                   float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt) {
+                   float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt,
+                   uint32_t reconnect_timeout_sec) {
   PacketConfig pc{};
   pc.header.id = 0;
   pc.header.packet_kind = PacketKind::SET_CONFIG;
@@ -299,6 +300,7 @@ void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t sma
   pc.max_delay_ms = max_delay_ms;
   pc.reed_solomon_redundancy = reed_solomon_redundancy;
   pc.auto_adapt = auto_adapt;
+  pc.reconnect_timeout_sec = reconnect_timeout_sec;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&pc);
   out.insert(out.end(), p, p + sizeof pc);
 }

@@ -28,6 +28,7 @@ const struct option LONG_OPTS[] = {
   { "connect-timeout",      required_argument, nullptr, 'T' },
   { "min-data-per-minute",  required_argument, nullptr, 'M' },
   { "file-lock",            required_argument, nullptr, 'F' },
+  { "reconnect-timeout",    required_argument, nullptr, 'e' },
   { "server",               no_argument,       nullptr, 'S' },
   { "unix-socket-connection", required_argument, nullptr, 'u' },
   { "debug",                no_argument,       nullptr, 'D' },
@@ -93,6 +94,8 @@ void usage(const char* program_name) {
     << c.connect_timeout_sec << "\n"
     << "  --min-data-per-minute N       Send keepalive data so each carrier sends ≥N bytes/min. Default: "
     << c.min_data_per_minute << "\n"
+    << "  --reconnect-timeout N         Global idle timeout (s); 0 = adaptive (12×RTT, min 60 s, max 300 s); else 1–7200. Default: "
+    << c.reconnect_timeout_sec << "\n"
     << "  --file-lock PATH              Acquire exclusive lock on PATH before client start (15s timeout)\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
     << "  --unix-socket-connection PATH Connect directly to Unix socket PATH instead of SSH -L\n"
@@ -103,7 +106,7 @@ void usage(const char* program_name) {
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:F:Su:Dh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:F:e:Su:Dh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -145,6 +148,13 @@ bool parse_args(int argc, char* argv[], Args& out) {
         case 'F':
           out.file_lock = optarg;
           break;
+        case 'e': {
+          unsigned v = parse_unsigned(optarg, "--reconnect-timeout");
+          if (v > 7200u)
+            throw std::runtime_error("--reconnect-timeout must be 0 (adaptive) or 1–7200 seconds");
+          out.config.reconnect_timeout_sec = v;
+          break;
+        }
         case 'S':
           out.server_mode = true;
           break;

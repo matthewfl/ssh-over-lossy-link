@@ -473,7 +473,8 @@ int run_client(const Args& args) {
   auto queue_config_to_carrier = [&](int fd, uint16_t pkt_size, uint16_t small_red, float max_delay_ms, float rs_red, uint8_t auto_adapt_val) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
-    packet_io::append_config(it->second.write_buf, pkt_size, small_red, max_delay_ms, rs_red, auto_adapt_val);
+    packet_io::append_config(it->second.write_buf, pkt_size, small_red, max_delay_ms, rs_red, auto_adapt_val,
+                             (uint32_t)args.config.reconnect_timeout_sec);
   };
 
   // Queue CLIENT_METRICS to one carrier (s2c path quality for server's dual-direction adapt).
@@ -1225,7 +1226,9 @@ int run_client(const Args& args) {
         for (auto& [cfd, cs] : carriers)
           if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
-        uint64_t global_idle_ns = scaled_ns(12, 60000000000ULL, 300000000000ULL);
+        uint64_t global_idle_ns = (args.config.reconnect_timeout_sec > 0)
+            ? (uint64_t)args.config.reconnect_timeout_sec * 1000000000ULL
+            : scaled_ns(12, 60000000000ULL, 300000000000ULL);
         if (now_p - last_global_recv_ns > global_idle_ns) {
           if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu last_recv_ms=%llu threshold_ms=%llu]\n",
                            (unsigned long long)(now_p/1000000ULL),

@@ -110,7 +110,8 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
 void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigned k,
                     uint16_t block_size, unsigned shard_index, const uint8_t* shard_data);
 void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
-                  float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt);
+                  float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt,
+                  uint32_t reconnect_timeout_sec = 0);
 void append_server_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
                          float max_delay_ms, float reed_solomon_redundancy);
 void append_ack(std::vector<uint8_t>& out, uint64_t acked_id);
