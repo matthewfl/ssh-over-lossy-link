@@ -11,14 +11,14 @@ Ssh-oll solves this problem by layering a single SSH connection over several "ca
         |
         | (stdin/stdout via ProxyCommand)
         v
-  +------------------+                    +-------------------+
-  |  ssh-oll client  | ---- carrier 1 ---->|                  |
-  |                  | ---- carrier 2 ---->|  ssh-oll server  | ----> localhost:22
-  |                  | ---- carrier N ---->|  (Unix socket)   |       (inner SSH)
-  +------------------+                    +-------------------+
-        ^                                        ^
-        |                                        |
-   lossy-ssh-host (multiple SSH sessions)   lossy-ssh-host
+  +------------------+                      +------------------+
+  |  ssh-oll client  | ---- carrier 1 ----> |                  |
+  |                  | ---- carrier 2 ----> |  ssh-oll server  | ----> localhost:22
+  |                  | ---- carrier N ----> |  (Unix socket)   |       (inner SSH)
+  +------------------+                      +------------------+
+        ^                                             ^
+        |                                             |
+   lossy-ssh-host     (multiple SSH sessions)    lossy-ssh-host
 ```
 
 The client runs as a ProxyCommand: the real SSH process talks to the client over stdin/stdout. The client multiplexes that single stream over N carrier SSH connections (each with a forwarded Unix socket to the server). The server reassembles the stream and connects to `localhost:22` (or the configured host/port) to complete the SSH hop.

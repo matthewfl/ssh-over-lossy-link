@@ -1546,6 +1546,13 @@ int run_client(const Args& args) {
                 uint64_t cid = itc->second.carrier_id;
                 if (!ui.small_sent_on.count(cid)) candidates.push_back(cfd);
               }
+              // If every live carrier has already carried this SMALL packet, reset
+              // the history and allow another round across all carriers so we don't
+              // get permanently stuck with an undeliverable id.
+              if (candidates.empty()) {
+                candidates = rt_carriers;
+                ui.small_sent_on.clear();
+              }
               if (!candidates.empty()) {
                 unsigned copies = std::min(small_rt_copies, static_cast<unsigned>(candidates.size()));
                 if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
@@ -1586,6 +1593,12 @@ int run_client(const Args& args) {
                   if (itc == carriers.end()) continue;
                   uint64_t cid = itc->second.carrier_id;
                   if (!sent_set.count(cid)) shard_candidates.push_back(cfd);
+                }
+                // If every live carrier has already carried this shard, clear the
+                // history and allow another full round on all carriers.
+                if (shard_candidates.empty()) {
+                  shard_candidates = rt_carriers;
+                  sent_set.clear();
                 }
                 if (shard_candidates.empty())
                   continue;
