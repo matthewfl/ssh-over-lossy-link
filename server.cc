@@ -491,6 +491,28 @@ int run_server(const Args& args) {
     while (c2s_small_extra_copy_gap_ns.size() > kMaxSpreadSamples) c2s_small_extra_copy_gap_ns.pop_front();
   };
   recv_cb.on_ping = [&](int fd, uint64_t id, size_t payload_size) { send_pong(fd, id, payload_size); };
+  // Client may send SUGGEST_CLOSE when it has decided a carrier is dead or being
+  // replaced. Once we receive that, we can immediately stop using and close the
+  // carrier; no further data will arrive on it.
+  recv_cb.on_suggest_close = [&](int fd) {
+    auto it = carriers.find(fd);
+    if (it == carriers.end()) return;
+    if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=peer_suggest_close]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
+    close(fd);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+    carriers.erase(it);
+    if (carriers.empty() && !unacked_data.empty()) {
+      retransmit_needed = true;
+      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=peer_closed_last]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_data.size());
+    }
+    if (!carriers.empty() && !unacked_data.empty()) {
+      last_retransmit_check_ns = 0;
+      if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu reason=peer_suggest_close]\n",
+                       (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
+    }
+  };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it = ack_send_time_ns.find(acked_id);
     if (it != ack_send_time_ns.end()) {
@@ -605,7 +627,10 @@ int run_server(const Args& args) {
               for (auto& [uid, ui] : unacked_data) {
                 if (ui.is_small) {
                   packet_io::append_small(cs.write_buf, uid, ui.data.data(), ui.data.size());
-                  ui.small_sent_on.insert(client);
+                  // Track by logical carrier_id, not raw fd, so the
+                  // retransmit logic can correctly avoid resending on
+                  // the same logical carrier even when fds are reused.
+                  ui.small_sent_on.insert(cs.carrier_id);
                 } else {
                   std::vector<const uint8_t*> dptrs(ui.k);
                   for (unsigned si = 0; si < ui.k; ++si)
@@ -624,7 +649,10 @@ int run_server(const Args& args) {
                         ? (ui.data.data() + si * ui.block_size)
                         : par[si - ui.k].data();
                     packet_io::append_rs_shard(cs.write_buf, uid, ui.n, ui.k, ui.block_size, si, shard);
-                    ui.rs_shard_sent_on[si].insert(client);
+                    // Track by logical carrier_id, not raw fd, so the retransmit
+                    // logic can correctly avoid resending the same shard on the
+                    // same logical carrier even when fds are reused.
+                    ui.rs_shard_sent_on[si].insert(cs.carrier_id);
                   }
                 }
                 // Reset timer so the periodic 3 s retransmit doesn't immediately

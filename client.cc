@@ -975,7 +975,10 @@ int run_client(const Args& args) {
                 if (ui.is_small) {
                   packet_io::append_small(it->second.write_buf, uid,
                                           ui.data.data(), ui.data.size());
-                  ui.small_sent_on.insert(fd);
+                  // Track by logical carrier_id, not raw fd, so the
+                  // retransmit logic can correctly avoid resending on
+                  // the same logical carrier when fds are reused.
+                  ui.small_sent_on.insert(it->second.carrier_id);
                 } else {
                   // Re-encode RS with the same parameters (n, k, block_size) so the
                   // receiver can combine these shards with any partials it retained.
@@ -997,7 +1000,10 @@ int run_client(const Args& args) {
                         : par[si - ui.k].data();  // m>0 ensures par has parity when si>=k
                     packet_io::append_rs_shard(it->second.write_buf, uid,
                                                ui.n, ui.k, ui.block_size, si, shard);
-                    ui.rs_shard_sent_on[si].insert(fd);
+                    // Track by logical carrier_id, not raw fd, so the retransmit
+                    // logic can correctly avoid resending the same shard on the
+                    // same logical carrier when fds are reused.
+                    ui.rs_shard_sent_on[si].insert(it->second.carrier_id);
                   }
                 }
                 // Reset timer so the periodic 3 s retransmit doesn't immediately
@@ -1274,6 +1280,16 @@ int run_client(const Args& args) {
         }
 
         for (int cfd : quality.dead_idle_fds) {
+          // Tell the server this carrier is about to be closed so it can stop
+          // sending on it immediately. We may delay our own close slightly
+          // (pending_reap path) to drain any in-flight data, but once the server
+          // sees SUGGEST_CLOSE it will close fd on its side.
+          if (auto itc = carriers.find(cfd); itc != carriers.end()) {
+            packet_io::append_suggest_close(itc->second.write_buf);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          }
           if (carriers.size() > target_carriers) {
             // Above target and dead: close immediately so floor maintenance can add
             // fresh replacements without waiting for the 60s slow-reduction rate limit.

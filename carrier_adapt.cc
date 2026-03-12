@@ -101,14 +101,32 @@ CarrierQualityResult assess_carriers(
   uint64_t grace_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
   uint64_t very_high_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
 
+  // Track the freshest receive time across all carriers so we can detect
+  // "send-only zombies": carriers we keep writing to but that never deliver
+  // anything back while peers are still receiving.
+  uint64_t latest_recv_ns = 0;
+  for (const auto& c : carriers)
+    if (c.last_recv_ns > latest_recv_ns) latest_recv_ns = c.last_recv_ns;
+
   for (const auto& c : carriers) {
     if (now_ns - c.connect_ns < grace_ns) continue;
-    // Use the most recent of connect, last recv, or last send.
-    // Including last_send prevents falsely closing a carrier that is actively
-    // pushing data outward but hasn't received a response yet (e.g. full write
-    // buffer suppressing PINGs on both sides under heavy bidirectional load).
+    // Original idle test: no activity (send or recv) for a long time.
     uint64_t last_activity = std::max({c.connect_ns, c.last_recv_ns, c.last_send_ns});
-    if (now_ns - last_activity > dead_idle_ns)
+    bool idle_dead = (now_ns - last_activity > dead_idle_ns);
+
+    // Additional RX-dead test: this carrier has not received anything for a long
+    // time while at least one peer *has* recently received data. This catches
+    // "zombie" carriers that we can still write to (so last_send_ns keeps
+    // advancing) but that never deliver shards back.
+    bool rx_dead = false;
+    if (!idle_dead && latest_recv_ns > 0 && c.last_recv_ns > 0) {
+      // Require that this carrier lags far behind the best receiver.
+      uint64_t recv_gap = latest_recv_ns - c.last_recv_ns;
+      if (recv_gap > dead_idle_ns)
+        rx_dead = true;
+    }
+
+    if (idle_dead || rx_dead)
       res.dead_idle_fds.push_back(c.fd);
   }
 
