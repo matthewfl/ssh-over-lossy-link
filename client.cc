@@ -272,6 +272,7 @@ int run_client(const Args& args) {
   const unsigned max_connections = args.config.max_connections;
   unsigned next_carrier_index = N;  // next socket index when adding carriers (SSH mode)
   std::vector<std::string> pending_carrier_paths;  // SSH mode: paths we're waiting to connect to
+  std::map<unsigned, uint64_t> pending_connect_started_ns;  // slot -> pending-start timestamp
 
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
@@ -1082,6 +1083,8 @@ int run_client(const Args& args) {
       std::string prefix = client_dir + "/";
       unsigned slot = (it->size() > prefix.size())
           ? static_cast<unsigned>(std::stoul(it->substr(prefix.size()))) : 0;
+      if (!pending_connect_started_ns.count(slot))
+        pending_connect_started_ns[slot] = now_ns();
       // If the SSH process for this slot has exited on its own (e.g. auth failure,
       // ExitOnForwardFailure), remove the entry so the slot is freed for relaunch.
       if (auto pit = ssh_idx_to_pid.find(slot); pit != ssh_idx_to_pid.end()) {
@@ -1089,6 +1092,35 @@ int run_client(const Args& args) {
           // Process exited; clean up and let find_free_ssh_index reclaim this slot.
           ssh_idx_to_pid.erase(pit);
           unlink(it->c_str());
+          pending_connect_started_ns.erase(slot);
+          it = pending_carrier_paths.erase(it);
+          continue;
+        }
+      }
+      // Recycle stale pending SSH connects that never produce a local forward socket.
+      // Without this, all slots can become permanently occupied during outages.
+      {
+        const uint64_t now_pc = now_ns();
+        uint64_t pending_timeout_ns;
+        if (args.config.connect_timeout_sec > 0) {
+          uint64_t base = static_cast<uint64_t>(args.config.connect_timeout_sec) * 1000000000ULL;
+          pending_timeout_ns = std::min<uint64_t>(120000000000ULL, std::max<uint64_t>(10000000000ULL, base * 2));
+        } else {
+          pending_timeout_ns = 20000000000ULL;  // 20 s default when ConnectTimeout is unset
+        }
+        const uint64_t started = pending_connect_started_ns[slot];
+        if (now_pc > started && now_pc - started > pending_timeout_ns) {
+          if (auto pit = ssh_idx_to_pid.find(slot); pit != ssh_idx_to_pid.end()) {
+            kill(pit->second, SIGTERM);
+            pids_to_reap.push_back(pit->second);
+            ssh_idx_to_pid.erase(pit);
+          }
+          unlink(it->c_str());
+          if (dbg) fprintf(dbg, "[pending-connect-timeout t=%llu slot=%u waited_ms=%llu]\n",
+                           (unsigned long long)(now_pc/1000000ULL),
+                           slot,
+                           (unsigned long long)((now_pc - started)/1000000ULL));
+          pending_connect_started_ns.erase(slot);
           it = pending_carrier_paths.erase(it);
           continue;
         }
@@ -1110,6 +1142,7 @@ int run_client(const Args& args) {
         } else {
           close(fd);
         }
+        pending_connect_started_ns.erase(slot);
         it = pending_carrier_paths.erase(it);  // success: remove from pending
       } else {
         ++it;  // transient failure (SSH still starting): retry next iteration
@@ -1211,6 +1244,7 @@ int run_client(const Args& args) {
           for (unsigned idx : dead_slots) {
             ssh_idx_to_pid.erase(idx);
             unlink((client_dir + "/" + std::to_string(idx)).c_str());
+            pending_connect_started_ns.erase(idx);
           }
         }
         uint64_t ping_idle_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
@@ -1483,6 +1517,7 @@ int run_client(const Args& args) {
               if (pid > 0) {
                 ssh_idx_to_pid[free_idx] = pid;
                 pending_carrier_paths.push_back(path);
+                pending_connect_started_ns[free_idx] = now_ns();
                 if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
                 const char* add_reason =
                     (total_write > backpressure_write_threshold) ? "backpressure" :
@@ -1800,6 +1835,7 @@ int run_client(const Args& args) {
             if (pid > 0) {
               ssh_idx_to_pid[free_idx] = pid;
               pending_carrier_paths.push_back(path);
+              pending_connect_started_ns[free_idx] = now_ns();
               if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
               const char* floor_reason = carriers.empty() ? "mass_death" : "below_floor";
               if (dbg) fprintf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",

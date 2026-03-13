@@ -280,6 +280,56 @@ run_test "combined-latency-and-death" \
     --test-min-packets           20
 
 # ============================================================================
+# 8b. High-latency realistic WAN profile: 300–500 ms jitter + 1% carrier death.
+#     Run each direction separately for stability under harsh conditions.
+# ============================================================================
+run_test "high-latency-300-500ms-loss1pct-t2c" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 120 \
+    --continuous-tcp-to-client-only \
+    --latency-random \
+    --latency-random-low-ms  300 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.01 \
+    --test-max-latency        30000 \
+    --test-max-average-latency 4000 \
+    --test-max-average-latency-after-warmup 2200 \
+    --test-min-packets           12
+
+run_test "high-latency-300-500ms-loss1pct-c2t" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 120 \
+    --continuous-client-to-tcp-only \
+    --latency-random \
+    --latency-random-low-ms  300 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.01 \
+    --test-max-latency        30000 \
+    --test-max-average-latency 4000 \
+    --test-max-average-latency-after-warmup 2200 \
+    --test-min-packets           12
+
+# ============================================================================
+# 8c. Very harsh WAN profile: 350–500 ms jitter + 3% carrier death.
+#     Directional-only to prevent bidirectional livelock under extreme churn.
+# ============================================================================
+run_test "high-latency-350-500ms-loss3pct-t2c" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 120 \
+    --continuous-tcp-to-client-only \
+    --latency-random \
+    --latency-random-low-ms  350 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.03 \
+    --test-max-latency        45000 \
+    --test-max-average-latency 7000 \
+    --test-max-average-latency-after-warmup 3500 \
+    --test-min-packets            8
+
+# ============================================================================
 # 9b. Stop-then-recover scenario — carriers go dead (but stay open) for a full
 #     30-second blackout, with short-lived replacement carriers that also die,
 #     then the link recovers after 60 seconds and new carriers work again.
@@ -313,6 +363,67 @@ run_test "wifi-stop-then-recover-heavy" \
     --latency-ms 50 \
     --scenario-stop-recover \
     --wifi-heavy-min-bytes 61440
+
+# ============================================================================
+# 9d. Stop-then-recover under realistic high-latency WAN + carrier churn.
+#     30s blackout in the middle of 300–500 ms latency and 1% connection death.
+# ============================================================================
+run_test "wifi-stop-then-recover-highlat-loss1pct" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 140 \
+    --continuous-tcp-to-client-only \
+    --latency-random \
+    --latency-random-low-ms  300 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.01 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 40 \
+    --scenario-blackout-duration 30 \
+    --warmup-seconds 90 \
+    --test-max-latency        120000 \
+    --test-max-average-latency-after-warmup 4500 \
+    --test-min-packets           10
+
+# ============================================================================
+# 9e. Double-blackout heavy stress:
+#     two Wi-Fi outages (20–50s and 90–120s), sustained bidirectional flooding.
+# ============================================================================
+run_test "wifi-double-blackout-heavy" \
+    --init-latency-override 0.05 \
+    --scenario-wifi-heavy \
+    --continuous-duration 150 \
+    --latency-ms 80 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 20 \
+    --scenario-blackout-duration 30 \
+    --scenario-second-blackout-start 90 \
+    --scenario-second-blackout-duration 30 \
+    --wifi-heavy-min-bytes 61440
+
+# ============================================================================
+# 9f. Periodic blackout + WAN loss profile:
+#     emulate repeated mobile/Wi-Fi flaps under 300–500 ms latency and 2% death.
+# ============================================================================
+run_test "wifi-periodic-blackouts-highlat-loss2pct" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 170 \
+    --continuous-tcp-to-client-only \
+    --latency-random \
+    --latency-random-low-ms  300 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.02 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 25 \
+    --scenario-blackout-duration 20 \
+    --scenario-periodic-blackout-interval 45 \
+    --scenario-periodic-blackout-duration 20 \
+    --scenario-periodic-blackout-count 3 \
+    --warmup-seconds 120 \
+    --test-max-latency        120000 \
+    --test-max-average-latency-after-warmup 6000 \
+    --test-min-packets            8
 
 # ============================================================================
 # 10. Auto-adapt disabled (--no-auto) — fixed RS and carrier count.

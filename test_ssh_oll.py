@@ -203,6 +203,35 @@ def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, ki
 
 _proxy_debug_enabled = False  # set True temporarily for diagnostics
 
+def _in_blackout_window(t_since_start, blackout_windows):
+    """Return True if t_since_start is inside any blackout window."""
+    for start, end in blackout_windows:
+        if start <= t_since_start < end:
+            return True
+    return False
+
+
+def _dead_cutoff_time(t_since_start, blackout_windows):
+    """Return latest blackout end-time that has fully elapsed by t_since_start."""
+    cutoff = 0.0
+    for _, end in blackout_windows:
+        if t_since_start >= end and end > cutoff:
+            cutoff = end
+    return cutoff
+
+
+def _phase_label(t_since_start, blackout_windows):
+    """Return a readable phase label for progress logs."""
+    if not blackout_windows:
+        return "normal"
+    if _in_blackout_window(t_since_start, blackout_windows):
+        return "blackout"
+    first_start = blackout_windows[0][0]
+    if t_since_start < first_start:
+        return "pre-blackout"
+    return "recovery"
+
+
 def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg, kill_callback=None, debug_label=None):
     """Special relay mode for the 'stop-then-recover' scenario.
 
@@ -219,8 +248,7 @@ def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg,
     """
     base_latency = scenario_cfg["base_latency_sec"]
     test_start = scenario_cfg["test_start"]
-    blackout_start = scenario_cfg["blackout_start"]
-    blackout_end = scenario_cfg["blackout_end"]
+    blackout_windows = scenario_cfg["blackout_windows"]
 
     try:
         while not stop_event.is_set():
@@ -238,15 +266,14 @@ def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg,
             # Determine whether this carrier should currently behave as "dead".
             dead_forever = False
 
-            if t_since_start < blackout_start:
-                # Fully alive before blackout.
-                pass
-            elif blackout_start <= t_since_start < blackout_end:
+            if _in_blackout_window(t_since_start, blackout_windows):
                 # During blackout: all carriers (old or newly opened) are dead-but-open.
                 dead_forever = True
-            else:  # t_since_start >= blackout_end
-                if opened_at < test_start + blackout_end:
-                    # Any carrier opened before blackout_end stays dead forever.
+            else:
+                dead_cutoff = _dead_cutoff_time(t_since_start, blackout_windows)
+                if dead_cutoff > 0.0 and opened_at < test_start + dead_cutoff:
+                    # Any carrier opened before the end of the most recently elapsed blackout
+                    # remains dead forever after that blackout.
                     dead_forever = True
 
             if dead_forever:
@@ -319,7 +346,7 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
     # the carrier as dead via its own inactivity timeout.
     if scenario_cfg is not None and scenario_cfg.get("mode") == "stop_recover":
         t_since_start = opened_at - scenario_cfg["test_start"]
-        if scenario_cfg["blackout_start"] <= t_since_start < scenario_cfg["blackout_end"]:
+        if _in_blackout_window(t_since_start, scenario_cfg["blackout_windows"]):
             stop_event = scenario_cfg.get("_stop_event") or threading.Event()
             try:
                 _blackout_hold_relay(client_conn, stop_event)
@@ -862,8 +889,7 @@ def _run_wifi_heavy(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     MAX_INFLIGHT = 512 * 1024
 
     scenario_cfg = getattr(args, "_scenario_cfg", None)
-    blackout_start = scenario_cfg["blackout_start"] if scenario_cfg else 30.0
-    blackout_end   = scenario_cfg["blackout_end"]   if scenario_cfg else 60.0
+    blackout_windows = scenario_cfg["blackout_windows"] if scenario_cfg else [(30.0, 60.0)]
     test_start     = scenario_cfg["test_start"]     if scenario_cfg else time.perf_counter()
 
     min_bytes_each_direction = getattr(args, "wifi_heavy_min_bytes", 60 * 1024)
@@ -1031,11 +1057,7 @@ def _run_wifi_heavy(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             # Phase is relative to the scenario test_start (proxy start time),
             # not relative to when this function was called.
             abs_t = test_start + (time.perf_counter() - t_run_start)
-            phase = (
-                "pre-blackout" if abs_t < test_start + blackout_start else
-                "blackout"     if abs_t < test_start + blackout_end   else
-                "recovery"
-            )
+            phase = _phase_label(abs_t - test_start, blackout_windows)
             with c2t_lock:
                 cs, cr = c2t_sent_bytes[0], c2t_recvd_bytes[0]
             with t2c_lock:
@@ -1337,6 +1359,55 @@ def main():
         metavar="BYTES",
         help="Minimum bytes each direction must send/receive to pass --scenario-wifi-heavy. Default 61440 (60 KB).",
     )
+    parser.add_argument(
+        "--scenario-blackout-start",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Start time (since test start) of the primary blackout window. Default 30.",
+    )
+    parser.add_argument(
+        "--scenario-blackout-duration",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Duration of the primary blackout window. Default 30.",
+    )
+    parser.add_argument(
+        "--scenario-second-blackout-start",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Optional start time of a second blackout window.",
+    )
+    parser.add_argument(
+        "--scenario-second-blackout-duration",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Duration of the optional second blackout window. Used with --scenario-second-blackout-start.",
+    )
+    parser.add_argument(
+        "--scenario-periodic-blackout-interval",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Optional interval between periodic blackout windows.",
+    )
+    parser.add_argument(
+        "--scenario-periodic-blackout-duration",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Duration of each periodic blackout window.",
+    )
+    parser.add_argument(
+        "--scenario-periodic-blackout-count",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Number of periodic blackout windows to add.",
+    )
 
     # Pass/fail criteria (both continuous and non-continuous modes).
     # The test exits with code 1 if any violated criterion is detected.
@@ -1411,12 +1482,31 @@ def main():
     _proxy_stop_event = threading.Event()  # signals _blackout_hold_relay to exit
     if getattr(args, "scenario_stop_recover", False) or getattr(args, "scenario_wifi_heavy", False):
         base_latency_sec = (args.latency_ms / 1000.0) if args.latency_ms else 0.05
+        b1_start = max(0.0, float(args.scenario_blackout_start))
+        b1_dur = max(0.0, float(args.scenario_blackout_duration))
+        blackout_windows = []
+        if b1_dur > 0.0:
+            blackout_windows.append((b1_start, b1_start + b1_dur))
+        if args.scenario_second_blackout_start is not None:
+            b2_start = max(0.0, float(args.scenario_second_blackout_start))
+            b2_dur = max(0.0, float(args.scenario_second_blackout_duration))
+            if b2_dur > 0.0:
+                blackout_windows.append((b2_start, b2_start + b2_dur))
+        if args.scenario_periodic_blackout_interval is not None:
+            interval = max(0.0, float(args.scenario_periodic_blackout_interval))
+            dur = max(0.0, float(args.scenario_periodic_blackout_duration))
+            count = max(0, int(args.scenario_periodic_blackout_count))
+            if interval > 0.0 and dur > 0.0 and count > 0:
+                start = b1_start
+                for i in range(count):
+                    s = start + i * interval
+                    blackout_windows.append((s, s + dur))
+        blackout_windows.sort(key=lambda x: x[0])
         scenario_cfg = {
             "mode": "stop_recover",
             "test_start": time.perf_counter(),
             "base_latency_sec": base_latency_sec,
-            "blackout_start": 30.0,
-            "blackout_end": 60.0,
+            "blackout_windows": blackout_windows,
             # Shared stop event so _blackout_hold_relay threads exit when we clean up.
             "_stop_event": _proxy_stop_event,
         }
