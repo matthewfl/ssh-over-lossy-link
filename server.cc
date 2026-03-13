@@ -826,26 +826,39 @@ int run_server(const Args& args) {
         }
       }
 
-      // SUGGEST_CLOSE: server cannot close; client performs actual close. Rate-limit 1 per 10s.
-      for (int cfd : quality.dead_idle_fds) {
-        if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
-        last_suggest_close_ns = now_ns_val;
-        packet_io::append_suggest_close(carriers[cfd].write_buf);
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-        if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
-                         (unsigned long long)(now_ns_val/1000000ULL), cfd);
-      }
-      if (quality.rtt_outlier_fd >= 0
-          && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
-        last_suggest_close_ns = now_ns_val;
-        packet_io::append_suggest_close(carriers[quality.rtt_outlier_fd].write_buf);
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = quality.rtt_outlier_fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, quality.rtt_outlier_fd, &ev);
-        if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
-                         (unsigned long long)(now_ns_val/1000000ULL), quality.rtt_outlier_fd);
+      // SUGGEST_CLOSE: avoid self-induced churn when traffic is light/idle.
+      // Only suggest-close aggressively under meaningful backlog pressure.
+      size_t backlog_bytes = 0;
+      for (const auto& [_, ud] : unacked_data) backlog_bytes += ud.data.size();
+      const bool heavy_backlog =
+          (backlog_bytes > 256 * 1024ULL) ||
+          (unacked_data.size() > 128) ||
+          !backend_pending.empty() ||
+          !reassembly.empty() ||
+          !rs_pending.empty();
+      if (heavy_backlog) {
+        // Server cannot close directly; client performs actual close.
+        // Keep rate limiting (1 per 10s) to avoid mass-close bursts.
+        for (int cfd : quality.dead_idle_fds) {
+          if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
+          last_suggest_close_ns = now_ns_val;
+          packet_io::append_suggest_close(carriers[cfd].write_buf);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = cfd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
+                           (unsigned long long)(now_ns_val/1000000ULL), cfd);
+        }
+        if (quality.rtt_outlier_fd >= 0
+            && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
+          last_suggest_close_ns = now_ns_val;
+          packet_io::append_suggest_close(carriers[quality.rtt_outlier_fd].write_buf);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = quality.rtt_outlier_fd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, quality.rtt_outlier_fd, &ev);
+          if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
+                           (unsigned long long)(now_ns_val/1000000ULL), quality.rtt_outlier_fd);
+        }
       }
 
       // Update global receive timestamp from all live carriers.

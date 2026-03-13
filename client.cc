@@ -743,6 +743,15 @@ int run_client(const Args& args) {
   };
 
   recv_cb.on_suggest_close = [&](int fd) {
+    // Defensive cap unless backlog is genuinely heavy. Tiny in-flight backlogs
+    // (a few packets) should not allow large close cascades.
+    size_t backlog_bytes = 0;
+    for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
+    const bool heavy_backlog = (backlog_bytes > 256 * 1024ULL) || (unacked_sends.size() > 128);
+    if (!heavy_backlog) {
+      size_t reap_cap = std::max<size_t>(3, target_carriers / 3);
+      if (pending_reap.size() >= reap_cap) return;
+    }
     add_to_pending_reap(fd, "server_suggest_close");
   };
 
@@ -1108,6 +1117,10 @@ int run_client(const Args& args) {
         } else {
           pending_timeout_ns = 20000000000ULL;  // 20 s default when ConnectTimeout is unset
         }
+        // During total carrier loss, recover aggressively: stale pending connects
+        // should be recycled quickly so slots become available for fresh attempts.
+        if (carriers.empty())
+          pending_timeout_ns = std::min<uint64_t>(pending_timeout_ns, 5000000000ULL);  // 5 s
         const uint64_t started = pending_connect_started_ns[slot];
         if (now_pc > started && now_pc - started > pending_timeout_ns) {
           if (auto pit = ssh_idx_to_pid.find(slot); pit != ssh_idx_to_pid.end()) {
@@ -1313,7 +1326,28 @@ int run_client(const Args& args) {
           }
         }
 
+        size_t dead_reap_added = 0;
+        size_t backlog_bytes = 0;
+        for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
+        const bool heavy_backlog = (backlog_bytes > 256 * 1024ULL) || (unacked_sends.size() > 128);
+        // In SSH mode, false-positive dead-idle classification can trigger
+        // self-inflicted carrier churn. Only run dead-idle reap logic when
+        // backlog pressure is genuinely high.
+        if (args.unix_socket_connection.empty() && !heavy_backlog) {
+          // Skip this cycle; keep carriers and rely on concrete read errors / peer signals.
+          continue;
+        }
+        size_t dead_reap_cap = heavy_backlog
+            ? std::max<size_t>(3, target_carriers)
+            : std::max<size_t>(1, target_carriers / 5);
+        size_t pending_cap = heavy_backlog
+            ? std::max<size_t>(6, target_carriers)
+            : std::max<size_t>(3, target_carriers / 3);
         for (int cfd : quality.dead_idle_fds) {
+          // Avoid mass-close cascades: only schedule a small number of dead-idle
+          // carriers per ping cycle, and never let pending_reap grow unbounded.
+          if (pending_reap.size() >= pending_cap) break;
+          if (dead_reap_added >= dead_reap_cap) break;
           // Tell the server this carrier is about to be closed so it can stop
           // sending on it immediately. We may delay our own close slightly
           // (pending_reap path) to drain any in-flight data, but once the server
@@ -1334,6 +1368,7 @@ int run_client(const Args& args) {
             // so we don't drop below the carrier floor during reconnection.
             add_to_pending_reap(cfd, "dead_idle");
           }
+          dead_reap_added++;
         }
 
         // When above target: slowly close HEALTHY pending-reap carriers (1 per 60s).

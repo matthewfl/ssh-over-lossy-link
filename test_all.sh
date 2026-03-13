@@ -330,6 +330,27 @@ run_test "high-latency-350-500ms-loss3pct-t2c" \
     --test-min-packets            8
 
 # ============================================================================
+# 8d. High-latency low-backlog stability:
+#     smaller packets + moderate loss to catch control-plane churn/collapse
+#     under light traffic (a common real-world interactive session pattern).
+# ============================================================================
+run_test "high-latency-low-backlog-stability" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 150 \
+    --continuous-tcp-to-client-only \
+    --continuous-min-size 32 \
+    --continuous-max-size 128 \
+    --latency-random \
+    --latency-random-low-ms  300 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.02 \
+    --test-max-latency        60000 \
+    --test-max-average-latency 5000 \
+    --test-max-average-latency-after-warmup 3000 \
+    --test-min-packets           12
+
+# ============================================================================
 # 9b. Stop-then-recover scenario — carriers go dead (but stay open) for a full
 #     30-second blackout, with short-lived replacement carriers that also die,
 #     then the link recovers after 60 seconds and new carriers work again.
