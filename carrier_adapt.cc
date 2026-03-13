@@ -110,13 +110,24 @@ CarrierQualityResult assess_carriers(
 
   for (const auto& c : carriers) {
     if (now_ns - c.connect_ns < grace_ns) continue;
-    // If the carrier has never received anything, only count connect_ns for
-    // last_activity; ignoring last_send_ns prevents a retransmit loop from
-    // keeping a silently-dropped (e.g. blackout) carrier alive indefinitely.
-    uint64_t last_activity = (c.last_recv_ns == 0)
-        ? c.connect_ns
-        : std::max({c.connect_ns, c.last_recv_ns, c.last_send_ns});
+    // Default idle test: no recent send/recv activity.
+    uint64_t last_activity = std::max({c.connect_ns, c.last_recv_ns, c.last_send_ns});
     bool idle_dead = (now_ns - last_activity > dead_idle_ns);
+    // Special case for carriers that have NEVER received anything:
+    // only reap them aggressively when all three are true:
+    // 1) they've been connected long enough,
+    // 2) we have sent on them recently (active retransmit pressure),
+    // 3) another carrier has received data since this one connected.
+    //
+    // This preserves the blackout recovery fix without culling healthy-but-idle
+    // carriers during normal low/one-way traffic.
+    if (!idle_dead && c.last_recv_ns == 0) {
+      bool connected_long_enough = (now_ns - c.connect_ns > dead_idle_ns);
+      bool actively_sending = (c.last_send_ns > 0) && (now_ns - c.last_send_ns < dead_idle_ns);
+      bool peers_receiving = (latest_recv_ns > c.connect_ns + dead_idle_ns);
+      if (connected_long_enough && actively_sending && peers_receiving)
+        idle_dead = true;
+    }
 
     // Additional RX-dead test: this carrier has not received anything for a long
     // time while at least one peer *has* recently received data. This catches
