@@ -203,8 +203,131 @@ def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, ki
 
 _proxy_debug_enabled = False  # set True temporarily for diagnostics
 
-def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
-    """Connect to server socket and relay client_conn <-> server in both directions with optional latency."""
+def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg, kill_callback=None, debug_label=None):
+    """Special relay mode for the 'stop-then-recover' scenario.
+
+    Behaviour:
+      - 0–blackout_start: normal operation with base_latency.
+      - blackout_start–blackout_end:
+          * Carriers opened before blackout_start become "dead" but remain open:
+            all data is read and dropped, never forwarded.
+          * Carriers opened during this window work normally for blackout_new_lifetime
+            seconds after their own open time, then are force-closed (kill_callback).
+      - >= blackout_end:
+          * Carriers opened before blackout_end remain dead forever (data dropped).
+          * Carriers opened after blackout_end operate normally with base_latency.
+    """
+    base_latency = scenario_cfg["base_latency_sec"]
+    test_start = scenario_cfg["test_start"]
+    blackout_start = scenario_cfg["blackout_start"]
+    blackout_end = scenario_cfg["blackout_end"]
+
+    try:
+        while not stop_event.is_set():
+            try:
+                data = sock_from.recv(65536)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+            if not data:
+                break
+
+            now = time.perf_counter()
+            t_since_start = now - test_start
+            age = now - opened_at
+
+            # Determine whether this carrier should currently behave as "dead".
+            dead_forever = False
+
+            if t_since_start < blackout_start:
+                # Fully alive before blackout.
+                pass
+            elif blackout_start <= t_since_start < blackout_end:
+                # During blackout: all carriers (old or newly opened) are dead-but-open.
+                dead_forever = True
+            else:  # t_since_start >= blackout_end
+                if opened_at < test_start + blackout_end:
+                    # Any carrier opened before blackout_end stays dead forever.
+                    dead_forever = True
+
+            if dead_forever:
+                # Simulate a dead-but-open link: consume and drop data without forwarding.
+                if _proxy_debug_enabled and debug_label:
+                    try:
+                        print(f"[proxy-scenario] {debug_label} dropping {len(data)} bytes (dead carrier)", flush=True)
+                    except Exception:
+                        pass
+                continue
+
+            # Alive path: apply base latency then forward data.
+            if base_latency > 0:
+                time.sleep(base_latency)
+            try:
+                sock_to.sendall(data)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                if kill_callback is not None:
+                    kill_callback()
+                return
+    finally:
+        try:
+            sock_to.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def _blackout_hold_relay(client_conn, stop_event):
+    """Accept-but-silence relay for blackout new carriers.
+
+    Reads and discards all data from client_conn; never writes anything back;
+    never connects to the backend.  Simulates Wi-Fi being off: the TCP
+    connection is accepted at the OS level but packets vanish.  The connection
+    stays open until the peer closes it or stop_event fires, so ssh-oll
+    detects the carrier as dead only via its own inactivity timeout.
+    """
+    client_conn.settimeout(1.0)
+    try:
+        while not stop_event.is_set():
+            try:
+                data = client_conn.recv(65536)
+                if not data:
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    finally:
+        try:
+            client_conn.close()
+        except OSError:
+            pass
+
+
+def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
+                     initial_connection_latency_sec=0.0, connection_death_probability=0.0,
+                     scenario_cfg=None):
+    """Connect to server socket and relay client_conn <-> server in both directions with optional latency.
+
+    When scenario_cfg is provided with mode 'stop_recover', use the special stop-then-recover
+    relay behaviour instead of the generic latency/death_probability path.  Carriers opened
+    during the blackout window are held open (drain-and-drop) rather than connected to the
+    backend, simulating Wi-Fi being physically off.
+    """
+    opened_at = time.perf_counter()
+
+    # Blackout new-connection handling: accept the carrier but never connect it to the
+    # backend.  We drain-and-drop all data from the client so its write buffer never
+    # fills (write() always succeeds), but we never send anything back.  ssh-oll detects
+    # the carrier as dead via its own inactivity timeout.
+    if scenario_cfg is not None and scenario_cfg.get("mode") == "stop_recover":
+        t_since_start = opened_at - scenario_cfg["test_start"]
+        if scenario_cfg["blackout_start"] <= t_since_start < scenario_cfg["blackout_end"]:
+            stop_event = scenario_cfg.get("_stop_event") or threading.Event()
+            try:
+                _blackout_hold_relay(client_conn, stop_event)
+            finally:
+                if on_close:
+                    on_close()
+            return
+
     try:
         server_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_conn.connect(server_socket_path)
@@ -227,32 +350,55 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
             pass
 
     import threading as _threading
+    import itertools as _it
     _conn_id = getattr(_threading.current_thread(), '_proxy_conn_id', None)
     if _conn_id is None:
-        import itertools as _it
         _counter = getattr(proxy_connection, '_counter', None)
         if _counter is None:
             proxy_connection._counter = _it.count()
         _conn_id = next(proxy_connection._counter)
         _threading.current_thread()._proxy_conn_id = _conn_id
-    relay_kw = {"death_probability": connection_death_probability, "kill_callback": kill_connection}
+
+    use_stop_recover = scenario_cfg is not None and scenario_cfg.get("mode") == "stop_recover"
+
     try:
-        t1 = threading.Thread(
-            target=relay_with_latency,
-            args=(client_conn, server_conn, delay_spec),
-            kwargs=relay_kw,
-            daemon=True,
-        )
-        t2 = threading.Thread(
-            target=relay_with_latency,
-            args=(server_conn, client_conn, delay_spec),
-            kwargs=relay_kw,
-            daemon=True,
-        )
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
+        if use_stop_recover:
+            stop = threading.Event()
+            dbg = f"c2s-{_conn_id}" if _proxy_debug_enabled else None
+            t1 = threading.Thread(
+                target=_relay_stop_recover,
+                args=(client_conn, server_conn, stop, opened_at, scenario_cfg),
+                kwargs={"kill_callback": kill_connection, "debug_label": dbg},
+                daemon=True,
+            )
+            t2 = threading.Thread(
+                target=_relay_stop_recover,
+                args=(server_conn, client_conn, stop, opened_at, scenario_cfg),
+                kwargs={"kill_callback": kill_connection, "debug_label": f"s2c-{_conn_id}" if _proxy_debug_enabled else None},
+                daemon=True,
+            )
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+        else:
+            relay_kw = {"death_probability": connection_death_probability, "kill_callback": kill_connection}
+            t1 = threading.Thread(
+                target=relay_with_latency,
+                args=(client_conn, server_conn, delay_spec),
+                kwargs=relay_kw,
+                daemon=True,
+            )
+            t2 = threading.Thread(
+                target=relay_with_latency,
+                args=(server_conn, client_conn, delay_spec),
+                kwargs=relay_kw,
+                daemon=True,
+            )
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
     finally:
         try:
             client_conn.close()
@@ -683,7 +829,321 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     return 1 if (continuous_errors or test_failures) else 0
 
 
-def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0):
+# ---------------------------------------------------------------------------
+# Heavy Wi-Fi-stop-then-recover test
+# ---------------------------------------------------------------------------
+
+def _run_wifi_heavy(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
+    """
+    Concurrent flood test for the wifi-stop-then-recover-heavy scenario.
+
+    Two writer threads push data (alternating small < packet_size and large
+    >= packet_size chunks to exercise both SMALL and RS code paths) into both
+    directions of the ssh-oll tunnel.  The writers are backpressure-limited:
+    they pause when the in-flight backlog (sent − received) exceeds
+    MAX_INFLIGHT bytes.  This guarantees that:
+      • the backlog stays bounded and drainable within the test window, and
+      • a meaningful amount of data (>= wifi_heavy_min_bytes) is buffered
+        during the blackout and must survive retransmit-after-reconnect.
+
+    Stream validation: each writer sends a cyclic byte pattern 0,1,...,255,0,…
+    The matching reader checks every received byte is (prev+1)%256.
+
+    Returns 0 on success, 1 on failure.
+    """
+    test_duration = getattr(args, "continuous_duration", None) or 120.0
+    packet_size   = getattr(args, "packet_size", 100)
+    # Alternate small (< packet_size → SMALL path) and large (>= packet_size → RS path).
+    small_size = max(1, packet_size // 2)
+    large_size = max(packet_size * 4, 400)
+    # Cap in-flight bytes per direction to keep drain time reasonable.
+    # 512 KB >> 60 KB minimum, but << the hundreds of MB the writer would
+    # otherwise queue before the blackout even starts.
+    MAX_INFLIGHT = 512 * 1024
+
+    scenario_cfg = getattr(args, "_scenario_cfg", None)
+    blackout_start = scenario_cfg["blackout_start"] if scenario_cfg else 30.0
+    blackout_end   = scenario_cfg["blackout_end"]   if scenario_cfg else 60.0
+    test_start     = scenario_cfg["test_start"]     if scenario_cfg else time.perf_counter()
+
+    min_bytes_each_direction = getattr(args, "wifi_heavy_min_bytes", 60 * 1024)
+
+    stop_writers  = threading.Event()
+    errors        = []
+    errors_lock   = threading.Lock()
+
+    # ── client → TCP direction ───────────────────────────────────────────────
+    c2t_sent_bytes   = [0]
+    c2t_recvd_bytes  = [0]
+    c2t_counter_out  = [0]    # next byte value to write
+    c2t_counter_in   = [None] # last byte received (None = not yet seen)
+    c2t_lock         = threading.Lock()
+    c2t_done         = threading.Event()
+
+    def c2t_writer():
+        idx = 0
+        while not stop_writers.is_set():
+            # Throttle: don't outrun delivery by more than MAX_INFLIGHT bytes.
+            while True:
+                with c2t_lock:
+                    inflight = c2t_sent_bytes[0] - c2t_recvd_bytes[0]
+                if inflight < MAX_INFLIGHT:
+                    break
+                if stop_writers.is_set():
+                    c2t_done.set()
+                    return
+                time.sleep(0.01)
+
+            size = small_size if (idx % 2 == 0) else large_size
+            idx += 1
+            with c2t_lock:
+                start = c2t_counter_out[0]
+            data = bytes((start + i) % 256 for i in range(size))
+            try:
+                client_proc.stdin.write(data)
+                client_proc.stdin.flush()
+            except OSError:
+                break
+            with c2t_lock:
+                c2t_sent_bytes[0] += size
+                c2t_counter_out[0] = (start + size) % 256
+        c2t_done.set()
+
+    def c2t_reader():
+        tcp_conn.settimeout(1.0)
+        while True:
+            try:
+                chunk = tcp_conn.recv(65536)
+            except socket.timeout:
+                with c2t_lock:
+                    done = c2t_done.is_set() and c2t_sent_bytes[0] == c2t_recvd_bytes[0]
+                if done:
+                    break
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            with c2t_lock:
+                for b in chunk:
+                    prev = c2t_counter_in[0]
+                    if prev is None:
+                        c2t_counter_in[0] = b
+                    else:
+                        expected = (prev + 1) % 256
+                        if b != expected:
+                            with errors_lock:
+                                errors.append(
+                                    f"c2t stream corruption: expected byte {expected}, got {b}"
+                                    f" (after {c2t_recvd_bytes[0]} bytes received)"
+                                )
+                        c2t_counter_in[0] = b
+                c2t_recvd_bytes[0] += len(chunk)
+
+    # ── TCP → client direction ───────────────────────────────────────────────
+    t2c_sent_bytes  = [0]
+    t2c_recvd_bytes = [0]
+    t2c_counter_out = [0]
+    t2c_counter_in  = [None]
+    t2c_lock        = threading.Lock()
+    t2c_done        = threading.Event()
+
+    def t2c_writer():
+        idx = 0
+        while not stop_writers.is_set():
+            # Same backpressure throttle.
+            while True:
+                with t2c_lock:
+                    inflight = t2c_sent_bytes[0] - t2c_recvd_bytes[0]
+                if inflight < MAX_INFLIGHT:
+                    break
+                if stop_writers.is_set():
+                    t2c_done.set()
+                    return
+                time.sleep(0.01)
+
+            size = small_size if (idx % 2 == 0) else large_size
+            idx += 1
+            with t2c_lock:
+                start = t2c_counter_out[0]
+            data = bytes((start + i) % 256 for i in range(size))
+            try:
+                tcp_conn.sendall(data)
+            except OSError:
+                break
+            with t2c_lock:
+                t2c_sent_bytes[0] += size
+                t2c_counter_out[0] = (start + size) % 256
+        t2c_done.set()
+
+    def t2c_reader():
+        raw_stdout = client_proc.stdout.raw
+        while True:
+            try:
+                r, _, _ = select.select([raw_stdout], [], [], 1.0)
+            except (OSError, ValueError):
+                break
+            if not r:
+                with t2c_lock:
+                    done = t2c_done.is_set() and t2c_sent_bytes[0] == t2c_recvd_bytes[0]
+                if done:
+                    break
+                continue
+            try:
+                chunk = raw_stdout.read(65536)
+            except (OSError, BlockingIOError):
+                continue
+            if not chunk:
+                break
+            with t2c_lock:
+                for b in chunk:
+                    prev = t2c_counter_in[0]
+                    if prev is None:
+                        t2c_counter_in[0] = b
+                    else:
+                        expected = (prev + 1) % 256
+                        if b != expected:
+                            with errors_lock:
+                                errors.append(
+                                    f"t2c stream corruption: expected byte {expected}, got {b}"
+                                    f" (after {t2c_recvd_bytes[0]} bytes received)"
+                                )
+                        t2c_counter_in[0] = b
+                t2c_recvd_bytes[0] += len(chunk)
+
+    tw1 = threading.Thread(target=c2t_writer, daemon=True)
+    tw2 = threading.Thread(target=t2c_writer, daemon=True)
+    tr1 = threading.Thread(target=c2t_reader, daemon=True)
+    tr2 = threading.Thread(target=t2c_reader, daemon=True)
+    for t in (tw1, tw2, tr1, tr2):
+        t.start()
+
+    # ── Run for test_duration, printing progress every 5 s ──────────────────
+    t_run_start = time.perf_counter()
+    try:
+        while True:
+            elapsed = time.perf_counter() - t_run_start
+            if elapsed >= test_duration:
+                break
+            remaining = test_duration - elapsed
+            time.sleep(min(5.0, remaining))
+            elapsed = time.perf_counter() - t_run_start
+            # Phase is relative to the scenario test_start (proxy start time),
+            # not relative to when this function was called.
+            abs_t = test_start + (time.perf_counter() - t_run_start)
+            phase = (
+                "pre-blackout" if abs_t < test_start + blackout_start else
+                "blackout"     if abs_t < test_start + blackout_end   else
+                "recovery"
+            )
+            with c2t_lock:
+                cs, cr = c2t_sent_bytes[0], c2t_recvd_bytes[0]
+            with t2c_lock:
+                ts, tr = t2c_sent_bytes[0], t2c_recvd_bytes[0]
+            print(
+                f"[wifi-heavy] t={elapsed:.0f}s phase={phase}  "
+                f"c2t sent={cs//1024}KB recv={cr//1024}KB inflight={( cs-cr)//1024}KB  "
+                f"t2c sent={ts//1024}KB recv={tr//1024}KB inflight={(ts-tr)//1024}KB",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        pass
+
+    # ── Stop writers, then drain until all bytes arrive or timeout ──────────
+    stop_writers.set()
+    tw1.join(timeout=3.0)
+    tw2.join(timeout=3.0)
+
+    # Give readers extra time to drain buffered data after recovery.
+    drain_timeout = 90.0
+    drain_deadline = time.perf_counter() + drain_timeout
+    last_print = time.perf_counter()
+    while time.perf_counter() < drain_deadline:
+        with c2t_lock:
+            c2t_s = c2t_sent_bytes[0]
+            c2t_r = c2t_recvd_bytes[0]
+        with t2c_lock:
+            t2c_s = t2c_sent_bytes[0]
+            t2c_r = t2c_recvd_bytes[0]
+        if c2t_r >= c2t_s and t2c_r >= t2c_s:
+            break
+        now = time.perf_counter()
+        if now - last_print >= 5.0:
+            print(
+                f"[wifi-heavy] draining...  "
+                f"c2t {c2t_r//1024}/{c2t_s//1024}KB  t2c {t2c_r//1024}/{t2c_s//1024}KB",
+                flush=True,
+            )
+            last_print = now
+        time.sleep(0.5)
+
+    # ── Tear down ────────────────────────────────────────────────────────────
+    try:
+        client_proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        client_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        client_proc.kill()
+
+    stop_proxy.set()
+    try:
+        tcp_conn.close()
+    except OSError:
+        pass
+    try:
+        tcp_listen.close()
+    except OSError:
+        pass
+
+    tr1.join(timeout=5.0)
+    tr2.join(timeout=5.0)
+
+    # ── Results ──────────────────────────────────────────────────────────────
+    with c2t_lock:
+        c2t_s = c2t_sent_bytes[0]
+        c2t_r = c2t_recvd_bytes[0]
+    with t2c_lock:
+        t2c_s = t2c_sent_bytes[0]
+        t2c_r = t2c_recvd_bytes[0]
+
+    print(f"\n[wifi-heavy] Final: c2t sent={c2t_s} recv={c2t_r}  t2c sent={t2c_s} recv={t2c_r}")
+
+    fail = False
+
+    if errors:
+        print(f"\n[wifi-heavy] STREAM CORRUPTION ({len(errors)} error(s)):", file=sys.stderr)
+        for e in errors[:10]:
+            print(f"  {e}", file=sys.stderr)
+        fail = True
+
+    if c2t_r < c2t_s:
+        print(f"\n[wifi-heavy] FAIL: c2t missing {c2t_s - c2t_r} bytes "
+              f"({c2t_r}/{c2t_s} received)", file=sys.stderr)
+        fail = True
+
+    if t2c_r < t2c_s:
+        print(f"\n[wifi-heavy] FAIL: t2c missing {t2c_s - t2c_r} bytes "
+              f"({t2c_r}/{t2c_s} received)", file=sys.stderr)
+        fail = True
+
+    if c2t_s < min_bytes_each_direction:
+        print(f"\n[wifi-heavy] FAIL: only {c2t_s} bytes sent c2t, "
+              f"need at least {min_bytes_each_direction}", file=sys.stderr)
+        fail = True
+
+    if t2c_s < min_bytes_each_direction:
+        print(f"\n[wifi-heavy] FAIL: only {t2c_s} bytes sent t2c, "
+              f"need at least {min_bytes_each_direction}", file=sys.stderr)
+        fail = True
+
+    if not fail:
+        print(f"\n[wifi-heavy] PASS: all {c2t_s} c2t bytes and {t2c_s} t2c bytes delivered correctly.")
+    return 1 if fail else 0
+
+
+def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0, scenario_cfg=None):
     """Accept on proxy_path, for each connection relay to server_socket_path with latency.
 
     If connection_callback is not None, it is called with "opened" when a new connection
@@ -715,6 +1175,7 @@ def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, co
                     on_close,
                     initial_connection_latency_sec,
                     connection_death_probability,
+                    scenario_cfg,
                 ),
                 daemon=True,
             )
@@ -854,6 +1315,28 @@ def main():
         default=False,
         help="In --continuous mode, only run the client→TCP direction (suppress TCP→client)",
     )
+    parser.add_argument(
+        "--scenario-stop-recover",
+        action="store_true",
+        default=False,
+        help="Simulate a link that runs normally for 30s at base latency, then has a 30s blackout where "
+             "existing carriers become dead-but-open and new carriers are accepted but never connected, "
+             "then recovers after 60s with newly created carriers working again.",
+    )
+    parser.add_argument(
+        "--scenario-wifi-heavy",
+        action="store_true",
+        default=False,
+        help="Heavy wifi-stop-then-recover test: concurrent writers flood both directions continuously "
+             "(>=60 KB each) through a 30s blackout; validates all bytes are delivered after recovery.",
+    )
+    parser.add_argument(
+        "--wifi-heavy-min-bytes",
+        type=int,
+        default=60 * 1024,
+        metavar="BYTES",
+        help="Minimum bytes each direction must send/receive to pass --scenario-wifi-heavy. Default 61440 (60 KB).",
+    )
 
     # Pass/fail criteria (both continuous and non-continuous modes).
     # The test exits with code 1 if any violated criterion is detected.
@@ -893,6 +1376,18 @@ def main():
         metavar="SECONDS",
         help="Warmup window in seconds for --test-max-average-latency-after-warmup. Default 30.",
     )
+    parser.add_argument(
+        "--server-debug",
+        action="store_true",
+        default=False,
+        help="Pass --debug to ssh-oll --server; debug log will be at /tmp/ssh-oll-server-<pid>.log.",
+    )
+    parser.add_argument(
+        "--client-debug",
+        action="store_true",
+        default=False,
+        help="Pass --debug to ssh-oll client; debug log will be at /tmp/ssh-oll-client-<pid>.log.",
+    )
     args = parser.parse_args()
 
     # Build delay spec: constant seconds or callable() -> seconds for randomize mode
@@ -910,6 +1405,22 @@ def main():
         delay_spec = latency_sec
     proxy_path = args.proxy_socket or f"/tmp/ssh-oll-test-script.{random_suffix()}"
 
+    # Scenario configuration for the stop-then-recover tests.  Used by both
+    # --scenario-stop-recover (sequential continuous) and --scenario-wifi-heavy.
+    scenario_cfg = None
+    _proxy_stop_event = threading.Event()  # signals _blackout_hold_relay to exit
+    if getattr(args, "scenario_stop_recover", False) or getattr(args, "scenario_wifi_heavy", False):
+        base_latency_sec = (args.latency_ms / 1000.0) if args.latency_ms else 0.05
+        scenario_cfg = {
+            "mode": "stop_recover",
+            "test_start": time.perf_counter(),
+            "base_latency_sec": base_latency_sec,
+            "blackout_start": 30.0,
+            "blackout_end": 60.0,
+            # Shared stop event so _blackout_hold_relay threads exit when we clean up.
+            "_stop_event": _proxy_stop_event,
+        }
+
     # 1. Start TCP server (backend for ssh-oll --server)
     tcp_listen = tcp_server_listen(args.tcp_port)
     tcp_conn_holder = {"conn": None, "ready": threading.Event()}
@@ -923,8 +1434,12 @@ def main():
     tcp_thread.start()
 
     # 2. Start ssh-oll --server; it prints socket path then daemonizes
+    _server_debug = getattr(args, "server_debug", False)
+    _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
+    if _server_debug:
+        _server_cmd += ["--debug"]
     server_proc = subprocess.Popen(
-        [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)],
+        _server_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -942,8 +1457,15 @@ def main():
 
     # 3. Start proxy (client -> proxy -> server) with optional latency
     stop_proxy = threading.Event()
+    # When stop_proxy fires, also wake any _blackout_hold_relay threads.
+    _orig_stop_proxy_set = stop_proxy.set
+    def _stop_proxy_set_and_wake():
+        _orig_stop_proxy_set()
+        _proxy_stop_event.set()
+    stop_proxy.set = _stop_proxy_set_and_wake  # type: ignore[method-assign]
+
     connection_callback = None
-    if args.continuous:
+    if args.continuous or getattr(args, "scenario_wifi_heavy", False):
         connection_count = [0]
         connection_lock = threading.Lock()
 
@@ -974,12 +1496,14 @@ def main():
             connection_callback,
             initial_latency_sec,
             death_prob,
+            scenario_cfg,
         ),
         daemon=True,
     )
     proxy_thread.start()
 
     # 4. Start client with --unix-socket-connection
+    _client_debug = getattr(args, "client_debug", False)
     client_cmd = [
         args.ssh_oll_path,
         "--unix-socket-connection",
@@ -989,6 +1513,8 @@ def main():
         "--packet-size",
         str(min(args.packet_size, args.payload_size)),
     ]
+    if _client_debug:
+        client_cmd += ["--debug"]
     if args.extra_client_args:
         client_cmd += args.extra_client_args
     client_proc = subprocess.Popen(
@@ -1065,6 +1591,17 @@ def main():
         _got += client_proc.stdout.read(len(_warm) - len(_got))
     if not validate_payload(_got, _warm, "TCP→client (warmup)", None):
         print("Warmup TCP→client payload validation failed.", file=sys.stderr)
+
+    if getattr(args, "scenario_wifi_heavy", False):
+        # Attach the scenario config so the test can use timing info.
+        args._scenario_cfg = scenario_cfg
+        return _run_wifi_heavy(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+        )
 
     if args.continuous:
         return _run_continuous(

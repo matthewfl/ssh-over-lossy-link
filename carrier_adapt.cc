@@ -110,8 +110,12 @@ CarrierQualityResult assess_carriers(
 
   for (const auto& c : carriers) {
     if (now_ns - c.connect_ns < grace_ns) continue;
-    // Original idle test: no activity (send or recv) for a long time.
-    uint64_t last_activity = std::max({c.connect_ns, c.last_recv_ns, c.last_send_ns});
+    // If the carrier has never received anything, only count connect_ns for
+    // last_activity; ignoring last_send_ns prevents a retransmit loop from
+    // keeping a silently-dropped (e.g. blackout) carrier alive indefinitely.
+    uint64_t last_activity = (c.last_recv_ns == 0)
+        ? c.connect_ns
+        : std::max({c.connect_ns, c.last_recv_ns, c.last_send_ns});
     bool idle_dead = (now_ns - last_activity > dead_idle_ns);
 
     // Additional RX-dead test: this carrier has not received anything for a long

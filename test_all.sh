@@ -280,7 +280,42 @@ run_test "combined-latency-and-death" \
     --test-min-packets           20
 
 # ============================================================================
-# 9. Auto-adapt disabled (--no-auto) — fixed RS and carrier count.
+# 9b. Stop-then-recover scenario — carriers go dead (but stay open) for a full
+#     30-second blackout, with short-lived replacement carriers that also die,
+#     then the link recovers after 60 seconds and new carriers work again.
+#     This emulates Wi-Fi being turned off and then back on.
+#     We only assert that the connection survives and moves a minimum amount of
+#     data, and that post-recovery average latency is bounded once things have
+#     stabilised again.
+# ============================================================================
+run_test "wifi-stop-then-recover" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 90 \
+    --latency-ms 50 \
+    --scenario-stop-recover \
+    --warmup-seconds 70 \
+    --test-max-latency        120000 \
+    --test-max-average-latency-after-warmup 2000 \
+    --test-min-packets           20
+
+# ============================================================================
+# 9c. Stop-then-recover HEAVY — concurrent writers flood ≥60 KB per direction
+#     through the same 30-second blackout, then verify every byte is delivered
+#     after recovery.  Tests both SMALL-path (small chunks) and RS-path (large
+#     chunks) retransmission after a prolonged link outage.
+#     This test is EXPECTED TO FAIL until ssh-oll's retransmit-after-reconnect
+#     logic is confirmed correct.
+# ============================================================================
+run_test "wifi-stop-then-recover-heavy" \
+    --init-latency-override 0.05 \
+    --scenario-wifi-heavy \
+    --continuous-duration 120 \
+    --latency-ms 50 \
+    --scenario-stop-recover \
+    --wifi-heavy-min-bytes 61440
+
+# ============================================================================
+# 10. Auto-adapt disabled (--no-auto) — fixed RS and carrier count.
 #    Verifies the non-adaptive path delivers data on a clean 10 ms link.
 #    Thresholds are relaxed compared to adaptive mode (no RS tuning).
 # ============================================================================
@@ -293,7 +328,7 @@ run_test "no-auto-adapt-fixed-10ms" \
     --extra-client-args --no-auto
 
 # ============================================================================
-# 10. Integrity-only — no latency/throughput criteria; just verify that no
+# 11. Integrity-only — no latency/throughput criteria; just verify that no
 #     payload corruption occurs across a 15-second run.
 # ============================================================================
 run_test "sanity-integrity" \
