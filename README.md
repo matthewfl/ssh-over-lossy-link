@@ -263,4 +263,4 @@ MIT. See [LICENSE](LICENSE) in this repository.
 
 ## Vibe coded warning
 
-This project is mostly vibe coded using Cursor with Composer 1.5 and Claude Sonnet 4.6.
+This project is mostly vibe coded using Cursor with Composer 1.5, Claude Sonnet 4.6 and GPT Codex 5.3.

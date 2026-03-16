@@ -1313,6 +1313,8 @@ int run_client(const Args& args) {
         }
 
         // Debug: log any outstanding PINGs that have not received a PONG for >5 s.
+        std::set<int> stale_ping_fds;
+        uint64_t ping_fail_ns = scaled_ns(6, 15000000000ULL, 120000000000ULL);
         if (dbg && !outstanding_pings.empty()) {
           for (const auto& [key, sent_ns] : outstanding_pings) {
             uint64_t age_ns = now_p - sent_ns;
@@ -1323,7 +1325,24 @@ int run_client(const Args& args) {
                       fd,
                       (unsigned long long)(age_ns/1000000ULL));
             }
+            if (age_ns > ping_fail_ns)
+              stale_ping_fds.insert(key.first);
           }
+        }
+        // Any carrier with an outstanding PING beyond ping_fail_ns is very likely dead.
+        // Reap these promptly so retransmit can concentrate on healthy carriers.
+        for (int cfd : stale_ping_fds) {
+          auto itc = carriers.find(cfd);
+          if (itc == carriers.end() || itc->second.connecting) continue;
+          packet_io::append_suggest_close(itc->second.write_buf);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = cfd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          bool aggressive = (!unacked_sends.empty() && carriers.size() > 1);
+          if (carriers.size() > target_carriers || aggressive)
+            remove_carrier(cfd, "ping_timeout");
+          else
+            add_to_pending_reap(cfd, "ping_timeout");
         }
 
         size_t dead_reap_added = 0;

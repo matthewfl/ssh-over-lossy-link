@@ -231,8 +231,21 @@ def _phase_label(t_since_start, blackout_windows):
         return "pre-blackout"
     return "recovery"
 
+def _is_partial_dead_preblackout(conn_seq, dead_fraction):
+    """Deterministically mark a pre-blackout connection as dead/alive.
 
-def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg, kill_callback=None, debug_label=None):
+    Uses a stable modulo pattern so with dead_fraction=0.90 and 30 carriers we
+    get exactly 27 dead / 3 alive (sequence numbers 0..29).
+    """
+    frac = max(0.0, min(1.0, float(dead_fraction)))
+    dead_pct = int(round(frac * 100.0))
+    dead_pct = max(0, min(100, dead_pct))
+    return (conn_seq % 100) < dead_pct
+
+
+def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg,
+                        partial_dead_preblackout=False,
+                        kill_callback=None, debug_label=None):
     """Special relay mode for the 'stop-then-recover' scenario.
 
     Behaviour:
@@ -249,6 +262,7 @@ def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg,
     base_latency = scenario_cfg["base_latency_sec"]
     test_start = scenario_cfg["test_start"]
     blackout_windows = scenario_cfg["blackout_windows"]
+    mode = scenario_cfg.get("mode", "stop_recover")
 
     try:
         while not stop_event.is_set():
@@ -266,15 +280,26 @@ def _relay_stop_recover(sock_from, sock_to, stop_event, opened_at, scenario_cfg,
             # Determine whether this carrier should currently behave as "dead".
             dead_forever = False
 
-            if _in_blackout_window(t_since_start, blackout_windows):
-                # During blackout: all carriers (old or newly opened) are dead-but-open.
-                dead_forever = True
+            if mode == "partial_route_loss":
+                # Partial-route loss mode:
+                # - at blackout start, only a deterministic subset of PRE-blackout
+                #   carriers become dead forever.
+                # - remaining pre-blackout carriers keep working.
+                # - all NEW carriers opened after blackout start work normally.
+                if blackout_windows:
+                    first_start = blackout_windows[0][0]
+                    if partial_dead_preblackout and t_since_start >= first_start:
+                        dead_forever = True
             else:
-                dead_cutoff = _dead_cutoff_time(t_since_start, blackout_windows)
-                if dead_cutoff > 0.0 and opened_at < test_start + dead_cutoff:
-                    # Any carrier opened before the end of the most recently elapsed blackout
-                    # remains dead forever after that blackout.
+                if _in_blackout_window(t_since_start, blackout_windows):
+                    # During blackout: all carriers (old or newly opened) are dead-but-open.
                     dead_forever = True
+                else:
+                    dead_cutoff = _dead_cutoff_time(t_since_start, blackout_windows)
+                    if dead_cutoff > 0.0 and opened_at < test_start + dead_cutoff:
+                        # Any carrier opened before the end of the most recently elapsed blackout
+                        # remains dead forever after that blackout.
+                        dead_forever = True
 
             if dead_forever:
                 # Simulate a dead-but-open link: consume and drop data without forwarding.
@@ -339,14 +364,30 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
     backend, simulating Wi-Fi being physically off.
     """
     opened_at = time.perf_counter()
+    partial_dead_preblackout = False
 
     # Blackout new-connection handling: accept the carrier but never connect it to the
     # backend.  We drain-and-drop all data from the client so its write buffer never
     # fills (write() always succeeds), but we never send anything back.  ssh-oll detects
     # the carrier as dead via its own inactivity timeout.
-    if scenario_cfg is not None and scenario_cfg.get("mode") == "stop_recover":
+    if scenario_cfg is not None and scenario_cfg.get("mode") in ("stop_recover", "partial_route_loss"):
         t_since_start = opened_at - scenario_cfg["test_start"]
-        if _in_blackout_window(t_since_start, scenario_cfg["blackout_windows"]):
+        if scenario_cfg.get("mode") == "partial_route_loss":
+            # Deterministic assignment for pre-blackout carriers: e.g. dead_fraction=0.90
+            # yields 27 dead and 3 alive for first 30 carriers.
+            first_start = scenario_cfg["blackout_windows"][0][0] if scenario_cfg["blackout_windows"] else 30.0
+            if t_since_start < first_start:
+                lock = scenario_cfg.get("_accept_lock")
+                if lock is not None:
+                    with lock:
+                        seq = scenario_cfg.get("_accept_seq", 0)
+                        scenario_cfg["_accept_seq"] = seq + 1
+                else:
+                    seq = scenario_cfg.get("_accept_seq", 0)
+                    scenario_cfg["_accept_seq"] = seq + 1
+                frac = scenario_cfg.get("partial_dead_fraction", 0.90)
+                partial_dead_preblackout = _is_partial_dead_preblackout(seq, frac)
+        elif _in_blackout_window(t_since_start, scenario_cfg["blackout_windows"]):
             stop_event = scenario_cfg.get("_stop_event") or threading.Event()
             try:
                 _blackout_hold_relay(client_conn, stop_event)
@@ -386,7 +427,7 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
         _conn_id = next(proxy_connection._counter)
         _threading.current_thread()._proxy_conn_id = _conn_id
 
-    use_stop_recover = scenario_cfg is not None and scenario_cfg.get("mode") == "stop_recover"
+    use_stop_recover = scenario_cfg is not None and scenario_cfg.get("mode") in ("stop_recover", "partial_route_loss")
 
     try:
         if use_stop_recover:
@@ -395,13 +436,21 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
             t1 = threading.Thread(
                 target=_relay_stop_recover,
                 args=(client_conn, server_conn, stop, opened_at, scenario_cfg),
-                kwargs={"kill_callback": kill_connection, "debug_label": dbg},
+                kwargs={
+                    "partial_dead_preblackout": partial_dead_preblackout,
+                    "kill_callback": kill_connection,
+                    "debug_label": dbg,
+                },
                 daemon=True,
             )
             t2 = threading.Thread(
                 target=_relay_stop_recover,
                 args=(server_conn, client_conn, stop, opened_at, scenario_cfg),
-                kwargs={"kill_callback": kill_connection, "debug_label": f"s2c-{_conn_id}" if _proxy_debug_enabled else None},
+                kwargs={
+                    "partial_dead_preblackout": partial_dead_preblackout,
+                    "kill_callback": kill_connection,
+                    "debug_label": f"s2c-{_conn_id}" if _proxy_debug_enabled else None,
+                },
                 daemon=True,
             )
             t1.start()
@@ -1346,6 +1395,20 @@ def main():
              "then recovers after 60s with newly created carriers working again.",
     )
     parser.add_argument(
+        "--scenario-partial-blackout",
+        action="store_true",
+        default=False,
+        help="At blackout start, only a subset of pre-blackout carriers become dead forever; "
+             "remaining pre-blackout carriers and all post-blackout new carriers stay functional.",
+    )
+    parser.add_argument(
+        "--scenario-partial-dead-fraction",
+        type=float,
+        default=0.90,
+        metavar="FRACTION",
+        help="Fraction [0..1] of pre-blackout carriers to mark dead in --scenario-partial-blackout. Default 0.90.",
+    )
+    parser.add_argument(
         "--scenario-wifi-heavy",
         action="store_true",
         default=False,
@@ -1480,7 +1543,9 @@ def main():
     # --scenario-stop-recover (sequential continuous) and --scenario-wifi-heavy.
     scenario_cfg = None
     _proxy_stop_event = threading.Event()  # signals _blackout_hold_relay to exit
-    if getattr(args, "scenario_stop_recover", False) or getattr(args, "scenario_wifi_heavy", False):
+    if (getattr(args, "scenario_stop_recover", False)
+            or getattr(args, "scenario_wifi_heavy", False)
+            or getattr(args, "scenario_partial_blackout", False)):
         base_latency_sec = (args.latency_ms / 1000.0) if args.latency_ms else 0.05
         b1_start = max(0.0, float(args.scenario_blackout_start))
         b1_dur = max(0.0, float(args.scenario_blackout_duration))
@@ -1502,11 +1567,15 @@ def main():
                     s = start + i * interval
                     blackout_windows.append((s, s + dur))
         blackout_windows.sort(key=lambda x: x[0])
+        _mode = "partial_route_loss" if getattr(args, "scenario_partial_blackout", False) else "stop_recover"
         scenario_cfg = {
-            "mode": "stop_recover",
+            "mode": _mode,
             "test_start": time.perf_counter(),
             "base_latency_sec": base_latency_sec,
             "blackout_windows": blackout_windows,
+            "partial_dead_fraction": max(0.0, min(1.0, float(args.scenario_partial_dead_fraction))),
+            "_accept_seq": 0,
+            "_accept_lock": threading.Lock(),
             # Shared stop event so _blackout_hold_relay threads exit when we clean up.
             "_stop_event": _proxy_stop_event,
         }

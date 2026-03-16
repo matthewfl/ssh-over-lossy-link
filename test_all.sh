@@ -407,6 +407,23 @@ run_test "wifi-stop-then-recover-highlat-loss1pct" \
     --test-min-packets           10
 
 # ============================================================================
+# 9d2. Partial route-loss scenario:
+#      30 carriers initially; at 30s, 90% of pre-existing carriers become dead
+#      forever, 10% remain functional, and all newly opened carriers are healthy.
+#      Simulates dual-route topology where the primary route drops.
+# ============================================================================
+run_test "wifi-partial-route-loss-heavy" \
+    --init-latency-override 0.05 \
+    --scenario-wifi-heavy \
+    --connections 30 \
+    --continuous-duration 120 \
+    --latency-ms 50 \
+    --scenario-partial-blackout \
+    --scenario-partial-dead-fraction 0.90 \
+    --scenario-blackout-start 30 \
+    --wifi-heavy-min-bytes 61440
+
+# ============================================================================
 # 9e. Double-blackout heavy stress:
 #     two Wi-Fi outages (20–50s and 90–120s), sustained bidirectional flooding.
 # ============================================================================
