@@ -244,6 +244,7 @@ int run_server(const Args& args) {
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
   uint64_t last_suggest_close_ns = 0;  // rate-limit SUGGEST_CLOSE to at most 1 per 10s
   static constexpr uint64_t suggest_close_min_interval_ns = 10 * 1000000000ULL;
+  std::map<int, uint64_t> outstanding_ping_ns;  // fd -> ping sent time
 
   // RTT-scaled timeouts: server observes server→client RTT from ACKs. Use 5 s default when unknown.
   auto get_effective_rtt_ns = [&]() -> uint64_t {
@@ -365,6 +366,10 @@ int run_server(const Args& args) {
       last_retransmit_check_ns = 0;
       if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu survivors=%zu reason=write_error]\n",
                        (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), carriers.size());
+    }
+    for (auto it = outstanding_ping_ns.begin(); it != outstanding_ping_ns.end(); ) {
+      if (!carriers.count(it->first)) it = outstanding_ping_ns.erase(it);
+      else ++it;
     }
   };
 
@@ -531,6 +536,9 @@ int run_server(const Args& args) {
     // Data confirmed received: remove from retransmit buffer.
     for (auto it_u = unacked_data.begin(); it_u != unacked_data.end() && it_u->first <= acked_id; )
       it_u = unacked_data.erase(it_u);
+  };
+  recv_cb.on_pong = [&](int fd, uint64_t) {
+    outstanding_ping_ns.erase(fd);
   };
   recv_cb.on_client_metrics = [&](uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
                                   float fraction_struggling, uint32_t rs_pending_count,
@@ -785,16 +793,41 @@ int run_server(const Args& args) {
         carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns, cs.last_send_ns});
       }
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
+      size_t backlog_bytes = 0;
+      for (const auto& [_, ud] : unacked_data) backlog_bytes += ud.data.size();
+      const bool heavy_backlog =
+          (backlog_bytes > 256 * 1024ULL) ||
+          (unacked_data.size() > 128) ||
+          !backend_pending.empty() ||
+          !reassembly.empty() ||
+          !rs_pending.empty();
+      uint64_t ping_fail_ns = scaled_ns(8, 30000000000ULL, 180000000000ULL);  // 30s..180s
 
       // Send PING to idle carriers; dead ones get SUGGEST_CLOSE (skip PING).
       for (auto& [cfd, cs] : carriers) {
         bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
             != quality.dead_idle_fds.end();
         if (is_dead) continue;
+        if (auto itp = outstanding_ping_ns.find(cfd); itp != outstanding_ping_ns.end()) {
+          uint64_t age_ns = now_ns_val - itp->second;
+          if (age_ns > ping_fail_ns && heavy_backlog
+              && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
+            last_suggest_close_ns = now_ns_val;
+            packet_io::append_suggest_close(cs.write_buf);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = cfd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=ping_timeout age_ms=%llu]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), cfd,
+                             (unsigned long long)(age_ns/1000000ULL));
+          }
+          continue;  // don't stack another ping while one is outstanding
+        }
         if (cs.write_buf.empty()
             && now_ns_val - cs.last_send_ns > ping_idle_ns
             && now_ns_val - cs.last_recv_ns > ping_idle_ns) {
           packet_io::append_ping(cs.write_buf, 0);
+          outstanding_ping_ns[cfd] = now_ns_val;
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -813,12 +846,14 @@ int run_server(const Args& args) {
             cs.last_minute_reset_ns = now_ns_val;
           }
           if (cs.bytes_sent_this_minute < min_bpm && cs.write_buf.empty()) {
+            if (outstanding_ping_ns.count(cfd)) continue;
             std::uniform_int_distribution<size_t> len_dist(50, std::max(size_t(50), pkt_max));
             size_t len = len_dist(keepalive_gen);
             std::vector<uint8_t> payload(len);
             std::uniform_int_distribution<int> byte_dist(0, 255);
             for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(byte_dist(keepalive_gen));
             packet_io::append_ping(cs.write_buf, 0, payload.data(), len);
+            outstanding_ping_ns[cfd] = now_ns_val;
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -828,14 +863,6 @@ int run_server(const Args& args) {
 
       // SUGGEST_CLOSE: avoid self-induced churn when traffic is light/idle.
       // Only suggest-close aggressively under meaningful backlog pressure.
-      size_t backlog_bytes = 0;
-      for (const auto& [_, ud] : unacked_data) backlog_bytes += ud.data.size();
-      const bool heavy_backlog =
-          (backlog_bytes > 256 * 1024ULL) ||
-          (unacked_data.size() > 128) ||
-          !backend_pending.empty() ||
-          !reassembly.empty() ||
-          !rs_pending.empty();
       if (heavy_backlog) {
         // Server cannot close directly; client performs actual close.
         // Keep rate limiting (1 per 10s) to avoid mass-close bursts.
