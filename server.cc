@@ -234,6 +234,7 @@ int run_server(const Args& args) {
   };
   std::map<uint64_t, UnackedItem> unacked_data;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
+  std::set<int> pending_peer_suggest_close;
   uint64_t next_carrier_id_global = 1;
 
   uint64_t last_ping_check_ns       = 0;
@@ -245,6 +246,8 @@ int run_server(const Args& args) {
   uint64_t last_suggest_close_ns = 0;  // rate-limit SUGGEST_CLOSE to at most 1 per 10s
   static constexpr uint64_t suggest_close_min_interval_ns = 10 * 1000000000ULL;
   std::map<int, uint64_t> outstanding_ping_ns;  // fd -> ping sent time
+  int last_read_errno = 0;
+  bool last_read_eof = false;
 
   // RTT-scaled timeouts: server observes server→client RTT from ACKs. Use 5 s default when unknown.
   auto get_effective_rtt_ns = [&]() -> uint64_t {
@@ -497,26 +500,13 @@ int run_server(const Args& args) {
   };
   recv_cb.on_ping = [&](int fd, uint64_t id, size_t payload_size) { send_pong(fd, id, payload_size); };
   // Client may send SUGGEST_CLOSE when it has decided a carrier is dead or being
-  // replaced. Once we receive that, we can immediately stop using and close the
-  // carrier; no further data will arrive on it.
+  // replaced. Mark it and close in the event loop after packet parsing returns.
+  // This avoids erasing the carrier while process_carrier_read is using CarrierState&.
   recv_cb.on_suggest_close = [&](int fd) {
-    auto it = carriers.find(fd);
-    if (it == carriers.end()) return;
-    if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=peer_suggest_close]\n",
-                     (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
-    close(fd);
-    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-    carriers.erase(it);
-    if (carriers.empty() && !unacked_data.empty()) {
-      retransmit_needed = true;
-      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=peer_closed_last]\n",
-                       (unsigned long long)(now_ns()/1000000ULL), unacked_data.size());
-    }
-    if (!carriers.empty() && !unacked_data.empty()) {
-      last_retransmit_check_ns = 0;
-      if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu reason=peer_suggest_close]\n",
-                       (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
-    }
+    if (!carriers.count(fd)) return;
+    pending_peer_suggest_close.insert(fd);
+    if (dbg) fprintf(dbg, "[carrier-mark-close t=%llu fd=%d reason=peer_suggest_close pending=%zu]\n",
+                     (unsigned long long)(now_ns()/1000000ULL), fd, pending_peer_suggest_close.size());
   };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
     auto it = ack_send_time_ns.find(acked_id);
@@ -575,11 +565,19 @@ int run_server(const Args& args) {
   };
 
   auto process_carrier_read = [&](int fd, CarrierState& s) {
+    last_read_errno = 0;
+    last_read_eof = false;
     uint8_t buf[READ_BUF_SIZE];
     ssize_t n = read(fd, buf, sizeof buf);
     if (n <= 0) {
-      if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+      if (n == 0) {
+        last_read_eof = true;
         return false;
+      }
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        last_read_errno = errno;
+        return false;
+      }
       return true;
     }
     s.read_buf.insert(s.read_buf.end(), buf, buf + n);
@@ -718,11 +716,15 @@ int run_server(const Args& args) {
         bool carrier_removed = false;
         if (e & EPOLLIN) {
           if (!process_carrier_read(fd, it->second)) {
-            if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=read_error]\n",
-                             (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
+            if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=read_error eof=%d err=%d errstr=%s events=0x%x rbuf=%zu wbuf=%zu]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1,
+                             last_read_eof ? 1 : 0, last_read_errno,
+                             last_read_errno ? strerror(last_read_errno) : "none",
+                             (unsigned)e, it->second.read_buf.size(), it->second.write_buf.size());
             close(fd);
             epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
             carriers.erase(it);
+            pending_peer_suggest_close.erase(fd);
             if (carriers.empty() && !unacked_data.empty()) {
               retransmit_needed = true;
               if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
@@ -736,12 +738,32 @@ int run_server(const Args& args) {
             carrier_removed = true;
           }
         }
+        if (!carrier_removed && pending_peer_suggest_close.count(fd)) {
+          if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=peer_suggest_close]\n",
+                           (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
+          close(fd);
+          epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+          carriers.erase(it);
+          pending_peer_suggest_close.erase(fd);
+          if (carriers.empty() && !unacked_data.empty()) {
+            retransmit_needed = true;
+            if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=peer_closed_last]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), unacked_data.size());
+          }
+          if (!carriers.empty() && !unacked_data.empty()) {
+            last_retransmit_check_ns = 0;
+            if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu reason=peer_suggest_close]\n",
+                             (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
+          }
+          carrier_removed = true;
+        }
         if (!carrier_removed && (e & (EPOLLERR | EPOLLHUP))) {
           if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=epoll_err_hup]\n",
                            (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
           carriers.erase(it);
+          pending_peer_suggest_close.erase(fd);
           if (carriers.empty() && !unacked_data.empty()) {
             retransmit_needed = true;
             if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
