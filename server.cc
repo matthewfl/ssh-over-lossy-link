@@ -222,6 +222,9 @@ int run_server(const Args& args) {
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
   std::set<int> pending_peer_suggest_close;
   uint64_t next_carrier_id_global = 1;
+  // When the carrier set last went from empty -> non-empty (recovery from total loss).
+  // ACKs for data sent before this instant span the outage and must not be timed as RTT.
+  uint64_t last_recovery_ns = 0;
 
   uint64_t last_ping_check_ns       = 0;
   uint64_t last_keepalive_check_ns  = 0;
@@ -491,8 +494,17 @@ int run_server(const Args& args) {
     auto it = ack_send_time_ns.find(acked_id);
     if (it != ack_send_time_ns.end()) {
       uint64_t rtt = now_ns() - it->second;
+      // Skip measurements that span a recovery from total carrier loss: the data was
+      // sent before we reconnected, so `rtt` would be ~the outage duration rather than
+      // link latency. Recording it would inflate every RTT-scaled timeout (retransmit,
+      // rs-stale, ping, idle) for up to max_server_recent_rtt samples and stall recovery.
+      bool spans_outage = (it->second < last_recovery_ns);
       // Sanity check: discard clearly-bogus values (> 60s); wrap-around produces ~1.8e19 ns.
-      if (rtt < 60000000000ULL) {
+      if (!spans_outage && rtt < 60000000000ULL) {
+        if (dbg && rtt > 5000000000ULL)
+          fprintf(dbg, "[ack-rtt-high t=%llu acked_id=%llu rtt_ms=%llu]\n",
+                  (unsigned long long)(now_ns()/1000000ULL), (unsigned long long)acked_id,
+                  (unsigned long long)(rtt/1000000ULL));
         server_recent_rtt_ns.push_back(rtt);
         while (server_recent_rtt_ns.size() > max_server_recent_rtt) server_recent_rtt_ns.pop_front();
         auto cs = carriers.find(fd);
@@ -588,9 +600,11 @@ int run_server(const Args& args) {
           ev.events = EPOLLIN;
           ev.data.fd = client;
           if (epoll_ctl(epfd, EPOLL_CTL_ADD, client, &ev) == 0) {
+            const bool recovered_from_empty = carriers.empty();
             CarrierState& cs = carriers[client];
             if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
             cs.connect_ns = now_ns();
+            if (recovered_from_empty) last_recovery_ns = cs.connect_ns;
             if (dbg) { fprintf(dbg, "[carrier-open t=%llu fd=%d total=%zu]\n",
                                (unsigned long long)(now_ns()/1000000ULL), client, carriers.size());
                         fflush(dbg); }
@@ -638,6 +652,10 @@ int run_server(const Args& args) {
                 // Reset timer so the periodic 3 s retransmit doesn't immediately
                 // fire a redundant duplicate of what we just queued.
                 ui.send_ns = retransmit_now;
+                // Re-stamp the RTT send-time so the eventual ACK measures latency from
+                // this retransmission, not the original pre-outage send (which would
+                // record an RTT ~= the outage duration and inflate every timeout).
+                ack_send_time_ns[uid] = retransmit_now;
               }
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = client;
@@ -986,6 +1004,10 @@ int run_server(const Args& args) {
             rt_idx += ui.n;
           }
           ui.send_ns = now_ns_val;  // throttle: don't retransmit again for 3 s
+          // Re-stamp RTT send-time so the eventual ACK measures from this retransmission,
+          // not the original send (which would record an outage-sized RTT and inflate
+          // every RTT-scaled timeout). See the reconnect-retransmit path for the same fix.
+          ack_send_time_ns[uid] = now_ns_val;
         }
       }
     }
