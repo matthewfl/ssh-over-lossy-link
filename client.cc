@@ -968,6 +968,16 @@ int run_client(const Args& args) {
           if (err == 0) {
             it->second.connecting = false;
             it->second.connect_ns = now_ns();
+            // Catch-up cumulative ACK: a freshly connected carrier is our first chance
+            // to tell the server how much s2c data we've already delivered to stdout, in
+            // case ACKs were lost while carriers were down. Without this the server can
+            // keep retransmitting already-delivered data indefinitely on a quiet stream.
+            if (next_deliver_id > 0) {
+              packet_io::append_ack(it->second.write_buf, next_deliver_id - 1);
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = fd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+            }
             if (!pending_reap.empty()) {
               int to_close = pending_reap.front();
               pending_reap.erase(pending_reap.begin());
@@ -1067,8 +1077,8 @@ int run_client(const Args& args) {
             ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
-          if (!carriers.empty())
-            next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
+          // next_rr is advanced once at the end of the loop body (below) for both
+          // branches; don't advance here too or the round-robin skips carriers.
         } else {
           auto it = carriers.begin();
           std::advance(it, next_rr % carriers.size());
@@ -1312,22 +1322,22 @@ int run_client(const Args& args) {
           }
         }
 
-        // Debug: log any outstanding PINGs that have not received a PONG for >5 s.
+        // Detect carriers whose PING has gone unanswered for too long: very likely
+        // dead-but-open (writes still succeed, so assess_carriers' dead-idle test can
+        // be defeated by an advancing last_send_ns). This detection must run in all
+        // modes — only the verbose per-ping logging is gated on dbg.
         std::set<int> stale_ping_fds;
         uint64_t ping_fail_ns = scaled_ns(6, 15000000000ULL, 120000000000ULL);
-        if (dbg && !outstanding_pings.empty()) {
-          for (const auto& [key, sent_ns] : outstanding_pings) {
-            uint64_t age_ns = now_p - sent_ns;
-            if (age_ns > 5000000000ULL) {
-              int fd = key.first;
-              fprintf(dbg, "[ping-unacked t=%llu fd=%d age_ms=%llu]\n",
-                      (unsigned long long)(now_p/1000000ULL),
-                      fd,
-                      (unsigned long long)(age_ns/1000000ULL));
-            }
-            if (age_ns > ping_fail_ns)
-              stale_ping_fds.insert(key.first);
+        for (const auto& [key, sent_ns] : outstanding_pings) {
+          uint64_t age_ns = now_p - sent_ns;
+          if (dbg && age_ns > 5000000000ULL) {
+            fprintf(dbg, "[ping-unacked t=%llu fd=%d age_ms=%llu]\n",
+                    (unsigned long long)(now_p/1000000ULL),
+                    key.first,
+                    (unsigned long long)(age_ns/1000000ULL));
           }
+          if (age_ns > ping_fail_ns)
+            stale_ping_fds.insert(key.first);
         }
         // Any carrier with an outstanding PING beyond ping_fail_ns is very likely dead.
         // Reap these promptly so retransmit can concentrate on healthy carriers.

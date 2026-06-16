@@ -146,8 +146,8 @@ Retransmit, inactivity, keepalive, and reap timeouts are scaled by observed link
 Connections can be detected as dead in three ways:
 
 1. **Immediate error**: `EPOLLHUP`, a failed `read()`, or a failed `write()` (returns `EPIPE`) removes the carrier immediately.
-2. **Keepalive ping**: if a carrier has not *sent* anything for 3×RTT and its write buffer is empty, a `PING` packet is sent. The peer replies with a `PONG`, which counts as activity.
-3. **Inactivity timeout**: if nothing has been *received* on a carrier for 5×RTT (after a 2×RTT post-connect grace period), the carrier is forcibly removed.
+2. **Keepalive ping**: if a carrier has had no send *and* no receive activity for 2×RTT (min 5 s) and its write buffer is empty, a `PING` packet is sent. The peer replies with a `PONG`, which counts as activity. If a `PING` then goes unanswered past a longer timeout (6×RTT on the client, 8×RTT on the server, both with floors), the carrier is treated as dead-but-open: the server sends `SUGGEST_CLOSE` and the client reaps it. This catches carriers that still accept writes (so the inactivity timer below keeps resetting) but never deliver anything back.
+3. **Inactivity timeout**: if nothing has been *received* on a carrier for ~5×RTT (after a 2×RTT post-connect grace period), the carrier is forcibly removed.
 
 The `epoll_wait` timeout is capped so the inactivity check always runs even when no I/O events arrive.
 
@@ -158,7 +158,7 @@ Every RS group and every `SMALL` packet sent is kept in an *unacked buffer* unti
 - **On reconnect**: when the last carrier dies and a new one subsequently connects, all unacked data is replayed immediately onto the new carrier.
 - **Periodic timeout**: every 500 ms, any unacked item that was sent more than 4×RTT ago is resent to a healthy carrier. This recovers from partial loss where some (but not all) carriers died, leaving the remote side's Reed-Solomon groups incomplete.
 
-Finally, as a safety net, incomplete RS groups (waiting for shards) that are older than 4×RTT are discarded and `next_deliver_id` is advanced past the gap so that later, successfully received data is not blocked indefinitely.
+Finally, incomplete RS groups (waiting for shards) that are older than 4×RTT are discarded **from memory** to bound buffering. Note that `next_deliver_id` is **not** advanced past the gap: jumping would inject a hole into the SSH byte stream, which SSH detects as a MAC failure and closes the connection. Instead the receiver waits for the retransmit path to refill the gap; if the sender is truly gone, the global idle timeout closes the connection cleanly. Both directions behave identically here.
 
 ### Ordering
 
@@ -191,6 +191,7 @@ enum packet_kind_e : uint8_t {
     PACKET_SERVER_CONFIG = 8,     // server -> client; server's current redundancy (when server manages it; auto_adapt)
     PACKET_READY = 9,             // server -> client; sent when carrier connects, confirms link is up before client sends
     PACKET_SUGGEST_CLOSE = 10,   // server -> client; suggests client close this carrier (dead or slow); client does the actual close
+    PACKET_CLIENT_METRICS = 11,  // client -> server; server→client path quality so the server can adapt redundancy using both directions
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -234,6 +235,11 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 
 // PACKET_READY: server -> client. Header only. Sent when a carrier connects so the client
 // knows the bidirectional path is up before it sends data; avoids premature timeouts.
+
+// PACKET_CLIENT_METRICS: client -> server. struct { packet_header; uint64_t avg_shard_spread_ns;
+//   uint64_t avg_extra_shard_gap_ns; float fraction_struggling; uint32_t rs_pending_count;
+//   uint8_t can_decrease_rs; uint8_t can_decrease_small; }. Reports server→client path quality
+//   so the server (which owns redundancy in auto mode) can adapt using both directions.
 
 ```
 

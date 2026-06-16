@@ -220,12 +220,19 @@ bool process_carrier_read(
         std::vector<std::vector<uint8_t>> out_shards(k, std::vector<uint8_t>(rp.block_size));
         std::vector<uint8_t*> out_ptrs(k);
         for (unsigned i = 0; i < k; ++i) out_ptrs[i] = out_shards[i].data();
-        if (reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
-          if (!reassembly.count(id)) {
-            reassembly[id].clear();
-            for (unsigned i = 0; i < k; ++i)
-              reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
-          }
+        bool decoded = reassembly.count(id) > 0;  // already reconstructed by an earlier call
+        if (!decoded &&
+            reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
+          decoded = true;
+          reassembly[id].clear();
+          for (unsigned i = 0; i < k; ++i)
+            reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
+        }
+        if (!decoded) {
+          // Decode failed (e.g. corrupt shard / unsolvable subset). Do NOT erase the
+          // pending group: dropping it here would leave a permanent hole at this id,
+          // stalling the stream forever. Keep it so retransmitted shards can retry.
+          continue;
         }
         if (callbacks.on_rs_decode || callbacks.on_rs_extra_shard) {
           // Sort per-shard arrival times to compute spread and the final inter-shard gap.

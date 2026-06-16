@@ -617,6 +617,12 @@ int run_server(const Args& args) {
                         fflush(dbg); }
             // Send READY so client knows the link is up before it sends data.
             packet_io::append_ready(carriers[client].write_buf);
+            // Catch-up cumulative ACK: tell the client how much c2s data we've already
+            // delivered to the backend, in case its ACKs were lost while carriers were
+            // down. Without this the client can keep retransmitting already-delivered
+            // data indefinitely on a quiet stream.
+            if (next_deliver_id > 0)
+              packet_io::append_ack(carriers[client].write_buf, next_deliver_id - 1);
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = client;
             epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);

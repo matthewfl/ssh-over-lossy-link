@@ -25,13 +25,16 @@ REED_SOLOMON_OBJ = reed_solomon.o
 
 .PHONY: all clean install
 
-all: test_reed_solomon ssh-oll
+all: test_reed_solomon test_packet_io ssh-oll
 
 reed_solomon.o: reed_solomon.cc reed_solomon.h
 	$(CXX) $(CXXFLAGS) -c -o $@ reed_solomon.cc
 
 test_reed_solomon: test_reed_solomon.cc $(REED_SOLOMON_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ test_reed_solomon.cc $(REED_SOLOMON_OBJ) $(LDFLAGS_STATIC)
+
+test_packet_io: test_packet_io.cc packet_io.o $(REED_SOLOMON_OBJ) packet_io.h ssholl.h
+	$(CXX) $(CXXFLAGS) -o $@ test_packet_io.cc packet_io.o $(REED_SOLOMON_OBJ) $(EPOLL_LDFLAGS) $(LDFLAGS_STATIC)
 
 ssh-oll: main.o server.o client.o packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ) ssholl.h
 	$(CXX) $(CXXFLAGS) -o $@ main.o server.o client.o packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ) $(EPOLL_LDFLAGS) $(LDFLAGS_STATIC)
@@ -49,7 +52,7 @@ packet_io.o: packet_io.cc packet_io.h ssholl.h reed_solomon.h
 	$(CXX) $(CXXFLAGS) -c -o $@ packet_io.cc
 
 clean:
-	rm -f $(REED_SOLOMON_OBJ) test_reed_solomon ssh-oll main.o server.o client.o packet_io.o carrier_adapt.o
+	rm -f $(REED_SOLOMON_OBJ) test_reed_solomon test_packet_io ssh-oll main.o server.o client.o packet_io.o carrier_adapt.o
 
 install: all
 	install -d $(DESTDIR)/usr/local/bin
