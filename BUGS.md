@@ -38,9 +38,10 @@ didn't receive the draining ACK lingered until that carrier got one, then was ti
   `UnackedItem.retransmitted` and skip RTT for retransmitted ids.
 
 ### Impact
-`wifi-double-blackout-heavy`: was ~50% pass (and 0/2 on the pre-bug-fix baseline);
-after B7 alone it was 4/5 with tiny (~21 KB) residual misses traced to B8; after B7+B8
-the post-outage RTT pollution is gone in both directions. (Re-measuring pass rate.)
+`wifi-double-blackout-heavy` pass rate progression: pre-bug-fix baseline **0/2** →
+round-1 fixes (B1–B4) **~50–75%** → server RTT fix (B7) **4/5** with tiny (~21 KB)
+residual misses traced to B8 → both RTT fixes (B7+B8) **6/6**. Post-outage RTT pollution
+is gone in both directions (`[ack-rtt-high]` count 0/0).
 
 ---
 
