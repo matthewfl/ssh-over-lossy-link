@@ -72,6 +72,13 @@ struct CarrierInfo {
 
 struct CarrierQualityResult {
   std::vector<int> dead_idle_fds;  // no activity for too long
+  // Subset of dead_idle_fds that are *confidently* dead: a peer carrier received data far
+  // more recently than this one, so there is active traffic this carrier is missing (not
+  // merely a quiet period). The server may close these itself — it can only SUGGEST_CLOSE
+  // to the client, which a dead-but-open carrier (e.g. after a WiFi/VPN drop) never
+  // receives, so without this the server would retain stale carriers forever and waste
+  // retransmits on them instead of reaching the client's live carriers.
+  std::vector<int> reap_fds;
   int rtt_outlier_fd = -1;         // worst carrier when 5× median; -1 if none
 };
 

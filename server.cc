@@ -184,6 +184,10 @@ int run_server(const Args& args) {
   unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
   bool runtime_auto_adapt = false;  // set from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
   uint32_t runtime_reconnect_timeout_sec = (uint32_t)args.config.reconnect_timeout_sec;
+  // --max-delay (client-provided via SET_CONFIG): hold a backend→client sub-block remainder
+  // up to this long so it can coalesce into a full RS block. 0 = send immediately.
+  uint64_t runtime_max_delay_ns = static_cast<uint64_t>(args.config.max_delay_ms * 1000000.0f);
+  uint64_t backend_partial_since_ns = 0;
   float last_sent_rs_redundancy = -1.0f;
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
@@ -238,11 +242,15 @@ int run_server(const Args& args) {
   int last_read_errno = 0;
   bool last_read_eof = false;
 
-  // RTT-scaled timeouts: server observes server→client RTT from ACKs. Use 5 s default when unknown.
+  // RTT-scaled timeouts: server observes server→client RTT from ACKs. Before enough
+  // samples exist, use the client-provided --rtt-ms cold-start hint (propagated on the
+  // server launch command) so high-latency links aren't scaled from the 5 s default,
+  // which is too aggressive — see README "RTT-scaled timeouts".
+  const uint64_t rtt_hint_ns = static_cast<uint64_t>(args.config.rtt_hint_ms) * 1000000ULL;
   auto get_effective_rtt_ns = [&]() -> uint64_t {
     if (server_recent_rtt_ns.size() >= 3)
       return p90_ns(server_recent_rtt_ns);
-    return 5000000000ULL;  // 5 s conservative when unknown
+    return rtt_hint_ns ? rtt_hint_ns : 5000000000ULL;  // hint, else 5 s conservative
   };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
     return ssholl::scaled_ns(mult, min_ns, max_ns, get_effective_rtt_ns());
@@ -543,6 +551,7 @@ int run_server(const Args& args) {
     runtime_rs_redundancy = pc.reed_solomon_redundancy;
     if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
     runtime_reconnect_timeout_sec = pc.reconnect_timeout_sec;
+    runtime_max_delay_ns = static_cast<uint64_t>(pc.max_delay_ms * 1000000.0f);
     if (dbg) fprintf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d reconnect_timeout_sec=%u]\n",
                      (unsigned long long)(now_ns()/1000000ULL), max_packet,
                      (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
@@ -580,7 +589,15 @@ int run_server(const Args& args) {
 
   while (running) {
     // 500ms bound ensures retransmit/ping checks run promptly even when carriers are idle.
-    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 500);
+    // When a backend remainder is being held for coalescing (--max-delay), wake sooner so
+    // it flushes on time instead of waiting a full poll cycle.
+    int poll_timeout_ms = 500;
+    if (backend_partial_since_ns != 0 && runtime_max_delay_ns > 0) {
+      uint64_t elapsed = now_ns() - backend_partial_since_ns;
+      uint64_t remaining_ms = (runtime_max_delay_ns > elapsed) ? ((runtime_max_delay_ns - elapsed) / 1000000ULL + 1) : 0;
+      if (static_cast<int>(remaining_ms) < poll_timeout_ms) poll_timeout_ms = static_cast<int>(remaining_ms);
+    }
+    int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), poll_timeout_ms);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
@@ -807,6 +824,33 @@ int run_server(const Args& args) {
         carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns, cs.last_send_ns});
       }
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
+
+      // Reap confidently-dead carriers ourselves. The server can normally only
+      // SUGGEST_CLOSE (the client is the master that opens/closes carriers), but a
+      // dead-but-open carrier — e.g. after a WiFi/VPN drop, where the old socket hasn't
+      // errored yet — never receives that suggestion. If we keep it, retransmits get
+      // round-robined onto it and never reach the client's fresh carriers, so the logical
+      // stream never recovers. reap_fds is the safe subset (a peer is actively receiving
+      // while this carrier is not), so closing it here is cleanup, not carrier management.
+      for (int cfd : quality.reap_fds) {
+        auto it = carriers.find(cfd);
+        if (it == carriers.end()) continue;
+        if (dbg) fprintf(dbg, "[carrier-reap t=%llu fd=%d total=%zu reason=dead_but_open]\n",
+                         (unsigned long long)(now_ns_val/1000000ULL), cfd, carriers.size()-1);
+        close(cfd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
+        carriers.erase(it);
+        pending_peer_suggest_close.erase(cfd);
+        outstanding_ping_ns.erase(cfd);
+      }
+      if (!quality.reap_fds.empty()) {
+        if (carriers.empty() && !unacked_data.empty()) {
+          retransmit_needed = true;  // recover by replaying once a fresh carrier connects
+        } else if (!unacked_data.empty()) {
+          last_retransmit_check_ns = 0;  // retransmit onto the survivors immediately
+        }
+      }
+
       size_t backlog_bytes = 0;
       for (const auto& [_, ud] : unacked_data) backlog_bytes += ud.data.size();
       // Base predicate is shared with the client; the server additionally treats any
@@ -881,16 +925,19 @@ int run_server(const Args& args) {
         // Server cannot close directly; client performs actual close.
         // Keep rate limiting (1 per 10s) to avoid mass-close bursts.
         for (int cfd : quality.dead_idle_fds) {
+          // Skip any we already reaped above (don't re-insert via operator[]).
+          auto itc = carriers.find(cfd);
+          if (itc == carriers.end()) continue;
           if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
           last_suggest_close_ns = now_ns_val;
-          packet_io::append_suggest_close(carriers[cfd].write_buf);
+          packet_io::append_suggest_close(itc->second.write_buf);
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), cfd);
         }
-        if (quality.rtt_outlier_fd >= 0
+        if (quality.rtt_outlier_fd >= 0 && carriers.count(quality.rtt_outlier_fd)
             && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
           last_suggest_close_ns = now_ns_val;
           packet_io::append_suggest_close(carriers[quality.rtt_outlier_fd].write_buf);
@@ -906,7 +953,10 @@ int run_server(const Args& args) {
       for (auto& [cfd, cs] : carriers)
         if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
-      // Global idle timeout: if nothing from any carrier for 12×RTT the client is gone.
+      // Global idle timeout: if nothing from any carrier for this long, the client is gone.
+      // Adaptive default 12×RTT clamped [60 s, 300 s]; set --reconnect-timeout (client
+      // propagates it here via SET_CONFIG) to stay alive across a longer outage so the
+      // client can still reconnect when the link returns.
       uint64_t global_idle_ns = (runtime_reconnect_timeout_sec > 0)
           ? (uint64_t)runtime_reconnect_timeout_sec * 1000000000ULL
           : scaled_ns(12, 60000000000ULL, 300000000000ULL);
@@ -922,17 +972,29 @@ int run_server(const Args& args) {
       last_retransmit_check_ns = now_ns_val;
       // 4×RTT, floored at 500 ms. Mirrors the client change: the old 2 s floor caused
       // multi-second stalls after carrier death on low-latency test links.
-      uint64_t retransmit_timeout_ns = (server_recent_rtt_ns.size() >= 2)
+      // Before ≥2 samples exist, honor the --rtt-ms cold-start hint (scaled_ns falls back
+      // to it) so high-latency links aren't retransmitted every 2.5 s before the first ACKs.
+      uint64_t retransmit_timeout_ns = (server_recent_rtt_ns.size() >= 2 || rtt_hint_ns > 0)
           ? scaled_ns(4, 500000000ULL, 60000000000ULL)
-          : 2500000000ULL;  // 2.5 s when no RTT known yet (cold start)
+          : 2500000000ULL;  // 2.5 s when no RTT samples and no hint (cold start)
       std::vector<int> rt_carriers;
       for (auto& [cfd, cs] : carriers)
         if (!cs.connecting) rt_carriers.push_back(cfd);
       if (!rt_carriers.empty()) {
         unsigned rt_idx = 0;
         const unsigned small_rt_copies = std::max(1u, std::min(3u, static_cast<unsigned>(rt_carriers.size())));
+        // Bound the work per cycle. unacked_data is ordered by id, and the receiver delivers
+        // in order, so it is blocked only on the LOWEST unacked id — anything above the gap is
+        // buffered there already. Re-encoding/resending the whole backlog every cycle (seen at
+        // 689 items × an RS group each after a long outage) starves the single-threaded loop and
+        // the gap data never gets through. Cap to the lowest N due items so the gap is always
+        // covered; higher ids are reached on later cycles once they come due again.
+        const size_t kMaxRetransmitItemsPerCycle = 64;
+        size_t rt_items = 0;
         for (auto& [uid, ui] : unacked_data) {
           if (ui.send_ns == 0 || now_ns_val - ui.send_ns < retransmit_timeout_ns) continue;
+          if (rt_items >= kMaxRetransmitItemsPerCycle) break;
+          ++rt_items;
           if (ui.is_small) {
             // Only retransmit SMALL on carriers that have not yet carried this uid.
             std::vector<int> candidates;
@@ -1189,12 +1251,19 @@ int run_server(const Args& args) {
       // exit) or carriers.empty() (early exit). The explicit size check matches the
       // equivalent guard on the client side and prevents a too-large SMALL packet if
       // somehow a full block remains (e.g. future code change removes the m==0 continue).
+      // Hold the remainder up to --max-delay so it can coalesce into a full RS block first.
       if (!backend_read_buf.empty() && backend_read_buf.size() < block_size && !carriers.empty()) {
-        size_t chunk = backend_read_buf.size();
-        { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.end());
-          ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
-        queue_small_to_carriers(backend_read_buf.data(), chunk);
-        backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+        if (backend_partial_since_ns == 0) backend_partial_since_ns = now_ns();
+        if (runtime_max_delay_ns == 0 || now_ns() - backend_partial_since_ns >= runtime_max_delay_ns) {
+          size_t chunk = backend_read_buf.size();
+          { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.end());
+            ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
+          queue_small_to_carriers(backend_read_buf.data(), chunk);
+          backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
+          backend_partial_since_ns = 0;
+        }
+      } else {
+        backend_partial_since_ns = 0;
       }
     }
     flush_backend_pending();

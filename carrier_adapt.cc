@@ -112,6 +112,10 @@ CarrierQualityResult assess_carriers(
   uint64_t dead_idle_ns = scaled_ns(5, 3000000000ULL, 120000000000ULL);
   uint64_t grace_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
   uint64_t very_high_ns = scaled_ns(3, 5000000000ULL, 30000000000ULL);
+  // Send-only zombie threshold: a carrier we keep writing to but that has delivered
+  // nothing back for this long is dead. Unlike the rx-dead test below, this needs no
+  // healthy peer, so it works during a *total* outage where every carrier is dead.
+  uint64_t zombie_ns = scaled_ns(8, 20000000000ULL, 120000000000ULL);
 
   // Track the freshest receive time across all carriers so we can detect
   // "send-only zombies": carriers we keep writing to but that never deliver
@@ -153,8 +157,29 @@ CarrierQualityResult assess_carriers(
         rx_dead = true;
     }
 
-    if (idle_dead || rx_dead)
+    // Send-only zombie: we are actively writing to this carrier (so the idle test above
+    // is defeated by an advancing last_send_ns) but it has delivered nothing back for a
+    // long time. This needs no healthy peer, so it detects dead-but-open carriers even
+    // when EVERY carrier is dead (a long total outage) — the case that otherwise stalls
+    // recovery forever, because nothing drops the carrier count below the floor so fresh
+    // carriers are never opened, and the server never sheds corpses to accept new ones.
+    bool zombie_dead = false;
+    if (!idle_dead && !rx_dead) {
+      bool actively_sending = (c.last_send_ns > 0) && (now_ns - c.last_send_ns < dead_idle_ns);
+      uint64_t silent_since = std::max(c.last_recv_ns, c.connect_ns);
+      if (actively_sending && now_ns - silent_since > zombie_ns)
+        zombie_dead = true;
+    }
+
+    if (idle_dead || rx_dead || zombie_dead) {
       res.dead_idle_fds.push_back(c.fd);
+      // Confidently dead (safe to close ourselves rather than only SUGGEST_CLOSE):
+      //  - a peer received far more recently than this carrier (active traffic it is
+      //    missing — not just a global quiet period), or
+      //  - it is a send-only zombie (peer-independent: silent for zombie_ns while we send).
+      if (zombie_dead || latest_recv_ns > c.last_recv_ns + dead_idle_ns)
+        res.reap_fds.push_back(c.fd);
+    }
   }
 
   if (carriers.size() > 1) {
