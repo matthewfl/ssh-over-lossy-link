@@ -6,9 +6,11 @@ drifting copies of the dead-carrier detection logic). The aim is to make the sha
 machinery exist **once**, be **unit-testable**, and stop hiding correctness bugs.
 
 > **Progress (branch `refactor-shared-machinery`):** Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅
-> · Phases 3–5 not started. `make check` green; `wifi-stop-then-recover-heavy` green;
-> the flaky `wifi-double-blackout-heavy` boundary test was A/B-tested against the
-> pre-refactor build and shows the same pass rate, confirming the extractions so far are
+> · Phase 3 ✅ (safe subset — shared predicates; deeper ping-orchestration unification
+> deferred to Phase 5, see note there) · Phase 4 deprioritized · Phase 5 not started.
+> `make check` green; `wifi-stop-then-recover-heavy` green; the flaky
+> `wifi-double-blackout-heavy` boundary test was A/B-tested against the pre-refactor
+> build and shows the same pass rate, confirming the extractions so far are
 > behavior-preserving.
 
 ## Goals
@@ -101,11 +103,12 @@ still duplicated and is exactly where client/server drifted.
 - [ ] Extract the heavy-backlog predicate.
 - [ ] This guarantees the two sides cannot silently diverge again the way B1 did.
 
-## Phase 4 — Tame debug logging
-- [ ] Add a `LOG(dbg, fmt, …)` helper (macro or small inline) so a log line is one call,
-      not an `if (dbg) fprintf(...)` block wrapped around — or worse, *around* — control
-      flow. Sweep the ~60 sites. This structurally prevents the B1 mistake (logic trapped
-      inside a debug guard).
+## Phase 4 — Tame debug logging — DEPRIORITIZED
+- [ ] Add a `LOG(dbg, fmt, …)` helper and sweep the ~60 `if (dbg) fprintf(...)` sites.
+> **Reassessed:** lower value than first thought. B1 was a whole `for` loop deliberately
+> nested in `if (dbg && ...)`, not a stray log line — a one-line `LOG()` macro would not
+> have prevented it. The sweep is ~60 mechanical edits with real transcription risk for
+> modest benefit. Recommend skipping unless doing it opportunistically alongside Phase 5.
 
 ## Phase 5 — Optional: structural split (larger, do last)
 Only if Phases 1–4 land cleanly and the appetite is there.
