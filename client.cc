@@ -1682,8 +1682,16 @@ int run_client(const Args& args) {
         if (!rt_carriers.empty()) {
           unsigned rt_idx = 0;
           const unsigned small_rt_copies = std::max(1u, std::min(3u, static_cast<unsigned>(rt_carriers.size())));
+          // Bound work per cycle: the receiver delivers in order and is blocked only on the
+          // lowest unacked id, so retransmit the lowest N due items (the gap is always
+          // covered) rather than the whole backlog, which starves the loop after a long
+          // outage. Higher ids are reached on later cycles. (Mirrors the server.)
+          const size_t kMaxRetransmitItemsPerCycle = 64;
+          size_t rt_items = 0;
           for (auto& [uid, ui] : unacked_sends) {
             if (ui.send_ns == 0 || now_p - ui.send_ns < retransmit_timeout_ns) continue;
+            if (rt_items >= kMaxRetransmitItemsPerCycle) break;
+            ++rt_items;
             if (ui.is_small) {
               // Choose only carriers that have not yet carried this SMALL packet.
               std::vector<int> candidates;

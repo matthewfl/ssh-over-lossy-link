@@ -228,6 +228,49 @@ void test_reap_dead_but_open() {
   check(!q.dead_idle_fds.empty(), "reap: quiet carriers are still flagged dead_idle (idle)");
 }
 
+// ── send-only zombie: reap-able with NO healthy peer (total-outage recovery) ──
+// The case that stalls recovery after a long *total* outage: every carrier is dead, so
+// there is no healthy peer for the rx-dead/reap comparison, yet we keep writing
+// retransmits onto each (last_send advances, defeating the idle test). Such carriers
+// must still be reaped (peer-independently) or the count never drops below the floor,
+// fresh post-outage carriers are never opened, and the link never recovers.
+void test_reap_send_only_zombie() {
+  auto scaled = [](unsigned mult, uint64_t mn, uint64_t mx) -> uint64_t {
+    uint64_t v = static_cast<uint64_t>(mult) * 1 * S;  // RTT = 1 s -> dead_idle 5s, zombie 20s
+    return v < mn ? mn : (v > mx ? mx : v);
+  };
+  const uint64_t now = 1000 * S;
+  auto has = [](const std::vector<int>& v, int fd) {
+    return std::find(v.begin(), v.end(), fd) != v.end();
+  };
+
+  // Two carriers, BOTH dead-but-open: silent ~50 s but we are still actively writing to
+  // them (last_send recent). No healthy peer exists.
+  std::vector<CarrierInfo> cs = {
+    {/*fd=*/1, /*rtt=*/1*S, /*last_recv=*/now - 50*S, /*connect=*/now - 100*S, /*last_send=*/now - 1*S},
+    {/*fd=*/2, 1*S,         now - 50*S,               now - 100*S,             now - 1*S},
+  };
+  auto r = assess_carriers(cs, now, scaled);
+  check(has(r.reap_fds, 1) && has(r.reap_fds, 2), "zombie: send-only zombies are reaped with no healthy peer");
+
+  // Not a zombie yet: silent only 10 s (< 20 s zombie window) while sending.
+  std::vector<CarrierInfo> young = {
+    {1, 1*S, now - 10*S, now - 100*S, now - 1*S},
+    {2, 1*S, now - 10*S, now - 100*S, now - 1*S},
+  };
+  check(assess_carriers(young, now, scaled).reap_fds.empty(),
+        "zombie: brief silence (< zombie window) is not reaped");
+
+  // Not a zombie: we are NOT writing to it (last_send old) — a quiet period, must not be
+  // reaped just for being idle. Pins the actively-sending requirement.
+  std::vector<CarrierInfo> idle = {
+    {1, 1*S, now - 50*S, now - 100*S, now - 50*S},
+    {2, 1*S, now - 50*S, now - 100*S, now - 50*S},
+  };
+  check(assess_carriers(idle, now, scaled).reap_fds.empty(),
+        "zombie: idle (not actively sending) is not reaped peer-independently");
+}
+
 }  // namespace
 
 int main() {
@@ -237,6 +280,7 @@ int main() {
   test_assess_carriers();
   test_health_predicates();
   test_reap_dead_but_open();
+  test_reap_send_only_zombie();
   if (g_failures) {
     std::fprintf(stderr, "carrier_adapt tests: %d failure(s)\n", g_failures);
     return 1;

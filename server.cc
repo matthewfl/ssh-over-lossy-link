@@ -980,8 +980,18 @@ int run_server(const Args& args) {
       if (!rt_carriers.empty()) {
         unsigned rt_idx = 0;
         const unsigned small_rt_copies = std::max(1u, std::min(3u, static_cast<unsigned>(rt_carriers.size())));
+        // Bound the work per cycle. unacked_data is ordered by id, and the receiver delivers
+        // in order, so it is blocked only on the LOWEST unacked id — anything above the gap is
+        // buffered there already. Re-encoding/resending the whole backlog every cycle (seen at
+        // 689 items × an RS group each after a long outage) starves the single-threaded loop and
+        // the gap data never gets through. Cap to the lowest N due items so the gap is always
+        // covered; higher ids are reached on later cycles once they come due again.
+        const size_t kMaxRetransmitItemsPerCycle = 64;
+        size_t rt_items = 0;
         for (auto& [uid, ui] : unacked_data) {
           if (ui.send_ns == 0 || now_ns_val - ui.send_ns < retransmit_timeout_ns) continue;
+          if (rt_items >= kMaxRetransmitItemsPerCycle) break;
+          ++rt_items;
           if (ui.is_small) {
             // Only retransmit SMALL on carriers that have not yet carried this uid.
             std::vector<int> candidates;
