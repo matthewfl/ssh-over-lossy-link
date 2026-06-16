@@ -120,6 +120,23 @@ std::string launch_server(const Args& args) {
     argv_vec.push_back("--server");
     if (args.debug)
       argv_vec.push_back("--debug");
+    // Propagate the cold-start RTT hint so the server scales its timeouts correctly
+    // before it has measured RTT (otherwise it falls back to a 5 s default, which is
+    // too aggressive on high-latency links — see README "RTT-scaled timeouts").
+    char rtt_buf[32];
+    if (args.config.rtt_hint_ms > 0) {
+      snprintf(rtt_buf, sizeof rtt_buf, "%u", args.config.rtt_hint_ms);
+      argv_vec.push_back("--rtt-ms");
+      argv_vec.push_back(rtt_buf);
+    }
+    // Propagate the keepalive floor so the server also sends ≥N bytes/min on each carrier
+    // (the server→client direction), keeping NAT/firewall state alive on idle links.
+    char mbpm_buf[32];
+    if (args.config.min_data_per_minute > 0) {
+      snprintf(mbpm_buf, sizeof mbpm_buf, "%u", args.config.min_data_per_minute);
+      argv_vec.push_back("--min-data-per-minute");
+      argv_vec.push_back(mbpm_buf);
+    }
     argv_vec.push_back(args.remote_hostname.c_str());
     argv_vec.push_back(port_str.c_str());
     argv_vec.push_back(nullptr);
@@ -299,6 +316,11 @@ int run_client(const Args& args) {
   bool stdin_eof = false;
   bool stdin_in_epoll = true;   // tracks whether STDIN_FILENO is registered with epoll
   bool stdout_in_epoll = false; // tracks whether STDOUT_FILENO is registered with epoll
+  // --max-delay: hold a sub-block remainder up to this long so small writes can coalesce
+  // into a full Reed-Solomon block before being sent as (weaker) SMALL copies. 0 = send
+  // immediately. stdin_partial_since_ns marks when the current remainder began waiting.
+  const uint64_t max_delay_ns = static_cast<uint64_t>(args.config.max_delay_ms * 1000000.0f);
+  uint64_t stdin_partial_since_ns = 0;
   // Max bytes we buffer from stdin before pausing reads (avoids spinning when carriers are dead).
   static constexpr size_t STDIN_THROTTLE_BYTES = 256 * 1024;
   // Round-robin index shared by both SMALL packets and RS shards (client→server).
@@ -318,7 +340,7 @@ int run_client(const Args& args) {
   const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
-  uint64_t last_redundancy_pressure_add_ns = 0;  // rate-limit: at most one add per 60s from rs ratio
+  uint64_t last_redundancy_pressure_add_ns = 0;  // rate-limit: at most one add per 25s from rs ratio
   uint64_t last_rs_pending_pressure_add_ns = 0;  // rate-limit: add every 10s when rs_pending is very high
   // RTT outlier threshold: carrier must be both 5× median AND above this absolute. Scales with link.
   uint64_t backpressure_write_threshold = 150 * effective_max_packet;  // updated when effective_max_packet changes
@@ -776,6 +798,108 @@ int run_client(const Args& args) {
     return max_connections;
   };
 
+  // Packetize buffered stdin onto carriers: full blocks as Reed-Solomon (sent
+  // immediately), and any sub-block remainder as SMALL — but the remainder is held up
+  // to --max-delay (max_delay_ns) so consecutive small writes can coalesce into a full
+  // RS block first. Called both when stdin produces data and periodically (so a held
+  // remainder still flushes once its window elapses). Caller flushes carrier writes.
+  auto pump_stdin_send = [&]() {
+    while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
+      const size_t block_size = effective_max_packet;
+      float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
+      // One shard per carrier so any k of them suffice to decode (see rs_group_params).
+      auto gp = packet_io::rs_group_params(carriers.size(), rs_frac, stdin_buf.size() / block_size);
+      unsigned k = gp.k;
+      if (k == 0) break;
+      unsigned m = gp.m;
+      unsigned n = gp.n;
+      if (m == 0) {
+        // Single carrier: can't do RS (need m>=1). Send block as SMALL.
+        size_t chunk = block_size;
+        UnackedItem& ui = unacked_sends[next_send_id];
+        ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
+        ui.is_small = true;
+        ui.send_ns = now_ns();
+        auto it = carriers.begin();
+        int cfd = it->first;
+        ui.small_sent_on.insert(it->second.carrier_id);
+        queue_to_carrier(cfd, stdin_buf.data(), chunk, false);  // increments next_send_id
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = cfd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+        stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
+        continue;
+      }
+      std::vector<const uint8_t*> data_ptrs(k);
+      for (unsigned i = 0; i < k; ++i)
+        data_ptrs[i] = stdin_buf.data() + i * block_size;
+      std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
+      std::vector<uint8_t*> parity_ptrs(m);
+      for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
+      reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
+      size_t num_shards = n;
+      std::vector<uint64_t> shard_carriers(num_shards);
+      for (size_t i = 0; i < num_shards; ++i) {
+        auto it = carriers.begin();
+        std::advance(it, (next_rr + i) % carriers.size());
+        int cfd = it->first;
+        shard_carriers[i] = it->second.carrier_id;
+        const uint8_t* shard = (i < k) ? (stdin_buf.data() + i * block_size) : parity[i - k].data();
+        queue_rs_shard_to_carrier(cfd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
+        ev.events = EPOLLIN | EPOLLOUT;
+        ev.data.fd = cfd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+      }
+      {
+        UnackedItem& ui = unacked_sends[next_send_id];
+        ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
+        ui.n = n;
+        ui.k = static_cast<unsigned>(k);
+        ui.block_size = static_cast<uint16_t>(block_size);
+        ui.is_small = false;
+        ui.send_ns = now_ns();
+        for (unsigned si = 0; si < num_shards; ++si)
+          ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
+      }
+      next_send_id++;
+      if (!carriers.empty())
+        next_rr = (next_rr + static_cast<unsigned>(num_shards)) % static_cast<unsigned>(carriers.size());
+      stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
+    }
+    // Sub-block remainder → SMALL, held up to --max-delay so it can coalesce into a block.
+    if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
+      if (stdin_partial_since_ns == 0) stdin_partial_since_ns = now_ns();
+      if (max_delay_ns == 0 || now_ns() - stdin_partial_since_ns >= max_delay_ns) {
+        size_t chunk = stdin_buf.size();
+        const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()),
+                                                        effective_small_packet_redundancy));
+        UnackedItem& ui = unacked_sends[next_send_id];
+        ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
+        ui.is_small = true;
+        ui.send_ns = now_ns();
+        size_t n_carriers = carriers.size();
+        for (unsigned i = 0; i < n_copies && n_carriers > 0; ++i) {
+          unsigned idx = (next_rr + i) % static_cast<unsigned>(n_carriers);
+          auto it = carriers.begin();
+          std::advance(it, idx);
+          int cfd = it->first;
+          ui.small_sent_on.insert(it->second.carrier_id);
+          queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = cfd;
+          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+        }
+        if (!carriers.empty())
+          next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
+        if (n_copies > 1) next_send_id++;
+        stdin_buf.clear();
+        stdin_partial_since_ns = 0;
+      }
+    } else {
+      stdin_partial_since_ns = 0;
+    }
+  };
+
   std::vector<struct epoll_event> events(64);
   bool running = true;
 
@@ -796,6 +920,13 @@ int run_client(const Args& args) {
         epoll_timeout_ms = 0;
       else
         epoll_timeout_ms = static_cast<int>((floor_interval - elapsed) / 1000000ULL + 1);
+    }
+    // If a sub-block remainder is being held for coalescing (--max-delay), wake in time
+    // to flush it rather than waiting a full poll cycle.
+    if (stdin_partial_since_ns != 0 && max_delay_ns > 0) {
+      uint64_t elapsed = now_ns() - stdin_partial_since_ns;
+      uint64_t remaining_ms = (max_delay_ns > elapsed) ? ((max_delay_ns - elapsed) / 1000000ULL + 1) : 0;
+      if (static_cast<int>(remaining_ms) < epoll_timeout_ms) epoll_timeout_ms = static_cast<int>(remaining_ms);
     }
     int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), epoll_timeout_ms);
     if (n < 0) {
@@ -840,98 +971,7 @@ int run_client(const Args& args) {
           epoll_ctl(epfd, EPOLL_CTL_DEL, STDIN_FILENO, nullptr);
           stdin_in_epoll = false;
         }
-        while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
-          const size_t block_size = effective_max_packet;
-          float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
-          // One shard per carrier so any k of them suffice to decode (see rs_group_params).
-          auto gp = packet_io::rs_group_params(carriers.size(), rs_frac, stdin_buf.size() / block_size);
-          unsigned k = gp.k;
-          if (k == 0) break;
-          unsigned m = gp.m;
-          unsigned n = gp.n;
-          if (m == 0) {
-            // Single carrier: can't do RS (need m>=1). Send block as SMALL.
-            size_t chunk = block_size;
-            UnackedItem& ui = unacked_sends[next_send_id];
-            ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
-            ui.is_small = true;
-            ui.send_ns = now_ns();
-            auto it = carriers.begin();
-            int cfd = it->first;
-            ui.small_sent_on.insert(it->second.carrier_id);
-            queue_to_carrier(cfd, stdin_buf.data(), chunk, false);  // increments next_send_id
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-            stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
-            continue;
-          }
-          std::vector<const uint8_t*> data_ptrs(k);
-          for (unsigned i = 0; i < k; ++i)
-            data_ptrs[i] = stdin_buf.data() + i * block_size;
-          std::vector<std::vector<uint8_t>> parity(m, std::vector<uint8_t>(block_size));
-          std::vector<uint8_t*> parity_ptrs(m);
-          for (unsigned i = 0; i < m; ++i) parity_ptrs[i] = parity[i].data();
-          reed_solomon::encode(k, m, data_ptrs.data(), parity_ptrs.data(), block_size);
-          size_t num_shards = n;
-          std::vector<uint64_t> shard_carriers(num_shards);
-          for (size_t i = 0; i < num_shards; ++i) {
-            auto it = carriers.begin();
-            std::advance(it, (next_rr + i) % carriers.size());
-            int cfd = it->first;
-            shard_carriers[i] = it->second.carrier_id;
-            const uint8_t* shard = (i < k) ? (stdin_buf.data() + i * block_size) : parity[i - k].data();
-            queue_rs_shard_to_carrier(cfd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-          }
-          // Save original data and which carriers carried which shards so retransmits
-          // can avoid reusing the same carrier for the same shard.
-          {
-            UnackedItem& ui = unacked_sends[next_send_id];
-            ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
-            ui.n = n;
-            ui.k = static_cast<unsigned>(k);
-            ui.block_size = static_cast<uint16_t>(block_size);
-            ui.is_small = false;
-            ui.send_ns = now_ns();
-            for (unsigned si = 0; si < num_shards; ++si) {
-              ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
-            }
-          }
-          next_send_id++;
-          if (!carriers.empty())
-            next_rr = (next_rr + static_cast<unsigned>(num_shards)) % static_cast<unsigned>(carriers.size());
-          stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
-        }
-        // Send any remainder smaller than one block as SMALL (no Reed–Solomon).
-        if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
-          size_t chunk = stdin_buf.size();
-          const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()),
-                                                           effective_small_packet_redundancy));
-          UnackedItem& ui = unacked_sends[next_send_id];
-          ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
-          ui.is_small = true;
-          ui.send_ns = now_ns();
-          // Round-robin SMALL packets across carriers using the same index as RS shards.
-          size_t n_carriers = carriers.size();
-          for (unsigned i = 0; i < n_copies && n_carriers > 0; ++i) {
-            unsigned idx = (next_rr + i) % static_cast<unsigned>(n_carriers);
-            auto it = carriers.begin();
-            std::advance(it, idx);
-            int cfd = it->first;
-            ui.small_sent_on.insert(it->second.carrier_id);
-            queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-          }
-          if (!carriers.empty())
-            next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
-          if (n_copies > 1) next_send_id++;
-          stdin_buf.clear();
-        }
+        pump_stdin_send();
         // Flush immediately so data reaches kernel (and thus server) in this
         // iteration instead of after processing other events in the batch.
         flush_carrier_writes();
@@ -1032,6 +1072,7 @@ int run_client(const Args& args) {
     }
 
     if (stdin_eof && !stdin_buf.empty() && !carriers.empty()) {
+      stdin_partial_since_ns = 0;  // EOF: flush everything now, don't hold for --max-delay
       while (!stdin_buf.empty()) {
         size_t chunk = std::min(stdin_buf.size(), effective_max_packet);
         const bool small_packet = (chunk < effective_max_packet);
@@ -1075,6 +1116,12 @@ int run_client(const Args& args) {
           next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
       }
     }
+
+    // Flush a sub-block remainder that has been held for coalescing once its --max-delay
+    // window elapses (no new stdin event is needed to push it out). EOF is handled by the
+    // drain path above, so only run this while stdin is still open.
+    if (!stdin_eof && stdin_partial_since_ns != 0 && !carriers.empty())
+      pump_stdin_send();
 
     flush_carrier_writes();
     flush_stdout();
@@ -1619,9 +1666,13 @@ int run_client(const Args& args) {
         // the old 2 s floor meant a dying carrier caused a 2+ s stall before retransmit.
         // 500 ms is still 5× the one-way latency on that link — conservative enough to
         // avoid duplicate traffic on healthy connections, aggressive enough to recover fast.
-        uint64_t retransmit_timeout_ns = (recent_rtt_ns.size() >= 2)
+        // With ≥2 samples, scale from observed RTT. Before that, honor the --rtt-ms
+        // cold-start hint (scaled_ns falls back to it) so high-latency links don't get
+        // spuriously retransmitted every 2.5 s before the first ACKs arrive; only use the
+        // 2.5 s floor when neither samples nor a hint are available.
+        uint64_t retransmit_timeout_ns = (recent_rtt_ns.size() >= 2 || args.config.rtt_hint_ms > 0)
             ? scaled_ns(4, 500000000ULL, 60000000000ULL)
-            : 2500000000ULL;  // 2.5 s when no RTT known yet (cold start)
+            : 2500000000ULL;  // 2.5 s when no RTT samples and no hint (cold start)
         // Collect all ready (non-connecting) carriers for round-robin retransmit.
         // Spreading shards across multiple carriers means no single carrier failure
         // can wipe out a retransmit attempt.
