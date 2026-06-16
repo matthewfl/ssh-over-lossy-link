@@ -153,8 +153,15 @@ CarrierQualityResult assess_carriers(
         rx_dead = true;
     }
 
-    if (idle_dead || rx_dead)
+    if (idle_dead || rx_dead) {
       res.dead_idle_fds.push_back(c.fd);
+      // Confidently dead (safe for the server to close itself): some peer received far
+      // more recently than this carrier, so traffic is flowing that this carrier is
+      // missing — it isn't just a global quiet period. Excludes the case where every
+      // carrier is equally idle (latest_recv_ns close to this carrier's last_recv_ns).
+      if (latest_recv_ns > c.last_recv_ns + dead_idle_ns)
+        res.reap_fds.push_back(c.fd);
+    }
   }
 
   if (carriers.size() > 1) {

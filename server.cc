@@ -824,6 +824,33 @@ int run_server(const Args& args) {
         carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns, cs.last_send_ns});
       }
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
+
+      // Reap confidently-dead carriers ourselves. The server can normally only
+      // SUGGEST_CLOSE (the client is the master that opens/closes carriers), but a
+      // dead-but-open carrier — e.g. after a WiFi/VPN drop, where the old socket hasn't
+      // errored yet — never receives that suggestion. If we keep it, retransmits get
+      // round-robined onto it and never reach the client's fresh carriers, so the logical
+      // stream never recovers. reap_fds is the safe subset (a peer is actively receiving
+      // while this carrier is not), so closing it here is cleanup, not carrier management.
+      for (int cfd : quality.reap_fds) {
+        auto it = carriers.find(cfd);
+        if (it == carriers.end()) continue;
+        if (dbg) fprintf(dbg, "[carrier-reap t=%llu fd=%d total=%zu reason=dead_but_open]\n",
+                         (unsigned long long)(now_ns_val/1000000ULL), cfd, carriers.size()-1);
+        close(cfd);
+        epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
+        carriers.erase(it);
+        pending_peer_suggest_close.erase(cfd);
+        outstanding_ping_ns.erase(cfd);
+      }
+      if (!quality.reap_fds.empty()) {
+        if (carriers.empty() && !unacked_data.empty()) {
+          retransmit_needed = true;  // recover by replaying once a fresh carrier connects
+        } else if (!unacked_data.empty()) {
+          last_retransmit_check_ns = 0;  // retransmit onto the survivors immediately
+        }
+      }
+
       size_t backlog_bytes = 0;
       for (const auto& [_, ud] : unacked_data) backlog_bytes += ud.data.size();
       // Base predicate is shared with the client; the server additionally treats any
@@ -898,16 +925,19 @@ int run_server(const Args& args) {
         // Server cannot close directly; client performs actual close.
         // Keep rate limiting (1 per 10s) to avoid mass-close bursts.
         for (int cfd : quality.dead_idle_fds) {
+          // Skip any we already reaped above (don't re-insert via operator[]).
+          auto itc = carriers.find(cfd);
+          if (itc == carriers.end()) continue;
           if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
           last_suggest_close_ns = now_ns_val;
-          packet_io::append_suggest_close(carriers[cfd].write_buf);
+          packet_io::append_suggest_close(itc->second.write_buf);
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), cfd);
         }
-        if (quality.rtt_outlier_fd >= 0
+        if (quality.rtt_outlier_fd >= 0 && carriers.count(quality.rtt_outlier_fd)
             && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
           last_suggest_close_ns = now_ns_val;
           packet_io::append_suggest_close(carriers[quality.rtt_outlier_fd].write_buf);
