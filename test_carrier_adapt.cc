@@ -186,46 +186,44 @@ void test_health_predicates() {
   check(!should_send_idle_ping(true, now, now - 6*S, now - 1*S, idle), "idle_ping: recent recv → false");
 }
 
-// ── reap_fds: confidently-dead carriers the server may close itself ──────────
-// Reproduces the reported WiFi/VPN-drop bug: the server keeps streaming s2c data, the
-// link drops for ~2 min, the client tears down its carriers and opens fresh ones, but the
-// server's OLD carriers are dead-but-open (their sockets haven't errored). The server
-// keeps writing retransmits to them (last_send advances) while only the NEW carriers
-// actually receive — so the stale carriers must be reaped or retransmits never reach the
-// client and the logical SSH stream never recovers.
-void test_reap_dead_but_open() {
+// ── reap_fds is anti-churn: never reap while the link is up ──────────────────
+// Critical safety property. When SOME carrier is receiving (the link is up), a carrier
+// that is silent is INDISTINGUISHABLE from a dead one by passive signals — it may simply
+// be one the peer's return traffic (ACKs) isn't currently routed over. Reaping it caused
+// constant carrier churn (the server closed live carriers, the client reopened them, ad
+// infinitum). So reap_fds must be EMPTY whenever any peer received recently; such carriers
+// are still flagged dead_idle (for SUGGEST_CLOSE) but are only really removed by a genuine
+// socket error.
+void test_reap_no_churn_while_link_up() {
   auto scaled = [](unsigned mult, uint64_t mn, uint64_t mx) -> uint64_t {
-    uint64_t v = static_cast<uint64_t>(mult) * 1 * S;  // effective RTT = 1 s
+    uint64_t v = static_cast<uint64_t>(mult) * 1 * S;  // effective RTT = 1 s -> dead_idle 5s
     return v < mn ? mn : (v > mx ? mx : v);
   };
-  const uint64_t now = 1000 * S;  // dead_idle = 5 s, grace = 5 s
-
-  // Two stale carriers (received only long ago, but we keep retransmitting → last_send
-  // recent) plus a healthy new carrier that is actively receiving.
-  std::vector<CarrierInfo> cs = {
-    {/*fd=*/1, /*rtt=*/1*S, /*last_recv=*/now - 100*S, /*connect=*/now - 100*S, /*last_send=*/now - 1*S},
-    {/*fd=*/2, 1*S,         now - 100*S,               now - 100*S,             now - 1*S},
-    {/*fd=*/3, 1*S,         now - 1*S,                 now - 10*S,              now - 1*S},  // healthy, receiving
-  };
-  auto r = assess_carriers(cs, now, scaled);
-  // Both stale carriers are flagged dead AND confidently reap-able; the healthy one isn't.
+  const uint64_t now = 1000 * S;
   auto has = [](const std::vector<int>& v, int fd) {
     return std::find(v.begin(), v.end(), fd) != v.end();
   };
-  check(has(r.reap_fds, 1) && has(r.reap_fds, 2), "reap: stale dead-but-open carriers are reap-able");
-  check(!has(r.reap_fds, 3), "reap: the actively-receiving carrier is NOT reaped");
-  check(has(r.dead_idle_fds, 1) && has(r.dead_idle_fds, 2), "reap: stale carriers are also flagged dead_idle");
 
-  // Safety: during a *global* quiet period (every carrier equally idle, no peer receiving
-  // more recently), nothing is reaped — the server must not churn live-but-idle carriers.
+  // Two long-silent carriers we keep writing to, plus a healthy carrier receiving now.
+  // The link is up (fd=3 just received), so NOTHING is reaped — even the silent ones.
+  std::vector<CarrierInfo> cs = {
+    {/*fd=*/1, /*rtt=*/1*S, /*last_recv=*/now - 100*S, /*connect=*/now - 100*S, /*last_send=*/now - 1*S},
+    {/*fd=*/2, 1*S,         now - 100*S,               now - 100*S,             now - 1*S},
+    {/*fd=*/3, 1*S,         now - 1*S,                 now - 10*S,              now - 1*S},  // healthy
+  };
+  auto r = assess_carriers(cs, now, scaled);
+  check(r.reap_fds.empty(), "reap: link is up (a peer is receiving) -> reap nothing (no churn)");
+  // The silent ones are still flagged dead_idle so SUGGEST_CLOSE can be sent.
+  check(has(r.dead_idle_fds, 1) && has(r.dead_idle_fds, 2), "reap: silent carriers still flagged dead_idle");
+  check(!has(r.dead_idle_fds, 3), "reap: the receiving carrier is not flagged");
+
+  // Global quiet period (no carrier ever received recently, and we are not sending):
+  // still nothing reaped.
   std::vector<CarrierInfo> quiet = {
     {1, 1*S, now - 100*S, now - 200*S, now - 100*S},
     {2, 1*S, now - 100*S, now - 200*S, now - 100*S},
-    {3, 1*S, now - 100*S, now - 200*S, now - 100*S},
   };
-  auto q = assess_carriers(quiet, now, scaled);
-  check(q.reap_fds.empty(), "reap: a global quiet period reaps nothing (no churn)");
-  check(!q.dead_idle_fds.empty(), "reap: quiet carriers are still flagged dead_idle (idle)");
+  check(assess_carriers(quiet, now, scaled).reap_fds.empty(), "reap: quiet period reaps nothing");
 }
 
 // ── send-only zombie: reap-able with NO healthy peer (total-outage recovery) ──
@@ -279,7 +277,7 @@ int main() {
   test_merge();
   test_assess_carriers();
   test_health_predicates();
-  test_reap_dead_but_open();
+  test_reap_no_churn_while_link_up();
   test_reap_send_only_zombie();
   if (g_failures) {
     std::fprintf(stderr, "carrier_adapt tests: %d failure(s)\n", g_failures);

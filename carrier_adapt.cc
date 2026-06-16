@@ -124,6 +124,15 @@ CarrierQualityResult assess_carriers(
   for (const auto& c : carriers)
     if (c.last_recv_ns > latest_recv_ns) latest_recv_ns = c.last_recv_ns;
 
+  // Total outage: the link was up (we received before) but NO carrier has received
+  // anything for dead_idle. This is the *only* condition under which we close carriers
+  // ourselves (reap_fds): when the whole link is down, a carrier we keep writing to but
+  // that is silent is genuinely dead. When the link is up (some carrier received recently)
+  // a silent carrier may simply be one the peer's return traffic isn't currently routed
+  // over — closing it would cause constant carrier churn — so we never reap in that case,
+  // only flag it (the client/server then SUGGEST_CLOSE and rely on a real socket error).
+  const bool total_outage = (latest_recv_ns > 0) && (now_ns - latest_recv_ns > dead_idle_ns);
+
   for (const auto& c : carriers) {
     if (now_ns - c.connect_ns < grace_ns) continue;
     // Default idle test: no recent send/recv activity.
@@ -163,8 +172,13 @@ CarrierQualityResult assess_carriers(
     // when EVERY carrier is dead (a long total outage) — the case that otherwise stalls
     // recovery forever, because nothing drops the carrier count below the floor so fresh
     // carriers are never opened, and the server never sheds corpses to accept new ones.
+    // Send-only zombie: during a TOTAL outage, a carrier we keep writing to (so the idle
+    // test is defeated by an advancing last_send_ns) but that has delivered nothing back
+    // for a long time is dead. Gated on total_outage so it never fires while the link is
+    // up — when some carrier is receiving, a silent carrier may just be out of the peer's
+    // return-traffic rotation, and reaping it would cause endless carrier churn.
     bool zombie_dead = false;
-    if (!idle_dead && !rx_dead) {
+    if (!idle_dead && !rx_dead && total_outage) {
       bool actively_sending = (c.last_send_ns > 0) && (now_ns - c.last_send_ns < dead_idle_ns);
       uint64_t silent_since = std::max(c.last_recv_ns, c.connect_ns);
       if (actively_sending && now_ns - silent_since > zombie_ns)
@@ -173,11 +187,10 @@ CarrierQualityResult assess_carriers(
 
     if (idle_dead || rx_dead || zombie_dead) {
       res.dead_idle_fds.push_back(c.fd);
-      // Confidently dead (safe to close ourselves rather than only SUGGEST_CLOSE):
-      //  - a peer received far more recently than this carrier (active traffic it is
-      //    missing — not just a global quiet period), or
-      //  - it is a send-only zombie (peer-independent: silent for zombie_ns while we send).
-      if (zombie_dead || latest_recv_ns > c.last_recv_ns + dead_idle_ns)
+      // Only confidently-dead total-outage zombies are reaped by us directly; everything
+      // else (rx-dead / never-received while the link is up) is left to SUGGEST_CLOSE +
+      // real socket errors, to avoid closing live-but-quiet carriers.
+      if (zombie_dead)
         res.reap_fds.push_back(c.fd);
     }
   }
