@@ -3,6 +3,7 @@
 test_reed_solomon
 ssh-oll
 test_packet_io
+test_carrier_adapt
 proxy.log
 client_err.txt
 .test-proxy-socket

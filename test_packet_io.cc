@@ -175,6 +175,36 @@ void test_mixed_order() {
   check(h.delivered == expect, "mixed: bytes are the decoded block followed by Z");
 }
 
+// ── Test 6: retransmit-after-reconnect — re-encoded shards complete a partial group ─
+// Mirrors what the retransmit/reconnect path does: a group is partially received, then
+// the sender re-encodes the SAME group (same id/n/k/block_size) and resends its shards.
+// The re-fed shards must combine with the retained partial and decode. This is the
+// invariant the Phase 2 shared retransmit helper must preserve.
+void test_rs_retransmit_combines() {
+  const unsigned k = 4, m = 2;
+  const size_t block_size = 8;
+  std::vector<uint8_t> data(k * block_size);
+  for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>(0x10 + i);
+
+  Harness h;
+  // First transmission: only 2 of the k=4 needed shards arrive (rest "lost").
+  auto first = make_rs_shards(/*id=*/0, data, k, m, block_size);
+  h.feed(first[0]);
+  h.feed(first[1]);
+  check(h.delivered.empty(), "rs-retransmit: partial group (2<k) not delivered");
+
+  // Reconnect retransmit: the sender re-encodes the same group from scratch and resends.
+  // Regenerate independently to prove the re-encode is deterministic (same parity bytes).
+  auto resend = make_rs_shards(/*id=*/0, data, k, m, block_size);
+  h.feed(resend[2]);  // 3rd distinct shard
+  check(h.delivered.empty(), "rs-retransmit: still short of k after 3rd shard");
+  h.feed(resend[3]);  // 4th distinct shard → decode from the combined set
+  check(h.delivered.size() == data.size(), "rs-retransmit: re-fed shards complete the group");
+  check(std::memcmp(h.delivered.data(), data.data(), data.size()) == 0,
+        "rs-retransmit: decoded bytes match original");
+  check(h.delivered_ids.size() == 1 && h.delivered_ids[0] == 0, "rs-retransmit: delivered exactly once");
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +213,7 @@ int main() {
   test_gap_blocks();
   test_rs_decode_and_extra();
   test_mixed_order();
+  test_rs_retransmit_combines();
   if (g_failures) {
     std::fprintf(stderr, "packet_io tests: %d failure(s)\n", g_failures);
     return 1;
