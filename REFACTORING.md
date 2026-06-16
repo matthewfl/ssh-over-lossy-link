@@ -5,6 +5,12 @@ root cause of the bug class just fixed (B1: the client and server kept separate,
 drifting copies of the dead-carrier detection logic). The aim is to make the shared
 machinery exist **once**, be **unit-testable**, and stop hiding correctness bugs.
 
+> **Progress (branch `refactor-shared-machinery`):** Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅
+> · Phases 3–5 not started. `make check` green; `wifi-stop-then-recover-heavy` green;
+> the flaky `wifi-double-blackout-heavy` boundary test was A/B-tested against the
+> pre-refactor build and shows the same pass rate, confirming the extractions so far are
+> behavior-preserving.
+
 ## Goals
 - Remove the parallel reimplementations between `client.cc` and `server.cc`.
 - Make the trickiest logic (retransmit/re-encode, carrier health, RTT/timeouts)
