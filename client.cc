@@ -599,16 +599,40 @@ int run_client(const Args& args) {
     }
   };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
-    auto it_p = carrier_pending_acks.find(fd);
-    if (it_p == carrier_pending_acks.end()) return;
-    uint64_t rtt_ns = 0;
     const uint64_t recv_time = now_ns();
-    auto& q = it_p->second;
-    while (!q.empty() && q.front().first <= acked_id) {
-      rtt_ns = recv_time - q.front().second;
-      q.pop_front();
+    uint64_t rtt_ns = 0;
+    // Measure RTT only on the carrier the ACK arrived on — that path actually round-tripped.
+    auto it_p = carrier_pending_acks.find(fd);
+    if (it_p != carrier_pending_acks.end()) {
+      auto& q = it_p->second;
+      uint64_t last_id = 0; bool have = false;
+      while (!q.empty() && q.front().first <= acked_id) {
+        last_id = q.front().first; have = true;
+        rtt_ns = recv_time - q.front().second;
+        q.pop_front();
+      }
+      // Karn's algorithm: if the acked item was retransmitted, the ACK is ambiguous
+      // (could be for any transmission) and a pre-outage send acked post-outage would
+      // otherwise be timed as ~the outage duration. Don't record RTT for it. The
+      // cross-carrier clear below guarantees unacked_sends[last_id] still exists here.
+      if (have) {
+        auto uit = unacked_sends.find(last_id);
+        if (uit != unacked_sends.end() && uit->second.retransmitted) rtt_ns = 0;
+      }
+    }
+    // ACKs are cumulative: every id <= acked_id is delivered, so clear its pending entry
+    // on ALL OTHER carriers too (without timing it). Otherwise an entry on a slow or
+    // recovered carrier lingers until that carrier itself gets an ACK and is then timed as
+    // a huge RTT (~outage duration), inflating the retransmit timeout and stalling recovery.
+    for (auto& [cfd, q2] : carrier_pending_acks) {
+      if (cfd == fd) continue;
+      while (!q2.empty() && q2.front().first <= acked_id) q2.pop_front();
     }
     if (rtt_ns != 0) {
+      if (dbg && rtt_ns > 5000000000ULL)
+        fprintf(dbg, "[ack-rtt-high t=%llu fd=%d acked_id=%llu rtt_ms=%llu]\n",
+                (unsigned long long)(now_ns()/1000000ULL), fd, (unsigned long long)acked_id,
+                (unsigned long long)(rtt_ns/1000000ULL));
       auto it_c = carriers.find(fd);
       if (it_c != carriers.end()) it_c->second.last_rtt_ns = rtt_ns;
       // Always record RTT samples regardless of auto_adapt. RTT drives all timeout
@@ -986,6 +1010,7 @@ int run_client(const Args& args) {
                 // Reset timer so the periodic 3 s retransmit doesn't immediately
                 // fire a redundant duplicate of what we just queued.
                 ui.send_ns = retransmit_now;
+                ui.retransmitted = true;  // Karn: don't time this id's ACK as RTT
               }
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;
@@ -1682,6 +1707,7 @@ int run_client(const Args& args) {
             }
             // Reset send_ns so we don't retransmit this group again for another 3 s.
             ui.send_ns = now_p;
+            ui.retransmitted = true;  // Karn: don't time this id's ACK as RTT
           }
         }
       }

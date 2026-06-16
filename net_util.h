@@ -49,6 +49,8 @@ struct UnackedItem {
   uint16_t block_size = 0;
   bool is_small = false;
   uint64_t send_ns = 0;        // when originally sent (for timeout-based retransmit)
+  bool retransmitted = false;  // set once this item has been resent; its ACK's RTT is then
+                               // ambiguous (Karn's algorithm) and must not be timed.
   // Which logical carriers have already carried this send, so retransmits avoid
   // reusing the same carrier. SMALL: set of carrier_ids that saw this id. RS: per-shard.
   std::set<uint64_t> small_sent_on;
