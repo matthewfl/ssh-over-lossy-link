@@ -6,12 +6,15 @@ drifting copies of the dead-carrier detection logic). The aim is to make the sha
 machinery exist **once**, be **unit-testable**, and stop hiding correctness bugs.
 
 > **Progress (branch `refactor-shared-machinery`):** Phase 0 ✅ · Phase 1 ✅ · Phase 2 ✅
-> · Phase 3 ✅ (safe subset — shared predicates; deeper ping-orchestration unification
-> deferred to Phase 5, see note there) · Phase 4 deprioritized · Phase 5 not started.
-> `make check` green; `wifi-stop-then-recover-heavy` green; the flaky
-> `wifi-double-blackout-heavy` boundary test was A/B-tested against the pre-refactor
-> build and shows the same pass rate, confirming the extractions so far are
-> behavior-preserving.
+> · Phase 3 ✅ (safe subset — shared predicates) · Phase 4 deprioritized (see note) ·
+> Phase 5 ✅ as focused extractions, **not** the big-bang Endpoint rewrite (see Phase 5
+> note for the rationale). `make check` green; `wifi-stop-then-recover-heavy` green; the
+> flaky `wifi-double-blackout-heavy` boundary test was A/B-tested against the pre-refactor
+> build and shows the same pass rate, confirming the extractions are behavior-preserving.
+>
+> Shared code now lives once: `net_util.h` (clock, RTT percentile, timeout scaling,
+> `UnackedItem`); `packet_io` (`rs_reencode_shards`, `rs_group_params`); `carrier_adapt`
+> (`is_heavy_backlog`, `should_send_idle_ping`, plus the existing adapt/health logic).
 
 ## Goals
 - Remove the parallel reimplementations between `client.cc` and `server.cc`.
@@ -110,14 +113,35 @@ still duplicated and is exactly where client/server drifted.
 > have prevented it. The sweep is ~60 mechanical edits with real transcription risk for
 > modest benefit. Recommend skipping unless doing it opportunistically alongside Phase 5.
 
-## Phase 5 — Optional: structural split (larger, do last)
-Only if Phases 1–4 land cleanly and the appetite is there.
-- [ ] Introduce an `Endpoint`/`CarrierSet` type owning `carriers`, `reassembly`,
-      `rs_pending`, `unacked`, `next_send_id`, `next_deliver_id`, with `feed_read`,
-      `encode_outgoing`, `flush`, `retransmit_due`, `assess_health` methods.
-- [ ] `run_client`/`run_server` become thin: an event loop plus the policy differences
-      (client launches SSH carriers and is the master; server has a backend socket and
-      only suggests closes). Break each giant function into named periodic-task methods.
+## Phase 5 — Done as focused extractions, NOT the big-bang Endpoint rewrite
+The original sketch was an `Endpoint`/`CarrierSet` type owning all the common state with
+`feed_read`/`encode_outgoing`/`retransmit_due`/`assess_health` methods, and thin
+`run_client`/`run_server` shells.
+
+**Reassessed and changed approach.** After Phases 1–3 the remaining shareable logic is
+narrow, and the two sides genuinely differ in control flow (client launches SSH carriers
+and is the master, reads stdin / writes stdout; server daemonizes, owns a backend socket,
+and can only *suggest* closes; they differ in ping-id scheme, the outstanding-ping
+representation, and ACK/RTT bookkeeping). A grand Endpoint interface would force both
+flows through one API with many conditionals/callbacks — likely *more* code and *harder*
+to follow, for a behavior-preserving change validated only by slow/flaky integration
+tests. Risk/reward did not favor it.
+
+Instead Phase 5 continued the proven pattern (focused, unit-tested, behavior-preserving
+helpers):
+- [x] `packet_io::rs_group_params(...)` — the RS group-sizing math (n/k/m), previously
+      duplicated verbatim in both primary-encode loops.
+
+Remaining duplication that was deliberately **left in place** (per-side coupling makes
+sharing higher-risk than the benefit): the primary encode *distribution* loop (differs in
+ACK/RTT tracking) and the periodic-retransmit driver (differs in per-carrier candidate
+bookkeeping). These are the natural first targets if a future Endpoint refactor is taken
+on; they are not worth extracting in isolation.
+
+If the giant `run_client`/`run_server` functions become a maintenance problem, the
+lowest-risk next step is mechanical: bundle the common stream state into a `StreamState`
+struct and split each function's periodic tasks into named helpers — before attempting any
+shared-method abstraction.
 
 ---
 
