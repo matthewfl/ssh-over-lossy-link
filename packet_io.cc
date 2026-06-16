@@ -220,12 +220,19 @@ bool process_carrier_read(
         std::vector<std::vector<uint8_t>> out_shards(k, std::vector<uint8_t>(rp.block_size));
         std::vector<uint8_t*> out_ptrs(k);
         for (unsigned i = 0; i < k; ++i) out_ptrs[i] = out_shards[i].data();
-        if (reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
-          if (!reassembly.count(id)) {
-            reassembly[id].clear();
-            for (unsigned i = 0; i < k; ++i)
-              reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
-          }
+        bool decoded = reassembly.count(id) > 0;  // already reconstructed by an earlier call
+        if (!decoded &&
+            reed_solomon::decode(rp.n, rp.k, recv_ptrs.data(), recv_indices.data(), out_ptrs.data(), rp.block_size)) {
+          decoded = true;
+          reassembly[id].clear();
+          for (unsigned i = 0; i < k; ++i)
+            reassembly[id].insert(reassembly[id].end(), out_shards[i].begin(), out_shards[i].end());
+        }
+        if (!decoded) {
+          // Decode failed (e.g. corrupt shard / unsolvable subset). Do NOT erase the
+          // pending group: dropping it here would leave a permanent hole at this id,
+          // stalling the stream forever. Keep it so retransmitted shards can retry.
+          continue;
         }
         if (callbacks.on_rs_decode || callbacks.on_rs_extra_shard) {
           // Sort per-shard arrival times to compute spread and the final inter-shard gap.
@@ -273,6 +280,37 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&size), reinterpret_cast<uint8_t*>(&size) + sizeof size);
   out.insert(out.end(), data, data + len);
+}
+
+RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks) {
+  RsGroupParams p;
+  unsigned n_carriers = static_cast<unsigned>(std::min(live_carriers, static_cast<size_t>(255)));
+  unsigned k = std::max(1u, static_cast<unsigned>(static_cast<float>(n_carriers) / (1.0f + rs_frac)));
+  k = static_cast<unsigned>(std::min(static_cast<size_t>(k), available_blocks));
+  p.k = k;
+  if (k == 0) return p;  // nothing buffered yet; caller stops
+  unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
+  unsigned n = std::min(k + m, n_carriers);  // cap so each shard lands on a distinct carrier
+  p.n = n;
+  p.m = n - k;
+  return p;
+}
+
+std::vector<std::vector<uint8_t>> rs_reencode_shards(const UnackedItem& ui) {
+  const unsigned k = ui.k, n = ui.n, m = n - k;
+  const size_t bs = ui.block_size;
+  std::vector<std::vector<uint8_t>> shards(n);
+  // Data shards are copies of the stored block; parity is recomputed from them.
+  for (unsigned i = 0; i < k; ++i)
+    shards[i].assign(ui.data.begin() + i * bs, ui.data.begin() + (i + 1) * bs);
+  if (m > 0) {
+    std::vector<const uint8_t*> dptrs(k);
+    for (unsigned i = 0; i < k; ++i) dptrs[i] = ui.data.data() + i * bs;
+    std::vector<uint8_t*> pptrs(m);
+    for (unsigned i = 0; i < m; ++i) { shards[k + i].resize(bs); pptrs[i] = shards[k + i].data(); }
+    reed_solomon::encode(k, m, dptrs.data(), pptrs.data(), bs);
+  }
+  return shards;
 }
 
 void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigned k,

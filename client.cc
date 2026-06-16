@@ -2,6 +2,7 @@
 #include "packet_io.h"
 #include "reed_solomon.h"
 #include "carrier_adapt.h"
+#include "net_util.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -304,9 +305,6 @@ int run_client(const Args& args) {
   unsigned next_rr = 0;
   size_t effective_max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   if (effective_max_packet == 0) effective_max_packet = 800;
-  auto now_ns = []() {
-    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-  };
   std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
   uint64_t next_carrier_id_global = 1;
 
@@ -357,12 +355,8 @@ int run_client(const Args& args) {
     bool have_observed = (recent_rtt_ns.size() >= 3) || (server_reported_max_rtt_ns > 0);
     if (have_observed) {
       uint64_t observed = server_reported_max_rtt_ns;
-      if (recent_rtt_ns.size() >= 3) {
-        std::vector<uint64_t> sorted(recent_rtt_ns.begin(), recent_rtt_ns.end());
-        std::sort(sorted.begin(), sorted.end());
-        uint64_t p90 = sorted[static_cast<size_t>(sorted.size() * 0.9)];
-        observed = std::max(observed, p90);
-      }
+      if (recent_rtt_ns.size() >= 3)
+        observed = std::max(observed, p90_ns(recent_rtt_ns));
       if (observed == 0) {
         // Should not normally happen, but fall back to hint/default if it does.
         return hint_ns ? hint_ns : 5000000000ULL;
@@ -376,29 +370,12 @@ int run_client(const Args& args) {
     return hint_ns ? hint_ns : 5000000000ULL;
   };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
-    uint64_t rtt = get_effective_rtt_ns();
-    uint64_t v = static_cast<uint64_t>(mult) * rtt;
-    if (v < min_ns) return min_ns;
-    if (v > max_ns) return max_ns;
-    return v;
+    return ssholl::scaled_ns(mult, min_ns, max_ns, get_effective_rtt_ns());
   };
 
-  // Unacked-send retransmit buffer.  Holds the original pre-encoded data for
-  // each outstanding send_id so that it can be re-encoded and re-sent on a
-  // new carrier when all existing carriers die.
-  struct UnackedItem {
-    std::vector<uint8_t> data;   // for RS: k*block_size bytes; for SMALL: raw bytes
-    unsigned n = 0;
-    unsigned k = 0;
-    uint16_t block_size = 0;
-    bool is_small = false;
-    uint64_t send_ns = 0;        // when originally sent (for timeout-based retransmit)
-    // Track which carriers have already carried this logical send so retransmits
-    // can avoid reusing the same carrier. For SMALL packets we record the set of
-    // logical carrier_ids that have ever seen this id; for RS we track it per-shard.
-    std::set<uint64_t> small_sent_on;
-    std::map<unsigned, std::set<uint64_t>> rs_shard_sent_on;  // shard_index -> carrier_ids
-  };
+  // Unacked-send retransmit buffer (shared UnackedItem from net_util.h): holds the
+  // original pre-encoded data for each outstanding send_id so it can be re-encoded and
+  // resent on a new carrier when all existing carriers die.
   std::map<uint64_t, UnackedItem> unacked_sends;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
 
@@ -622,16 +599,40 @@ int run_client(const Args& args) {
     }
   };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
-    auto it_p = carrier_pending_acks.find(fd);
-    if (it_p == carrier_pending_acks.end()) return;
-    uint64_t rtt_ns = 0;
     const uint64_t recv_time = now_ns();
-    auto& q = it_p->second;
-    while (!q.empty() && q.front().first <= acked_id) {
-      rtt_ns = recv_time - q.front().second;
-      q.pop_front();
+    uint64_t rtt_ns = 0;
+    // Measure RTT only on the carrier the ACK arrived on — that path actually round-tripped.
+    auto it_p = carrier_pending_acks.find(fd);
+    if (it_p != carrier_pending_acks.end()) {
+      auto& q = it_p->second;
+      uint64_t last_id = 0; bool have = false;
+      while (!q.empty() && q.front().first <= acked_id) {
+        last_id = q.front().first; have = true;
+        rtt_ns = recv_time - q.front().second;
+        q.pop_front();
+      }
+      // Karn's algorithm: if the acked item was retransmitted, the ACK is ambiguous
+      // (could be for any transmission) and a pre-outage send acked post-outage would
+      // otherwise be timed as ~the outage duration. Don't record RTT for it. The
+      // cross-carrier clear below guarantees unacked_sends[last_id] still exists here.
+      if (have) {
+        auto uit = unacked_sends.find(last_id);
+        if (uit != unacked_sends.end() && uit->second.retransmitted) rtt_ns = 0;
+      }
+    }
+    // ACKs are cumulative: every id <= acked_id is delivered, so clear its pending entry
+    // on ALL OTHER carriers too (without timing it). Otherwise an entry on a slow or
+    // recovered carrier lingers until that carrier itself gets an ACK and is then timed as
+    // a huge RTT (~outage duration), inflating the retransmit timeout and stalling recovery.
+    for (auto& [cfd, q2] : carrier_pending_acks) {
+      if (cfd == fd) continue;
+      while (!q2.empty() && q2.front().first <= acked_id) q2.pop_front();
     }
     if (rtt_ns != 0) {
+      if (dbg && rtt_ns > 5000000000ULL)
+        fprintf(dbg, "[ack-rtt-high t=%llu fd=%d acked_id=%llu rtt_ms=%llu]\n",
+                (unsigned long long)(now_ns()/1000000ULL), fd, (unsigned long long)acked_id,
+                (unsigned long long)(rtt_ns/1000000ULL));
       auto it_c = carriers.find(fd);
       if (it_c != carriers.end()) it_c->second.last_rtt_ns = rtt_ns;
       // Always record RTT samples regardless of auto_adapt. RTT drives all timeout
@@ -747,7 +748,7 @@ int run_client(const Args& args) {
     // (a few packets) should not allow large close cascades.
     size_t backlog_bytes = 0;
     for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
-    const bool heavy_backlog = (backlog_bytes > 256 * 1024ULL) || (unacked_sends.size() > 128);
+    const bool heavy_backlog = carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_sends.size());
     if (!heavy_backlog) {
       size_t reap_cap = std::max<size_t>(3, target_carriers / 3);
       if (pending_reap.size() >= reap_cap) return;
@@ -842,18 +843,12 @@ int run_client(const Args& args) {
         while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
           const size_t block_size = effective_max_packet;
           float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
-          // n = carriers: one shard per carrier so any k of them suffice to decode.
-          // k = floor(n / (1 + rs_frac)): max data shards within the carrier budget.
-          unsigned n_carriers = static_cast<unsigned>(std::min(carriers.size(), static_cast<size_t>(255)));
-          unsigned k = std::max(1u, static_cast<unsigned>(
-              static_cast<float>(n_carriers) / (1.0f + rs_frac)));
-          k = static_cast<unsigned>(std::min(static_cast<size_t>(k),
-                                             stdin_buf.size() / block_size));
+          // One shard per carrier so any k of them suffice to decode (see rs_group_params).
+          auto gp = packet_io::rs_group_params(carriers.size(), rs_frac, stdin_buf.size() / block_size);
+          unsigned k = gp.k;
           if (k == 0) break;
-          unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
-          // Cap n to n_carriers so every shard goes on a different carrier.
-          unsigned n = std::min(k + m, n_carriers);
-          m = n - k;
+          unsigned m = gp.m;
+          unsigned n = gp.n;
           if (m == 0) {
             // Single carrier: can't do RS (need m>=1). Send block as SMALL.
             size_t chunk = block_size;
@@ -968,6 +963,16 @@ int run_client(const Args& args) {
           if (err == 0) {
             it->second.connecting = false;
             it->second.connect_ns = now_ns();
+            // Catch-up cumulative ACK: a freshly connected carrier is our first chance
+            // to tell the server how much s2c data we've already delivered to stdout, in
+            // case ACKs were lost while carriers were down. Without this the server can
+            // keep retransmitting already-delivered data indefinitely on a quiet stream.
+            if (next_deliver_id > 0) {
+              packet_io::append_ack(it->second.write_buf, next_deliver_id - 1);
+              ev.events = EPOLLIN | EPOLLOUT;
+              ev.data.fd = fd;
+              epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+            }
             if (!pending_reap.empty()) {
               int to_close = pending_reap.front();
               pending_reap.erase(pending_reap.begin());
@@ -990,26 +995,12 @@ int run_client(const Args& args) {
                   // the same logical carrier when fds are reused.
                   ui.small_sent_on.insert(it->second.carrier_id);
                 } else {
-                  // Re-encode RS with the same parameters (n, k, block_size) so the
-                  // receiver can combine these shards with any partials it retained.
-                  std::vector<const uint8_t*> dptrs(ui.k);
-                  for (unsigned si = 0; si < ui.k; ++si)
-                    dptrs[si] = ui.data.data() + si * ui.block_size;
-                  unsigned m = ui.n - ui.k;
-                  std::vector<std::vector<uint8_t>> par;
-                  std::vector<uint8_t*> pptrs;
-                  if (m > 0) {
-                    par.resize(m, std::vector<uint8_t>(ui.block_size));
-                    pptrs.resize(m);
-                    for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
-                    reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
-                  }
+                  // Re-encode RS with the same (n, k, block_size) so the receiver can
+                  // combine these shards with any partials it retained.
+                  auto shards = packet_io::rs_reencode_shards(ui);
                   for (unsigned si = 0; si < ui.n; ++si) {
-                    const uint8_t* shard = (si < ui.k)
-                        ? (ui.data.data() + si * ui.block_size)
-                        : par[si - ui.k].data();  // m>0 ensures par has parity when si>=k
                     packet_io::append_rs_shard(it->second.write_buf, uid,
-                                               ui.n, ui.k, ui.block_size, si, shard);
+                                               ui.n, ui.k, ui.block_size, si, shards[si].data());
                     // Track by logical carrier_id, not raw fd, so the retransmit
                     // logic can correctly avoid resending the same shard on the
                     // same logical carrier when fds are reused.
@@ -1019,6 +1010,7 @@ int run_client(const Args& args) {
                 // Reset timer so the periodic 3 s retransmit doesn't immediately
                 // fire a redundant duplicate of what we just queued.
                 ui.send_ns = retransmit_now;
+                ui.retransmitted = true;  // Karn: don't time this id's ACK as RTT
               }
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;
@@ -1067,8 +1059,8 @@ int run_client(const Args& args) {
             ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
           }
-          if (!carriers.empty())
-            next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
+          // next_rr is advanced once at the end of the loop body (below) for both
+          // branches; don't advance here too or the round-robin skips carriers.
         } else {
           auto it = carriers.begin();
           std::advance(it, next_rr % carriers.size());
@@ -1274,9 +1266,8 @@ int run_client(const Args& args) {
           bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
               != quality.dead_idle_fds.end();
           if (is_dead) continue;
-          if (cs.write_buf.empty()
-              && now_p - cs.last_send_ns > ping_idle_ns
-              && now_p - cs.last_recv_ns > ping_idle_ns) {
+          if (carrier_adapt::should_send_idle_ping(cs.write_buf.empty(), now_p,
+                                                   cs.last_send_ns, cs.last_recv_ns, ping_idle_ns)) {
             packet_io::append_ping(cs.write_buf, next_send_id);
             outstanding_pings[{cfd, next_send_id}] = now_p;
             ev.events = EPOLLIN | EPOLLOUT;
@@ -1312,22 +1303,22 @@ int run_client(const Args& args) {
           }
         }
 
-        // Debug: log any outstanding PINGs that have not received a PONG for >5 s.
+        // Detect carriers whose PING has gone unanswered for too long: very likely
+        // dead-but-open (writes still succeed, so assess_carriers' dead-idle test can
+        // be defeated by an advancing last_send_ns). This detection must run in all
+        // modes — only the verbose per-ping logging is gated on dbg.
         std::set<int> stale_ping_fds;
         uint64_t ping_fail_ns = scaled_ns(6, 15000000000ULL, 120000000000ULL);
-        if (dbg && !outstanding_pings.empty()) {
-          for (const auto& [key, sent_ns] : outstanding_pings) {
-            uint64_t age_ns = now_p - sent_ns;
-            if (age_ns > 5000000000ULL) {
-              int fd = key.first;
-              fprintf(dbg, "[ping-unacked t=%llu fd=%d age_ms=%llu]\n",
-                      (unsigned long long)(now_p/1000000ULL),
-                      fd,
-                      (unsigned long long)(age_ns/1000000ULL));
-            }
-            if (age_ns > ping_fail_ns)
-              stale_ping_fds.insert(key.first);
+        for (const auto& [key, sent_ns] : outstanding_pings) {
+          uint64_t age_ns = now_p - sent_ns;
+          if (dbg && age_ns > 5000000000ULL) {
+            fprintf(dbg, "[ping-unacked t=%llu fd=%d age_ms=%llu]\n",
+                    (unsigned long long)(now_p/1000000ULL),
+                    key.first,
+                    (unsigned long long)(age_ns/1000000ULL));
           }
+          if (age_ns > ping_fail_ns)
+            stale_ping_fds.insert(key.first);
         }
         // Any carrier with an outstanding PING beyond ping_fail_ns is very likely dead.
         // Reap these promptly so retransmit can concentrate on healthy carriers.
@@ -1348,7 +1339,7 @@ int run_client(const Args& args) {
         size_t dead_reap_added = 0;
         size_t backlog_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
-        const bool heavy_backlog = (backlog_bytes > 256 * 1024ULL) || (unacked_sends.size() > 128);
+        const bool heavy_backlog = carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_sends.size());
         // In SSH mode, false-positive dead-idle classification can trigger
         // self-inflicted carrier churn. Only run dead-idle reap logic when
         // backlog pressure is genuinely high.
@@ -1675,18 +1666,7 @@ int run_client(const Args& args) {
                 rt_idx += copies;
               }
             } else {
-              std::vector<const uint8_t*> dptrs(ui.k);
-              for (unsigned si = 0; si < ui.k; ++si)
-                dptrs[si] = ui.data.data() + si * ui.block_size;
-              unsigned m2 = ui.n - ui.k;
-              std::vector<std::vector<uint8_t>> par2;
-              std::vector<uint8_t*> pptrs2;
-              if (m2 > 0) {
-                par2.resize(m2, std::vector<uint8_t>(ui.block_size));
-                pptrs2.resize(m2);
-                for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
-                reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
-              }
+              auto shards = packet_io::rs_reencode_shards(ui);
               std::set<int> touched;
               for (unsigned si = 0; si < ui.n; ++si) {
                 // For each shard index, avoid retransmitting on carriers that have
@@ -1710,11 +1690,8 @@ int run_client(const Args& args) {
                 int cfd = shard_candidates[(rt_idx + si) % shard_candidates.size()];
                 auto itc = carriers.find(cfd);
                 if (itc == carriers.end()) continue;
-                const uint8_t* shard = (si < ui.k)
-                    ? (ui.data.data() + si * ui.block_size)
-                    : par2[si - ui.k].data();  // m2>0 when si>=k
                 packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
-                                           ui.n, ui.k, ui.block_size, si, shard);
+                                           ui.n, ui.k, ui.block_size, si, shards[si].data());
                 sent_set.insert(itc->second.carrier_id);
                 touched.insert(cfd);
               }
@@ -1730,6 +1707,7 @@ int run_client(const Args& args) {
             }
             // Reset send_ns so we don't retransmit this group again for another 3 s.
             ui.send_ns = now_p;
+            ui.retransmitted = true;  // Karn: don't time this id's ACK as RTT
           }
         }
       }

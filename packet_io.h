@@ -2,6 +2,7 @@
 #define SSH_OLL_PACKET_IO_H
 
 #include "ssholl.h"
+#include "net_util.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -110,6 +111,24 @@ bool process_carrier_read(
 void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, size_t len);
 void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigned k,
                     uint16_t block_size, unsigned shard_index, const uint8_t* shard_data);
+
+// Re-encode the shards of an unacked Reed-Solomon group from its stored data, using the
+// original (n, k, block_size). Returns ui.n shard buffers: [0, k) are the data shards,
+// [k, n) the recomputed parity. The retransmit/reconnect paths use this so the RS
+// re-encode logic exists in one place (preserving the original n/k/block_size is required
+// — the receiver drops shards whose parameters don't match the pending group).
+// Precondition: !ui.is_small and ui.k >= 1 and ui.n > ui.k.
+std::vector<std::vector<uint8_t>> rs_reencode_shards(const UnackedItem& ui);
+
+// Reed-Solomon group sizing for the primary send path, identical on both sides.
+//   k: data shards = min(floor(n_carriers / (1 + rs_frac)), available_blocks); >=1 unless
+//      available_blocks == 0 (then k == 0 and the caller should stop — nothing to send yet).
+//   n: total shards = min(k + max(1, round(k*rs_frac)), n_carriers), capped so each shard
+//      lands on a distinct carrier. m = n - k parity shards.
+//   m == 0 means RS isn't possible (single carrier): the caller sends the block as SMALL.
+struct RsGroupParams { unsigned n = 0; unsigned k = 0; unsigned m = 0; };
+RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks);
+
 void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
                   float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt,
                   uint32_t reconnect_timeout_sec = 0);

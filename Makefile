@@ -23,9 +23,17 @@ endif
 
 REED_SOLOMON_OBJ = reed_solomon.o
 
-.PHONY: all clean install
+.PHONY: all clean install check
 
-all: test_reed_solomon ssh-oll
+all: test_reed_solomon test_packet_io test_carrier_adapt ssh-oll
+
+# Run all deterministic unit tests (fast, no sockets). Use as the guard between
+# refactoring steps before reaching for the slower integration suite (test_all.sh).
+check: test_reed_solomon test_packet_io test_carrier_adapt
+	./test_reed_solomon
+	./test_packet_io
+	./test_carrier_adapt
+	@echo "All unit tests passed."
 
 reed_solomon.o: reed_solomon.cc reed_solomon.h
 	$(CXX) $(CXXFLAGS) -c -o $@ reed_solomon.cc
@@ -33,23 +41,29 @@ reed_solomon.o: reed_solomon.cc reed_solomon.h
 test_reed_solomon: test_reed_solomon.cc $(REED_SOLOMON_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ test_reed_solomon.cc $(REED_SOLOMON_OBJ) $(LDFLAGS_STATIC)
 
+test_packet_io: test_packet_io.cc packet_io.o $(REED_SOLOMON_OBJ) packet_io.h ssholl.h
+	$(CXX) $(CXXFLAGS) -o $@ test_packet_io.cc packet_io.o $(REED_SOLOMON_OBJ) $(EPOLL_LDFLAGS) $(LDFLAGS_STATIC)
+
+test_carrier_adapt: test_carrier_adapt.cc carrier_adapt.o carrier_adapt.h
+	$(CXX) $(CXXFLAGS) -o $@ test_carrier_adapt.cc carrier_adapt.o $(LDFLAGS_STATIC)
+
 ssh-oll: main.o server.o client.o packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ) ssholl.h
 	$(CXX) $(CXXFLAGS) -o $@ main.o server.o client.o packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ) $(EPOLL_LDFLAGS) $(LDFLAGS_STATIC)
 
 main.o: main.cc ssholl.h
 	$(CXX) $(CXXFLAGS) -c -o $@ main.cc
 
-server.o: server.cc ssholl.h packet_io.h
+server.o: server.cc ssholl.h packet_io.h carrier_adapt.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ server.cc
 
-client.o: client.cc ssholl.h packet_io.h
+client.o: client.cc ssholl.h packet_io.h carrier_adapt.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ client.cc
 
-packet_io.o: packet_io.cc packet_io.h ssholl.h reed_solomon.h
+packet_io.o: packet_io.cc packet_io.h ssholl.h reed_solomon.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ packet_io.cc
 
 clean:
-	rm -f $(REED_SOLOMON_OBJ) test_reed_solomon ssh-oll main.o server.o client.o packet_io.o carrier_adapt.o
+	rm -f $(REED_SOLOMON_OBJ) test_reed_solomon test_packet_io test_carrier_adapt ssh-oll main.o server.o client.o packet_io.o carrier_adapt.o
 
 install: all
 	install -d $(DESTDIR)/usr/local/bin
