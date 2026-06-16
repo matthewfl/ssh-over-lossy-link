@@ -464,6 +464,28 @@ run_test "wifi-periodic-blackouts-highlat-loss2pct" \
     --test-min-packets            8
 
 # ============================================================================
+# 9g. Long total outage (70 s) — the logical stream must survive and recover.
+#     A long drop (longer than the 60 s adaptive idle floor) requires
+#     --reconnect-timeout so neither end gives up before the link returns; this
+#     mirrors a real config (e.g. --reconnect-timeout 900 for multi-minute drops).
+#     Exercises: dead-but-open carrier reaping with no healthy peer (send-only
+#     zombies), bounded retransmit, and re-establishing fresh carriers after the
+#     outage. Without the flag both ends would exit at the 60 s idle floor.
+# ============================================================================
+run_test "long-blackout-recover-reconnect-timeout" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 130 \
+    --latency-ms 50 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 20 \
+    --scenario-blackout-duration 70 \
+    --warmup-seconds 100 \
+    --test-max-latency        130000 \
+    --test-max-average-latency-after-warmup 4000 \
+    --test-min-packets           15 \
+    --extra-client-args --reconnect-timeout 900
+
+# ============================================================================
 # 10. Auto-adapt disabled (--no-auto) — fixed RS and carrier count.
 #    Verifies the non-adaptive path delivers data on a clean 10 ms link.
 #    Thresholds are relaxed compared to adaptive mode (no RS tuning).

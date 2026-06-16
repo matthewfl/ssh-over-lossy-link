@@ -1308,6 +1308,32 @@ int run_client(const Args& args) {
         }
         auto quality = carrier_adapt::assess_carriers(carrier_infos, now_p, scaled_ns);
 
+        // Periodic per-carrier diagnostics (every ~2 s) to debug stuck recovery: shows why
+        // carriers are/aren't flagged dead and why the floor/reap cycle does or doesn't run.
+        if (dbg) {
+          static uint64_t last_carrier_diag_ns = 0;
+          if (now_p - last_carrier_diag_ns >= 2000000000ULL) {
+            last_carrier_diag_ns = now_p;
+            size_t connecting_n = 0;
+            for (auto& [cfd, cs] : carriers) if (cs.connecting) connecting_n++;
+            fprintf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u pending_reap=%zu "
+                         "dead_idle=%zu reap=%zu rtt_outlier=%d]\n",
+                    (unsigned long long)(now_p/1000000ULL), carriers.size(), connecting_n,
+                    target_carriers, pending_reap.size(),
+                    quality.dead_idle_fds.size(), quality.reap_fds.size(), quality.rtt_outlier_fd);
+            for (auto& [cfd, cs] : carriers) {
+              bool in_reap = std::find(pending_reap.begin(), pending_reap.end(), cfd) != pending_reap.end();
+              bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
+                  != quality.dead_idle_fds.end();
+              long long recv_ago = cs.last_recv_ns ? (long long)((now_p - cs.last_recv_ns)/1000000ULL) : -1;
+              long long send_ago = cs.last_send_ns ? (long long)((now_p - cs.last_send_ns)/1000000ULL) : -1;
+              fprintf(dbg, "  fd=%d age_ms=%llu recv_ago_ms=%lld send_ago_ms=%lld wbuf=%zu connecting=%d dead=%d pending=%d\n",
+                      cfd, (unsigned long long)((now_p - cs.connect_ns)/1000000ULL),
+                      recv_ago, send_ago, cs.write_buf.size(), (int)cs.connecting, (int)is_dead, (int)in_reap);
+            }
+          }
+        }
+
         for (auto& [cfd, cs] : carriers) {
           if (cs.connecting) continue;
           bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
@@ -1442,6 +1468,10 @@ int run_client(const Args& args) {
         for (auto& [cfd, cs] : carriers)
           if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
+        // Adaptive default is 12×RTT, clamped [60 s, 300 s]. To survive a longer outage
+        // (e.g. a multi-minute VPN/wifi drop) so the logical SSH stream can recover, set
+        // --reconnect-timeout (both ends must outlast the outage or they give up before
+        // the link returns).
         uint64_t global_idle_ns = (args.config.reconnect_timeout_sec > 0)
             ? (uint64_t)args.config.reconnect_timeout_sec * 1000000000ULL
             : scaled_ns(12, 60000000000ULL, 300000000000ULL);

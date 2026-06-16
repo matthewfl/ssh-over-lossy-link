@@ -953,7 +953,10 @@ int run_server(const Args& args) {
       for (auto& [cfd, cs] : carriers)
         if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
 
-      // Global idle timeout: if nothing from any carrier for 12×RTT the client is gone.
+      // Global idle timeout: if nothing from any carrier for this long, the client is gone.
+      // Adaptive default 12×RTT clamped [60 s, 300 s]; set --reconnect-timeout (client
+      // propagates it here via SET_CONFIG) to stay alive across a longer outage so the
+      // client can still reconnect when the link returns.
       uint64_t global_idle_ns = (runtime_reconnect_timeout_sec > 0)
           ? (uint64_t)runtime_reconnect_timeout_sec * 1000000000ULL
           : scaled_ns(12, 60000000000ULL, 300000000000ULL);
