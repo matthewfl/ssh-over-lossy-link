@@ -2,6 +2,7 @@
 #include "packet_io.h"
 #include "reed_solomon.h"
 #include "carrier_adapt.h"
+#include "net_util.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -192,9 +193,6 @@ int run_server(const Args& args) {
 
 
   // Server-side link monitoring: record when we send each id; when client sends ACK, measure RTT.
-  auto now_ns = []() {
-    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-  };
   std::map<uint64_t, uint64_t> ack_send_time_ns;  // id -> when we sent it (for server→client RTT)
   std::deque<uint64_t> server_recent_rtt_ns;
   const size_t max_server_recent_rtt = 50;
@@ -217,21 +215,9 @@ int run_server(const Args& args) {
   std::map<uint64_t, uint64_t> recently_decoded_ns;
   std::map<uint64_t, std::vector<uint64_t>> small_copy_arrival_times;
 
-  // Unacked retransmit buffer: holds original bytes for each outstanding send_id
-  // so we can re-encode and resend on a new carrier when all existing ones die.
-  struct UnackedItem {
-    std::vector<uint8_t> data;
-    unsigned n = 0;
-    unsigned k = 0;
-    uint16_t block_size = 0;
-    bool is_small = false;
-    uint64_t send_ns = 0;
-    // Track which carriers have already carried this logical send so retransmits
-    // avoid resending the same packet/shard on the same carrier. For SMALL packets
-    // we record logical carrier_ids; for RS we track per-shard which carrier_ids have seen it.
-    std::set<uint64_t> small_sent_on;
-    std::map<unsigned, std::set<uint64_t>> rs_shard_sent_on;  // shard_index -> carrier_ids
-  };
+  // Unacked retransmit buffer (shared UnackedItem from net_util.h): holds original bytes
+  // for each outstanding send_id so we can re-encode and resend on a new carrier when all
+  // existing ones die.
   std::map<uint64_t, UnackedItem> unacked_data;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
   std::set<int> pending_peer_suggest_close;
@@ -251,19 +237,12 @@ int run_server(const Args& args) {
 
   // RTT-scaled timeouts: server observes server→client RTT from ACKs. Use 5 s default when unknown.
   auto get_effective_rtt_ns = [&]() -> uint64_t {
-    if (server_recent_rtt_ns.size() >= 3) {
-      std::vector<uint64_t> sorted(server_recent_rtt_ns.begin(), server_recent_rtt_ns.end());
-      std::sort(sorted.begin(), sorted.end());
-      return sorted[static_cast<size_t>(sorted.size() * 0.9)];
-    }
+    if (server_recent_rtt_ns.size() >= 3)
+      return p90_ns(server_recent_rtt_ns);
     return 5000000000ULL;  // 5 s conservative when unknown
   };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
-    uint64_t rtt = get_effective_rtt_ns();
-    uint64_t v = static_cast<uint64_t>(mult) * rtt;
-    if (v < min_ns) return min_ns;
-    if (v > max_ns) return max_ns;
-    return v;
+    return ssholl::scaled_ns(mult, min_ns, max_ns, get_effective_rtt_ns());
   };
 
   auto connect_backend = [&]() {

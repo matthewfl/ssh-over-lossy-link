@@ -2,6 +2,7 @@
 #include "packet_io.h"
 #include "reed_solomon.h"
 #include "carrier_adapt.h"
+#include "net_util.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -304,9 +305,6 @@ int run_client(const Args& args) {
   unsigned next_rr = 0;
   size_t effective_max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
   if (effective_max_packet == 0) effective_max_packet = 800;
-  auto now_ns = []() {
-    return static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
-  };
   std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
   uint64_t next_carrier_id_global = 1;
 
@@ -357,12 +355,8 @@ int run_client(const Args& args) {
     bool have_observed = (recent_rtt_ns.size() >= 3) || (server_reported_max_rtt_ns > 0);
     if (have_observed) {
       uint64_t observed = server_reported_max_rtt_ns;
-      if (recent_rtt_ns.size() >= 3) {
-        std::vector<uint64_t> sorted(recent_rtt_ns.begin(), recent_rtt_ns.end());
-        std::sort(sorted.begin(), sorted.end());
-        uint64_t p90 = sorted[static_cast<size_t>(sorted.size() * 0.9)];
-        observed = std::max(observed, p90);
-      }
+      if (recent_rtt_ns.size() >= 3)
+        observed = std::max(observed, p90_ns(recent_rtt_ns));
       if (observed == 0) {
         // Should not normally happen, but fall back to hint/default if it does.
         return hint_ns ? hint_ns : 5000000000ULL;
@@ -376,29 +370,12 @@ int run_client(const Args& args) {
     return hint_ns ? hint_ns : 5000000000ULL;
   };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
-    uint64_t rtt = get_effective_rtt_ns();
-    uint64_t v = static_cast<uint64_t>(mult) * rtt;
-    if (v < min_ns) return min_ns;
-    if (v > max_ns) return max_ns;
-    return v;
+    return ssholl::scaled_ns(mult, min_ns, max_ns, get_effective_rtt_ns());
   };
 
-  // Unacked-send retransmit buffer.  Holds the original pre-encoded data for
-  // each outstanding send_id so that it can be re-encoded and re-sent on a
-  // new carrier when all existing carriers die.
-  struct UnackedItem {
-    std::vector<uint8_t> data;   // for RS: k*block_size bytes; for SMALL: raw bytes
-    unsigned n = 0;
-    unsigned k = 0;
-    uint16_t block_size = 0;
-    bool is_small = false;
-    uint64_t send_ns = 0;        // when originally sent (for timeout-based retransmit)
-    // Track which carriers have already carried this logical send so retransmits
-    // can avoid reusing the same carrier. For SMALL packets we record the set of
-    // logical carrier_ids that have ever seen this id; for RS we track it per-shard.
-    std::set<uint64_t> small_sent_on;
-    std::map<unsigned, std::set<uint64_t>> rs_shard_sent_on;  // shard_index -> carrier_ids
-  };
+  // Unacked-send retransmit buffer (shared UnackedItem from net_util.h): holds the
+  // original pre-encoded data for each outstanding send_id so it can be re-encoded and
+  // resent on a new carrier when all existing carriers die.
   std::map<uint64_t, UnackedItem> unacked_sends;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
 

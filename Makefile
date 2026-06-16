@@ -53,10 +53,10 @@ ssh-oll: main.o server.o client.o packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ
 main.o: main.cc ssholl.h
 	$(CXX) $(CXXFLAGS) -c -o $@ main.cc
 
-server.o: server.cc ssholl.h packet_io.h
+server.o: server.cc ssholl.h packet_io.h carrier_adapt.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ server.cc
 
-client.o: client.cc ssholl.h packet_io.h
+client.o: client.cc ssholl.h packet_io.h carrier_adapt.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ client.cc
 
 packet_io.o: packet_io.cc packet_io.h ssholl.h reed_solomon.h
