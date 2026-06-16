@@ -977,26 +977,12 @@ int run_client(const Args& args) {
                   // the same logical carrier when fds are reused.
                   ui.small_sent_on.insert(it->second.carrier_id);
                 } else {
-                  // Re-encode RS with the same parameters (n, k, block_size) so the
-                  // receiver can combine these shards with any partials it retained.
-                  std::vector<const uint8_t*> dptrs(ui.k);
-                  for (unsigned si = 0; si < ui.k; ++si)
-                    dptrs[si] = ui.data.data() + si * ui.block_size;
-                  unsigned m = ui.n - ui.k;
-                  std::vector<std::vector<uint8_t>> par;
-                  std::vector<uint8_t*> pptrs;
-                  if (m > 0) {
-                    par.resize(m, std::vector<uint8_t>(ui.block_size));
-                    pptrs.resize(m);
-                    for (unsigned si = 0; si < m; ++si) pptrs[si] = par[si].data();
-                    reed_solomon::encode(ui.k, m, dptrs.data(), pptrs.data(), ui.block_size);
-                  }
+                  // Re-encode RS with the same (n, k, block_size) so the receiver can
+                  // combine these shards with any partials it retained.
+                  auto shards = packet_io::rs_reencode_shards(ui);
                   for (unsigned si = 0; si < ui.n; ++si) {
-                    const uint8_t* shard = (si < ui.k)
-                        ? (ui.data.data() + si * ui.block_size)
-                        : par[si - ui.k].data();  // m>0 ensures par has parity when si>=k
                     packet_io::append_rs_shard(it->second.write_buf, uid,
-                                               ui.n, ui.k, ui.block_size, si, shard);
+                                               ui.n, ui.k, ui.block_size, si, shards[si].data());
                     // Track by logical carrier_id, not raw fd, so the retransmit
                     // logic can correctly avoid resending the same shard on the
                     // same logical carrier when fds are reused.
@@ -1662,18 +1648,7 @@ int run_client(const Args& args) {
                 rt_idx += copies;
               }
             } else {
-              std::vector<const uint8_t*> dptrs(ui.k);
-              for (unsigned si = 0; si < ui.k; ++si)
-                dptrs[si] = ui.data.data() + si * ui.block_size;
-              unsigned m2 = ui.n - ui.k;
-              std::vector<std::vector<uint8_t>> par2;
-              std::vector<uint8_t*> pptrs2;
-              if (m2 > 0) {
-                par2.resize(m2, std::vector<uint8_t>(ui.block_size));
-                pptrs2.resize(m2);
-                for (unsigned si = 0; si < m2; ++si) pptrs2[si] = par2[si].data();
-                reed_solomon::encode(ui.k, m2, dptrs.data(), pptrs2.data(), ui.block_size);
-              }
+              auto shards = packet_io::rs_reencode_shards(ui);
               std::set<int> touched;
               for (unsigned si = 0; si < ui.n; ++si) {
                 // For each shard index, avoid retransmitting on carriers that have
@@ -1697,11 +1672,8 @@ int run_client(const Args& args) {
                 int cfd = shard_candidates[(rt_idx + si) % shard_candidates.size()];
                 auto itc = carriers.find(cfd);
                 if (itc == carriers.end()) continue;
-                const uint8_t* shard = (si < ui.k)
-                    ? (ui.data.data() + si * ui.block_size)
-                    : par2[si - ui.k].data();  // m2>0 when si>=k
                 packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
-                                           ui.n, ui.k, ui.block_size, si, shard);
+                                           ui.n, ui.k, ui.block_size, si, shards[si].data());
                 sent_set.insert(itc->second.carrier_id);
                 touched.insert(cfd);
               }

@@ -205,6 +205,35 @@ void test_rs_retransmit_combines() {
   check(h.delivered_ids.size() == 1 && h.delivered_ids[0] == 0, "rs-retransmit: delivered exactly once");
 }
 
+// ── Test 7: rs_reencode_shards produces shards that decode back to the original ─
+// Directly exercises the shared retransmit helper (the four retransmit sites delegate
+// to it): build an UnackedItem, re-encode, feed any k of its shards through the parser,
+// and confirm the original bytes come back.
+void test_rs_reencode_shards() {
+  const unsigned k = 3, m = 2, n = k + m;
+  const size_t block_size = 8;
+  UnackedItem ui;
+  ui.is_small = false;
+  ui.n = n; ui.k = k; ui.block_size = block_size;
+  ui.data.resize(k * block_size);
+  for (size_t i = 0; i < ui.data.size(); ++i) ui.data[i] = static_cast<uint8_t>(0x80 + i);
+
+  auto shards = rs_reencode_shards(ui);
+  check(shards.size() == n, "reencode: returns n shard buffers");
+  for (auto& s : shards) check(s.size() == block_size, "reencode: each shard is block_size");
+
+  // Feed k shards chosen to force real decode (1 data + 2 parity: indices 0, 3, 4).
+  Harness h;
+  for (unsigned idx : {0u, 3u, 4u}) {
+    std::vector<uint8_t> pkt;
+    append_rs_shard(pkt, /*id=*/0, n, k, static_cast<uint16_t>(block_size), idx, shards[idx].data());
+    h.feed(pkt);
+  }
+  check(h.delivered.size() == ui.data.size(), "reencode: k shards decode to full block");
+  check(std::memcmp(h.delivered.data(), ui.data.data(), ui.data.size()) == 0,
+        "reencode: decoded bytes match the UnackedItem data");
+}
+
 }  // namespace
 
 int main() {
@@ -214,6 +243,7 @@ int main() {
   test_rs_decode_and_extra();
   test_mixed_order();
   test_rs_retransmit_combines();
+  test_rs_reencode_shards();
   if (g_failures) {
     std::fprintf(stderr, "packet_io tests: %d failure(s)\n", g_failures);
     return 1;

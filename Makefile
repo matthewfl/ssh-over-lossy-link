@@ -59,7 +59,7 @@ server.o: server.cc ssholl.h packet_io.h carrier_adapt.h net_util.h
 client.o: client.cc ssholl.h packet_io.h carrier_adapt.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ client.cc
 
-packet_io.o: packet_io.cc packet_io.h ssholl.h reed_solomon.h
+packet_io.o: packet_io.cc packet_io.h ssholl.h reed_solomon.h net_util.h
 	$(CXX) $(CXXFLAGS) -c -o $@ packet_io.cc
 
 clean:

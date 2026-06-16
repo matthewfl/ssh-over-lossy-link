@@ -282,6 +282,23 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
   out.insert(out.end(), data, data + len);
 }
 
+std::vector<std::vector<uint8_t>> rs_reencode_shards(const UnackedItem& ui) {
+  const unsigned k = ui.k, n = ui.n, m = n - k;
+  const size_t bs = ui.block_size;
+  std::vector<std::vector<uint8_t>> shards(n);
+  // Data shards are copies of the stored block; parity is recomputed from them.
+  for (unsigned i = 0; i < k; ++i)
+    shards[i].assign(ui.data.begin() + i * bs, ui.data.begin() + (i + 1) * bs);
+  if (m > 0) {
+    std::vector<const uint8_t*> dptrs(k);
+    for (unsigned i = 0; i < k; ++i) dptrs[i] = ui.data.data() + i * bs;
+    std::vector<uint8_t*> pptrs(m);
+    for (unsigned i = 0; i < m; ++i) { shards[k + i].resize(bs); pptrs[i] = shards[k + i].data(); }
+    reed_solomon::encode(k, m, dptrs.data(), pptrs.data(), bs);
+  }
+  return shards;
+}
+
 void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigned k,
                      uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
   PacketHeader h{};
