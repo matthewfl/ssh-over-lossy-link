@@ -27,12 +27,12 @@ Tracking for the disconnect/reconnect robustness pass. Detailed analysis lives i
       passes 3/3 after the fixes. Root cause was B1 (the disabled dead-carrier reaper);
       see BUGS.md "Headline result".
 
-## Optional / follow-ups (not done — lower priority)
-- [ ] RTT-sample skew after a long blackout: post-reconnect ACKs (and the new catch-up
-      ACK) can match a pre-blackout `ack_send_time_ns`/`carrier_pending_acks` entry and
-      record an RTT ≈ blackout duration. Bounded by the 60 s sanity guard + p90 over 50
-      samples, so impact is small, but consider stamping retransmits / ignoring RTT for
-      ids older than a threshold. Pre-existing; not introduced here.
+## Optional / follow-ups
+- [x] **RTT-sample skew after a long blackout** — FIXED (B7 server, B8 client; see
+      BUGS.md "Round 2"). Turned out impactful, not minor: it inflated every RTT-scaled
+      timeout and was the main driver of `wifi-double-blackout-heavy` flakiness. Server:
+      re-stamp `ack_send_time_ns` on retransmit. Client: cross-carrier cumulative-ACK
+      clear + Karn's algorithm (skip RTT for retransmitted ids).
 - [ ] `reassembly`/`rs_pending` can grow unbounded on the receiver during a sustained
       one-directional gap (sender keeps producing higher ids while a low id is missing).
       In practice the gap is refilled quickly by retransmit; consider a hard cap that

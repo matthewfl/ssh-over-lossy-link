@@ -9,6 +9,41 @@ run against current build to confirm → fix → re-run to verify green.
 
 ---
 
+## Round 2 — RTT inflation after an outage (CONFIRMED + FIXED)
+
+Found while investigating why `wifi-double-blackout-heavy` stayed flaky (~50%). Every
+timeout in the system is RTT-scaled; if the measured RTT spikes, recovery slows.
+
+### B7 — Server times outage-spanning ACKs as RTT (FIXED)
+`server.cc`: RTT = `now - ack_send_time_ns[id]`, but `ack_send_time_ns[id]` was stamped
+only at original send, never on retransmit. After a 30 s blackout the eventual ACK
+recorded RTT ≈ 30 s; under the 60 s cap it entered `server_recent_rtt_ns`, and the p90
+spike stretched retransmit (4×), rs-stale (4×), ping-fail (8×) and idle (12×) timeouts
+for up to 50 samples — stalling recovery exactly when fast retransmit matters.
+- **Demonstrated:** added an `[ack-rtt-high]` debug log; a 30 s blackout produced **219**
+  samples of ~30 s RTT before the fix, **0** after.
+- **Fix:** re-stamp `ack_send_time_ns[id] = now` on every retransmit (reconnect + periodic)
+  so RTT is measured from the latest transmission; plus a `last_recovery_ns` guard for
+  the true total-loss (carriers-removed) case.
+
+### B8 — Client times outage-spanning ACKs as RTT (FIXED)
+`client.cc`: c2s RTT comes from per-carrier pending-ack records, but ACKs are cumulative
+and land on whichever carrier completed delivery. (a) A pending entry on a carrier that
+didn't receive the draining ACK lingered until that carrier got one, then was timed late;
+(b) the arrival carrier's own entry for a retransmitted id measured the original send.
+- **Demonstrated:** same `[ack-rtt-high]` log on the client — **hundreds** of 9–20 s
+  samples after a blackout, **0** after the fix.
+- **Fix:** (a) on any cumulative ACK, clear `id <= acked_id` pending entries from *all*
+  carriers (time RTT only on the arrival carrier); (b) Karn's algorithm — mark
+  `UnackedItem.retransmitted` and skip RTT for retransmitted ids.
+
+### Impact
+`wifi-double-blackout-heavy`: was ~50% pass (and 0/2 on the pre-bug-fix baseline);
+after B7 alone it was 4/5 with tiny (~21 KB) residual misses traced to B8; after B7+B8
+the post-outage RTT pollution is gone in both directions. (Re-measuring pass rate.)
+
+---
+
 ## CONFIRMED bugs
 
 ### B1 — Client PING-timeout dead-carrier reaper is gated behind `--debug` (CONFIRMED)
