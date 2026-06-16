@@ -234,6 +234,37 @@ void test_rs_reencode_shards() {
         "reencode: decoded bytes match the UnackedItem data");
 }
 
+// ── rs_group_params sizing math ──────────────────────────────────────────────
+void test_rs_group_params() {
+  // 10 carriers, 0.1 redundancy, plenty buffered: k=floor(10/1.1)=9, m=max(1,round(0.9))=1, n=10.
+  {
+    auto p = rs_group_params(10, 0.1f, 100);
+    check(p.k == 9 && p.m == 1 && p.n == 10, "group_params: 10 carriers @0.1 -> k9 m1 n10");
+  }
+  // k capped by available full blocks; n = k + m with m >= 1 when RS is possible.
+  {
+    auto p = rs_group_params(10, 0.1f, 4);
+    check(p.k == 4 && p.m >= 1 && p.n == p.k + p.m, "group_params: k capped by available blocks");
+  }
+  // Nothing buffered -> k == 0 (caller stops).
+  check(rs_group_params(10, 0.1f, 0).k == 0, "group_params: no blocks -> k0");
+  // Single carrier -> m == 0 (RS impossible; caller falls back to SMALL).
+  {
+    auto p = rs_group_params(1, 0.1f, 100);
+    check(p.k == 1 && p.m == 0 && p.n == 1, "group_params: single carrier -> m0 (SMALL fallback)");
+  }
+  // Carrier count capped at 255.
+  {
+    auto p = rs_group_params(1000, 0.0f, 10000);
+    check(p.n <= 255 && p.k <= 255, "group_params: capped at 255 shards");
+  }
+  // Higher redundancy raises parity share: 10 carriers @1.0 -> k=floor(10/2)=5, m=5, n=10.
+  {
+    auto p = rs_group_params(10, 1.0f, 100);
+    check(p.k == 5 && p.m == 5 && p.n == 10, "group_params: 10 carriers @1.0 -> k5 m5 n10");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -244,6 +275,7 @@ int main() {
   test_mixed_order();
   test_rs_retransmit_combines();
   test_rs_reencode_shards();
+  test_rs_group_params();
   if (g_failures) {
     std::fprintf(stderr, "packet_io tests: %d failure(s)\n", g_failures);
     return 1;

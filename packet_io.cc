@@ -282,6 +282,20 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
   out.insert(out.end(), data, data + len);
 }
 
+RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks) {
+  RsGroupParams p;
+  unsigned n_carriers = static_cast<unsigned>(std::min(live_carriers, static_cast<size_t>(255)));
+  unsigned k = std::max(1u, static_cast<unsigned>(static_cast<float>(n_carriers) / (1.0f + rs_frac)));
+  k = static_cast<unsigned>(std::min(static_cast<size_t>(k), available_blocks));
+  p.k = k;
+  if (k == 0) return p;  // nothing buffered yet; caller stops
+  unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
+  unsigned n = std::min(k + m, n_carriers);  // cap so each shard lands on a distinct carrier
+  p.n = n;
+  p.m = n - k;
+  return p;
+}
+
 std::vector<std::vector<uint8_t>> rs_reencode_shards(const UnackedItem& ui) {
   const unsigned k = ui.k, n = ui.n, m = n - k;
   const size_t bs = ui.block_size;

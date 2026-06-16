@@ -1098,19 +1098,13 @@ int run_server(const Args& args) {
       // Loop so that large buffers produce multiple correctly-sized groups rather than one
       // oversized group that demands too many shards from each carrier.
       while (backend_read_buf.size() >= block_size && !carriers.empty()) {
-        unsigned n_carriers = static_cast<unsigned>(std::min(carriers.size(), static_cast<size_t>(255)));
-        // k = floor(n / (1 + rs_frac)): the max data shards that still leave room for parity
-        // within the n_carriers budget.
-        unsigned k = std::max(1u, static_cast<unsigned>(
-            static_cast<float>(n_carriers) / (1.0f + runtime_rs_redundancy)));
-        // Cap by how many full blocks are actually in the buffer.
-        k = static_cast<unsigned>(std::min(static_cast<size_t>(k),
-                                           backend_read_buf.size() / block_size));
+        // One shard per carrier so any k of them suffice to decode (see rs_group_params).
+        auto gp = packet_io::rs_group_params(carriers.size(), runtime_rs_redundancy,
+                                             backend_read_buf.size() / block_size);
+        unsigned k = gp.k;
         if (k < 1) break;
-        unsigned m = std::max(1u, static_cast<unsigned>(k * runtime_rs_redundancy + 0.5f));
-        // n must not exceed n_carriers so every shard lands on a different carrier.
-        unsigned n = std::min(k + m, n_carriers);
-        m = n - k;
+        unsigned m = gp.m;
+        unsigned n = gp.n;
         if (m == 0) {
           // Single carrier: can't do RS (need m>=1). Send one block as SMALL and continue
           // draining, matching the client-side behaviour. Do NOT break — falling through to
