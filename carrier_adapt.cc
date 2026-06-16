@@ -88,6 +88,18 @@ AdaptResult run_adapt(const PathMetrics& merged,
   return r;
 }
 
+bool is_heavy_backlog(uint64_t unacked_bytes, size_t unacked_count) {
+  return unacked_bytes > kHeavyBacklogBytes || unacked_count > kHeavyBacklogCount;
+}
+
+bool should_send_idle_ping(bool write_buf_empty, uint64_t now_ns,
+                           uint64_t last_send_ns, uint64_t last_recv_ns,
+                           uint64_t ping_idle_ns) {
+  return write_buf_empty
+      && now_ns - last_send_ns > ping_idle_ns
+      && now_ns - last_recv_ns > ping_idle_ns;
+}
+
 CarrierQualityResult assess_carriers(
     const std::vector<CarrierInfo>& carriers,
     uint64_t now_ns,

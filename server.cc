@@ -791,9 +791,10 @@ int run_server(const Args& args) {
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
       size_t backlog_bytes = 0;
       for (const auto& [_, ud] : unacked_data) backlog_bytes += ud.data.size();
+      // Base predicate is shared with the client; the server additionally treats any
+      // non-empty pending buffer (backend / reassembly / rs) as backlog.
       const bool heavy_backlog =
-          (backlog_bytes > 256 * 1024ULL) ||
-          (unacked_data.size() > 128) ||
+          carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_data.size()) ||
           !backend_pending.empty() ||
           !reassembly.empty() ||
           !rs_pending.empty();
@@ -819,9 +820,8 @@ int run_server(const Args& args) {
           }
           continue;  // don't stack another ping while one is outstanding
         }
-        if (cs.write_buf.empty()
-            && now_ns_val - cs.last_send_ns > ping_idle_ns
-            && now_ns_val - cs.last_recv_ns > ping_idle_ns) {
+        if (carrier_adapt::should_send_idle_ping(cs.write_buf.empty(), now_ns_val,
+                                                 cs.last_send_ns, cs.last_recv_ns, ping_idle_ns)) {
           packet_io::append_ping(cs.write_buf, 0);
           outstanding_ping_ns[cfd] = now_ns_val;
           ev.events = EPOLLIN | EPOLLOUT;

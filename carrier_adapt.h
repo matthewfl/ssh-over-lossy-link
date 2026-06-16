@@ -22,6 +22,11 @@ constexpr uint64_t kSpreadIncreaseThresholdNs = 2000000ULL;       // 2 ms
 constexpr uint64_t kExtraGapDecreaseThresholdNs = 500000ULL;     // 0.5 ms
 constexpr uint64_t kSmallPacketGapDecreaseThresholdNs = 1500000ULL;  // 1.5 ms
 
+// Carrier-health predicate thresholds, shared by client and server so the two sides
+// cannot silently diverge (the kind of drift that produced the B1 reaper bug).
+constexpr uint64_t kHeavyBacklogBytes = 256 * 1024ULL;
+constexpr size_t   kHeavyBacklogCount = 128;
+
 // Path metrics computed from one direction (c2s or s2c).
 struct PathMetrics {
   float fraction_struggling = 0.0f;
@@ -77,6 +82,17 @@ CarrierQualityResult assess_carriers(
     const std::vector<CarrierInfo>& carriers,
     uint64_t now_ns,
     ScaledNsFn scaled_ns);
+
+// Base "heavy backlog" test from the unacked-retransmit buffer (bytes or item count
+// over threshold). The server additionally OR's in its pending-buffer conditions
+// (backend_pending / reassembly / rs_pending non-empty) at the call site.
+bool is_heavy_backlog(uint64_t unacked_bytes, size_t unacked_count);
+
+// Should a keepalive PING be sent on an idle carrier? True when its write buffer is
+// empty and it has had no send *and* no receive activity for ping_idle_ns.
+bool should_send_idle_ping(bool write_buf_empty, uint64_t now_ns,
+                           uint64_t last_send_ns, uint64_t last_recv_ns,
+                           uint64_t ping_idle_ns);
 
 }  // namespace carrier_adapt
 

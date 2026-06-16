@@ -724,7 +724,7 @@ int run_client(const Args& args) {
     // (a few packets) should not allow large close cascades.
     size_t backlog_bytes = 0;
     for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
-    const bool heavy_backlog = (backlog_bytes > 256 * 1024ULL) || (unacked_sends.size() > 128);
+    const bool heavy_backlog = carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_sends.size());
     if (!heavy_backlog) {
       size_t reap_cap = std::max<size_t>(3, target_carriers / 3);
       if (pending_reap.size() >= reap_cap) return;
@@ -1247,9 +1247,8 @@ int run_client(const Args& args) {
           bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
               != quality.dead_idle_fds.end();
           if (is_dead) continue;
-          if (cs.write_buf.empty()
-              && now_p - cs.last_send_ns > ping_idle_ns
-              && now_p - cs.last_recv_ns > ping_idle_ns) {
+          if (carrier_adapt::should_send_idle_ping(cs.write_buf.empty(), now_p,
+                                                   cs.last_send_ns, cs.last_recv_ns, ping_idle_ns)) {
             packet_io::append_ping(cs.write_buf, next_send_id);
             outstanding_pings[{cfd, next_send_id}] = now_p;
             ev.events = EPOLLIN | EPOLLOUT;
@@ -1321,7 +1320,7 @@ int run_client(const Args& args) {
         size_t dead_reap_added = 0;
         size_t backlog_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
-        const bool heavy_backlog = (backlog_bytes > 256 * 1024ULL) || (unacked_sends.size() > 128);
+        const bool heavy_backlog = carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_sends.size());
         // In SSH mode, false-positive dead-idle classification can trigger
         // self-inflicted carrier churn. Only run dead-idle reap logic when
         // backlog pressure is genuinely high.

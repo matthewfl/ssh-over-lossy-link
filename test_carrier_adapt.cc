@@ -167,6 +167,24 @@ void test_assess_carriers() {
   }
 }
 
+// ── is_heavy_backlog / should_send_idle_ping ─────────────────────────────────
+void test_health_predicates() {
+  check(!is_heavy_backlog(0, 0), "heavy_backlog: empty → false");
+  check(is_heavy_backlog(kHeavyBacklogBytes + 1, 0), "heavy_backlog: over byte threshold → true");
+  check(is_heavy_backlog(0, kHeavyBacklogCount + 1), "heavy_backlog: over count threshold → true");
+  check(!is_heavy_backlog(kHeavyBacklogBytes, kHeavyBacklogCount), "heavy_backlog: exactly at threshold → false");
+
+  const uint64_t now = 100 * S, idle = 5 * S;
+  // Idle long enough in both directions, buffer empty → ping.
+  check(should_send_idle_ping(true, now, now - 6*S, now - 6*S, idle), "idle_ping: idle both ways → true");
+  // Non-empty write buffer → never ping (we're already sending).
+  check(!should_send_idle_ping(false, now, now - 6*S, now - 6*S, idle), "idle_ping: write pending → false");
+  // Recent send → not idle enough.
+  check(!should_send_idle_ping(true, now, now - 1*S, now - 6*S, idle), "idle_ping: recent send → false");
+  // Recent recv → not idle enough.
+  check(!should_send_idle_ping(true, now, now - 6*S, now - 1*S, idle), "idle_ping: recent recv → false");
+}
+
 }  // namespace
 
 int main() {
@@ -174,6 +192,7 @@ int main() {
   test_compute_from_deques();
   test_merge();
   test_assess_carriers();
+  test_health_predicates();
   if (g_failures) {
     std::fprintf(stderr, "carrier_adapt tests: %d failure(s)\n", g_failures);
     return 1;
