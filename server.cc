@@ -210,6 +210,15 @@ int run_server(const Args& args) {
   std::deque<uint64_t> c2s_extra_shard_gap_ns;
   std::deque<uint64_t> c2s_small_extra_copy_gap_ns;  // copy 1->2 gap for small packets (c2s)
   static constexpr size_t kMaxSpreadSamples = 100;
+  // Per-shard loss (q) estimation for the probability-bounded redundancy model.
+  // Over each adapt window: shards sent (sum of n over decoded c2s groups), shards that
+  // were present at decode (~k per group), and redundant shards that arrived late. Loss
+  // q = (sent - present_at_decode - late) / sent. See REDUNDANCY_MODEL.md.
+  uint64_t qest_n_sum = 0;
+  uint64_t qest_present_sum = 0;
+  uint64_t qest_late_sum = 0;
+  double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
+  bool     have_loss_q = false;
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
   float s2c_fraction_struggling = 0.0f;
   bool s2c_can_decrease_rs = false;
@@ -472,13 +481,17 @@ int run_server(const Args& args) {
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     }
   };
-  recv_cb.on_rs_decode = [&](unsigned /*shards_received*/, unsigned /*n*/,
+  recv_cb.on_rs_decode = [&](unsigned shards_received, unsigned n,
                               uint64_t spread_ns, uint64_t gap_final_ns) {
     c2s_shard_spread_ns.push_back(spread_ns);
     while (c2s_shard_spread_ns.size() > kMaxSpreadSamples) c2s_shard_spread_ns.pop_front();
     c2s_gap_final_ns.push_back(gap_final_ns);
     while (c2s_gap_final_ns.size() > kMaxSpreadSamples) c2s_gap_final_ns.pop_front();
+    // Loss estimation: this group sent n shards; shards_received were present at decode.
+    qest_n_sum += n;
+    qest_present_sum += shards_received;
   };
+  recv_cb.on_rs_late_shard = [&]() { qest_late_sum += 1; };
   recv_cb.on_rs_extra_shard = [&](uint64_t gap_ns) {
     c2s_extra_shard_gap_ns.push_back(gap_ns);
     while (c2s_extra_shard_gap_ns.size() > kMaxSpreadSamples) c2s_extra_shard_gap_ns.pop_front();
@@ -1134,24 +1147,39 @@ int run_server(const Args& args) {
       last_adapt_ns = now_ns_val;
       const uint64_t s2c_stale_ns = 2 * metrics_interval_ns;
 
-      auto c2s = carrier_adapt::compute_from_deques(c2s_shard_spread_ns, c2s_gap_final_ns,
-                                                    c2s_extra_shard_gap_ns, c2s_small_extra_copy_gap_ns);
-      carrier_adapt::PathMetrics s2c;
-      s2c.fraction_struggling = s2c_fraction_struggling;
-      s2c.can_decrease_rs = s2c_can_decrease_rs;
-      s2c.can_decrease_small = s2c_can_decrease_small;
-      bool s2c_fresh = (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
-      auto merged = carrier_adapt::merge(c2s, s2c, s2c_fresh);
-
-      auto res = carrier_adapt::run_adapt(merged, runtime_rs_redundancy,
-                                          runtime_small_packet_redundancy,
-                                          static_cast<unsigned>(carriers.size()));
-      runtime_rs_redundancy = res.rs_redundancy;
-      runtime_small_packet_redundancy = res.small_packet_redundancy;
-      if (res.clear_spread) {
-        c2s_shard_spread_ns.clear();
-        c2s_gap_final_ns.clear();
+      // Probability-bounded redundancy model (see REDUNDANCY_MODEL.md): estimate the
+      // per-shard loss q from this window, then set redundancy to the minimum that holds
+      // the per-block stall probability at <= kTargetStallProb, plus a fixed safety margin.
+      // Because the redundancy is computed from the CURRENT carrier count, it falls as
+      // carriers are added — which is the feedback the old heuristic lacked (it kept
+      // redundancy high regardless of n, so carriers grew to the cap).
+      static constexpr double kTargetStallProb = 0.0001;   // 0.01%
+      static constexpr float  kRedundancyMargin = 0.05f;   // headroom over the formula
+      if (qest_n_sum >= 50) {
+        double recvd = static_cast<double>(qest_present_sum + qest_late_sum);
+        double sent  = static_cast<double>(qest_n_sum);
+        double q = (sent > recvd) ? (sent - recvd) / sent : 0.0;
+        if (q < 0.0) q = 0.0;
+        if (q > 0.5) q = 0.5;   // beyond this, RS won't save us; reconnect path handles it
+        // Light smoothing so a single noisy window doesn't swing the config.
+        est_loss_q = have_loss_q ? (0.5 * est_loss_q + 0.5 * q) : q;
+        have_loss_q = true;
+        qest_n_sum = qest_present_sum = qest_late_sum = 0;
       }
+      // s2c struggle (reported by the client) can only raise the loss estimate, never
+      // lower it, so a lossy return path is still protected even though we measure c2s.
+      double q_used = est_loss_q;
+      bool s2c_fresh = (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
+      if (s2c_fresh && s2c_fraction_struggling > 0.05f && q_used < 0.05)
+        q_used = 0.05;
+
+      const unsigned n_now = static_cast<unsigned>(carriers.size());
+      float r_model = carrier_adapt::redundancy_for_stall_bound(n_now, q_used, kTargetStallProb)
+                      + kRedundancyMargin;
+      runtime_rs_redundancy = std::min(2.0f, std::max(0.1f, r_model));
+      unsigned copies = carrier_adapt::small_copies_for_loss(q_used, kTargetStallProb);
+      runtime_small_packet_redundancy =
+          std::min(std::max(2u, n_now), std::max(2u, copies));
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;

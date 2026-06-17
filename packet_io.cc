@@ -166,7 +166,9 @@ bool process_carrier_read(
       }
       unsigned n = prs->n, k = prs->k;
       if (id < next_deliver_id) {
-        // Group already decoded; this is an "extra" shard arriving late.
+        // Group already decoded; this is an "extra"/redundant shard arriving late. Count
+        // every one (loss estimation): a parity shard that arrives late was not lost.
+        if (callbacks.on_rs_late_shard) callbacks.on_rs_late_shard();
         // If it's the first extra shard for this group, fire on_rs_extra_shard so
         // the caller can measure the gap between the k-th and (k+1)-th shard.
         if (callbacks.on_rs_extra_shard) {

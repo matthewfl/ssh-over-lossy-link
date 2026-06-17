@@ -1552,9 +1552,16 @@ int run_client(const Args& args) {
         //   6. small_packet saturation: small_packet_redundancy >= carriers means we're capped;
         //      adding carriers lets us use that redundancy and improves RS group diversity.
         static constexpr uint64_t REDUNDANCY_PRESSURE_ADD_INTERVAL_NS = 25 * 1000000000ULL;
+        // Redundancy ceiling. The server now computes redundancy from the probability
+        // model as a function of the carrier count (REDUNDANCY_MODEL.md), so it FALLS as
+        // carriers are added. We add carriers only while the server's redundancy is above
+        // this cap; once enough carriers exist to hold the stall bound under ~this much
+        // parity, the server's value drops below the cap and growth stops — a real
+        // terminating condition instead of growing to max_connections on any lossy link.
+        static constexpr float kRedundancyCap = 0.3f;
         bool small_packet_saturation = effective_small_packet_redundancy >= carriers.size();
         bool redundancy_pressure = args.config.auto_adapt
-                                   && (effective_rs_redundancy > 0.4f || small_packet_saturation)
+                                   && (effective_rs_redundancy > kRedundancyCap || small_packet_saturation)
                                    && (now - last_redundancy_pressure_add_ns >= REDUNDANCY_PRESSURE_ADD_INTERVAL_NS
                                        || last_redundancy_pressure_add_ns == 0);
         bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;

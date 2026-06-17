@@ -1,9 +1,48 @@
 #include "carrier_adapt.h"
 #include <algorithm>
+#include <cmath>
 
 namespace ssholl {
 
 namespace carrier_adapt {
+
+unsigned min_parity_for_stall_bound(unsigned n, double q, double eps) {
+  if (n == 0) return 0;
+  if (q <= 0.0) return 0;          // no loss -> no parity needed
+  if (q >= 1.0) return n;          // total loss -> impossible at this n
+  if (eps <= 0.0) eps = 1e-12;
+  // Walk the Binomial(n,q) PMF iteratively (stable for n up to a few hundred) and stop at
+  // the smallest m whose CDF P(X<=m) >= 1-eps, i.e. P(X>m) <= eps.
+  const double need = 1.0 - eps;
+  double pmf = std::pow(1.0 - q, static_cast<double>(n));  // P(X=0)
+  double cdf = pmf;
+  if (cdf >= need) return 0;
+  const double ratio = q / (1.0 - q);
+  for (unsigned i = 1; i <= n; ++i) {
+    pmf *= (static_cast<double>(n - i + 1) / static_cast<double>(i)) * ratio;
+    cdf += pmf;
+    if (cdf >= need) return i;
+  }
+  return n;
+}
+
+float redundancy_for_stall_bound(unsigned n, double q, double eps) {
+  if (n < 2) return 2.0f;          // RS needs >=2 carriers
+  unsigned m = min_parity_for_stall_bound(n, q, eps);
+  if (m >= n) m = n - 1;           // keep k = n-m >= 1
+  unsigned k = n - m;
+  return static_cast<float>(m) / static_cast<float>(k);
+}
+
+unsigned small_copies_for_loss(double q, double eps) {
+  if (q <= 0.0) return 1;
+  if (q >= 1.0) return 20;
+  if (eps <= 0.0) eps = 1e-12;
+  // smallest c with q^c <= eps  ->  c >= ln(eps)/ln(q)  (ln q < 0)
+  double c = std::log(eps) / std::log(q);
+  unsigned ci = static_cast<unsigned>(std::ceil(c - 1e-9));
+  return ci < 1 ? 1u : ci;
+}
 
 PathMetrics compute_from_deques(
     const std::deque<uint64_t>& shard_spread_ns,
