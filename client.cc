@@ -1278,7 +1278,14 @@ int run_client(const Args& args) {
         const uint64_t now = now_ns();
         if (now - last_client_metrics_ns >= client_metrics_interval_ns) {
           last_client_metrics_ns = now;
-          queue_client_metrics_to_carrier(carriers.begin()->first);
+          // Load-spread: send over the carrier we've sent on least recently.
+          int fd = -1; uint64_t oldest = 0;
+          for (auto& [cfd, cs] : carriers) {
+            if (cs.connecting) continue;
+            uint64_t age = now - cs.last_send_ns;
+            if (fd < 0 || age > oldest) { fd = cfd; oldest = age; }
+          }
+          if (fd >= 0) queue_client_metrics_to_carrier(fd);
         }
       }
     } else if (!carriers.empty()) {

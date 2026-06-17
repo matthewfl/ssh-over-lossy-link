@@ -1228,8 +1228,15 @@ int run_server(const Args& args) {
       last_metrics_ns = now_ns_val;
       uint64_t max_rtt = 0;
       for (uint64_t r : server_recent_rtt_ns) if (r > max_rtt) max_rtt = r;
-      int fd = carriers.begin()->first;
-      queue_server_metrics_to_carrier(fd, max_rtt);
+      // Spread periodic control traffic over the carrier we've sent on least recently
+      // (every carrier is an equal TCP connection; concentrating control on one just makes
+      // that one more likely to HoL-block on a lost control packet).
+      int fd = -1; uint64_t oldest = 0;
+      for (auto& [cfd, cs] : carriers) {
+        uint64_t age = now_ns_val - cs.last_send_ns;
+        if (fd < 0 || age > oldest) { fd = cfd; oldest = age; }
+      }
+      if (fd >= 0) queue_server_metrics_to_carrier(fd, max_rtt);
     }
 
     ensure_backend_connected();
