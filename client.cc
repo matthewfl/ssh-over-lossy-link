@@ -422,6 +422,10 @@ int run_client(const Args& args) {
   // Track outstanding PINGs so we can debug long RTTs / missing PONGs.
   // Keyed by (fd, ping_id) -> send_time_ns.
   std::map<std::pair<int, uint64_t>, uint64_t> outstanding_pings;
+  // Group dead-carrier detection: fd -> when we sent a targeted confirm-ping to a carrier
+  // our s2c receive side has gone silent on. If it delivers nothing (no PONG / no data)
+  // before the confirm timeout, it's dead and we close it. Replaces blanket idle pinging.
+  std::map<int, uint64_t> confirm_ping_sent_ns;
 
   // Timing for periodic operations that don't depend on carrier events.
   uint64_t last_ping_check_ns       = 0;
@@ -1348,12 +1352,6 @@ int run_client(const Args& args) {
             pending_connect_started_ns.erase(idx);
           }
         }
-        // Keepalive ping floor MUST stay below the dead-idle floor (3 s in assess_carriers):
-        // otherwise an idle carrier is flagged dead at 3 s before this 5 s ping ever fires,
-        // and the dead-skip below then never pings it — so it is never kept warm and drifts
-        // to "dead_idle" forever (NAT/firewall then silently drops it -> dead-but-open). At
-        // 2 s + one ~500 ms loop it always refreshes (last_send + PONG) before the 3 s flag.
-        uint64_t ping_idle_ns = scaled_ns(2, 2000000000ULL, 30000000000ULL);
 
         std::vector<carrier_adapt::CarrierInfo> carrier_infos;
         for (auto& [cfd, cs] : carriers) {
@@ -1388,18 +1386,61 @@ int run_client(const Args& args) {
           }
         }
 
-        for (auto& [cfd, cs] : carriers) {
-          if (cs.connecting) continue;
-          bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
-              != quality.dead_idle_fds.end();
-          if (is_dead) continue;
-          if (carrier_adapt::should_send_idle_ping(cs.write_buf.empty(), now_p,
-                                                   cs.last_send_ns, cs.last_recv_ns, ping_idle_ns)) {
-            packet_io::append_ping(cs.write_buf, next_send_id);
-            outstanding_pings[{cfd, next_send_id}] = now_p;
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
+        // Group dead-carrier detection (replaces blanket idle pinging, which put a PING on
+        // every idle carrier every ~2 s — and a lost PING head-of-line-blocks that carrier's
+        // next data shard, self-inflicting the very lateness we measure). A carrier is dead
+        // if EITHER direction is dead:
+        //   - c2s: the server reported it (CARRIER_STATUS) — already windowed-confirmed on
+        //     its side, so act on a fresh report directly.
+        //   - s2c: our own receive side is silent while peers deliver (quality.rx_dead_fds) —
+        //     confirm with a single targeted ping; if it delivers nothing back before the
+        //     confirm timeout it's dead, else it recovered (transient) and we leave it.
+        {
+          const uint64_t report_fresh_ns = 2500000000ULL;       // server "currently dead"
+          const uint64_t confirm_timeout_ns = scaled_ns(8, 2000000000ULL, 30000000000ULL);
+          std::set<int> rx_dead(quality.rx_dead_fds.begin(), quality.rx_dead_fds.end());
+          std::vector<std::pair<int,const char*>> to_reap;
+          for (auto& [cfd, cs] : carriers) {
+            if (cs.connecting) continue;
+            // c2s dead per a fresh server report -> reap directly.
+            if (cs.shared_carrier_id != 0) {
+              auto sr = server_reported_dead_ns.find(cs.shared_carrier_id);
+              if (sr != server_reported_dead_ns.end() && now_p - sr->second < report_fresh_ns) {
+                to_reap.push_back({cfd, "c2s_dead_server"});
+                continue;
+              }
+            }
+            // s2c dead (silent while peers deliver): confirm with a targeted ping.
+            if (rx_dead.count(cfd)) {
+              auto cp = confirm_ping_sent_ns.find(cfd);
+              if (cp == confirm_ping_sent_ns.end()) {
+                packet_io::append_ping(cs.write_buf, next_send_id);
+                confirm_ping_sent_ns[cfd] = now_p;
+                ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+                epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+              } else if (cs.last_recv_ns > cp->second) {
+                confirm_ping_sent_ns.erase(cp);          // delivered something -> recovered
+              } else if (now_p - cp->second > confirm_timeout_ns) {
+                to_reap.push_back({cfd, "s2c_dead_confirmed"});
+              }
+            }
+          }
+          for (auto& [cfd, reason] : to_reap) {
+            auto itc = carriers.find(cfd);
+            if (itc == carriers.end() || itc->second.connecting) continue;
+            packet_io::append_suggest_close(itc->second.write_buf);
+            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
             epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            confirm_ping_sent_ns.erase(cfd);
+            bool aggressive = (!unacked_sends.empty() && carriers.size() > 1);
+            if (carriers.size() > target_carriers || aggressive) remove_carrier(cfd, reason);
+            else add_to_pending_reap(cfd, reason);
+          }
+          // Drop confirm state for carriers no longer suspect (recovered on their own).
+          for (auto it = confirm_ping_sent_ns.begin(); it != confirm_ping_sent_ns.end(); ) {
+            if (!rx_dead.count(it->first) || !carriers.count(it->first))
+              it = confirm_ping_sent_ns.erase(it);
+            else ++it;
           }
         }
 
@@ -1437,37 +1478,16 @@ int run_client(const Args& args) {
           }
         }
 
-        // Detect carriers whose PING has gone unanswered for too long: very likely
-        // dead-but-open (writes still succeed, so assess_carriers' dead-idle test can
-        // be defeated by an advancing last_send_ns). This detection must run in all
-        // modes — only the verbose per-ping logging is gated on dbg.
-        std::set<int> stale_ping_fds;
-        uint64_t ping_fail_ns = scaled_ns(6, 15000000000ULL, 120000000000ULL);
-        for (const auto& [key, sent_ns] : outstanding_pings) {
-          uint64_t age_ns = now_p - sent_ns;
-          if (dbg && age_ns > 5000000000ULL) {
-            fprintf(dbg, "[ping-unacked t=%llu fd=%d age_ms=%llu]\n",
-                    (unsigned long long)(now_p/1000000ULL),
-                    key.first,
-                    (unsigned long long)(age_ns/1000000ULL));
+        // Prune long-unanswered pings (e.g. a min-data keepalive whose PONG was lost) so
+        // outstanding_pings can't grow without bound. We no longer reap on an unanswered
+        // ping — a single lost PONG on an otherwise-healthy carrier must not kill it;
+        // dead-carrier handling is the group detection above (rx-dead + server report).
+        {
+          uint64_t ping_stale_ns = scaled_ns(6, 15000000000ULL, 120000000000ULL);
+          for (auto it = outstanding_pings.begin(); it != outstanding_pings.end(); ) {
+            if (now_p - it->second > ping_stale_ns) it = outstanding_pings.erase(it);
+            else ++it;
           }
-          if (age_ns > ping_fail_ns)
-            stale_ping_fds.insert(key.first);
-        }
-        // Any carrier with an outstanding PING beyond ping_fail_ns is very likely dead.
-        // Reap these promptly so retransmit can concentrate on healthy carriers.
-        for (int cfd : stale_ping_fds) {
-          auto itc = carriers.find(cfd);
-          if (itc == carriers.end() || itc->second.connecting) continue;
-          packet_io::append_suggest_close(itc->second.write_buf);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = cfd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-          bool aggressive = (!unacked_sends.empty() && carriers.size() > 1);
-          if (carriers.size() > target_carriers || aggressive)
-            remove_carrier(cfd, "ping_timeout");
-          else
-            add_to_pending_reap(cfd, "ping_timeout");
         }
 
         size_t dead_reap_added = 0;

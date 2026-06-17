@@ -862,9 +862,12 @@ int run_server(const Args& args) {
       // the client logs it and does not yet act.)
       if (now_ns_val - last_carrier_status_ns >= 1000000000ULL) {
         last_carrier_status_ns = now_ns_val;
-        std::set<int> dead_set(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end());
+        // Only rx-dead carriers (silent while a peer is actively delivering) — NOT plain
+        // idle_dead, which during a quiet period would flag every carrier and tell the
+        // client to reap the whole fleet.
+        std::set<int> dead_set(quality.rx_dead_fds.begin(), quality.rx_dead_fds.end());
         std::vector<uint64_t> dead_ids;
-        for (int dfd : quality.dead_idle_fds) {
+        for (int dfd : quality.rx_dead_fds) {
           auto di = carriers.find(dfd);
           if (di != carriers.end() && di->second.shared_carrier_id != 0)
             dead_ids.push_back(di->second.shared_carrier_id);
