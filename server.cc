@@ -216,7 +216,8 @@ int run_server(const Args& args) {
   // window: total shard-gaps seen and how many exceeded B. q = late/total. This is the
   // absolute-budget criterion (NOT RTT-relative): B is the acceptable interactive delay.
   // See REDUNDANCY_MODEL.md.
-  static constexpr uint64_t kLatencyBudgetNs = 10 * 1000000ULL;   // 10 ms acceptable HoL delay
+  const uint64_t kLatencyBudgetNs =
+      std::max<uint64_t>(1, args.config.max_added_latency_ms) * 1000000ULL;  // acceptable HoL delay
   uint64_t qest_total_gaps = 0;
   uint64_t qest_late_gaps = 0;
   double   est_loss_q = 0.05;   // start pessimistic until we have a measurement

@@ -137,6 +137,12 @@ std::string launch_server(const Args& args) {
       argv_vec.push_back("--min-data-per-minute");
       argv_vec.push_back(mbpm_buf);
     }
+    // The server owns RS redundancy in auto_adapt and measures the latency budget, so it
+    // needs the budget value the user configured on the client side.
+    char mal_buf[32];
+    snprintf(mal_buf, sizeof mal_buf, "%u", args.config.max_added_latency_ms);
+    argv_vec.push_back("--max-added-latency-ms");
+    argv_vec.push_back(mal_buf);
     argv_vec.push_back(args.remote_hostname.c_str());
     argv_vec.push_back(port_str.c_str());
     argv_vec.push_back(nullptr);

@@ -139,3 +139,27 @@ Add `test_carrier_adapt` cases pinning `min_parity_for_stall_bound` to the table
 Add a `test_all.sh` scenario at q≈5 %, RTT≈400 ms, bulk + idle traffic, asserting the
 carrier count **plateaus** (e.g. < 2× the `r_cap`-implied target) instead of climbing
 to `max_connections`, while stall/stutter stays within bounds.
+
+## 8. As implemented (branch `probability-bounded-redundancy`)
+
+What shipped, and where it differs from the sketch above:
+
+- **`q` is measured against an absolute latency budget `B`, not RTT.** With a 300 ms RTT,
+  "1 RTT late" is an unacceptable head-of-line stall, so the deadline must be a small
+  absolute budget. `packet_io` fires `on_rs_shard_gap(gap)` for every shard (gap from its
+  group's first shard); a shard is *late* if `gap > B`. `q = late/total` per adapt window,
+  measured on the server (c2s); a struggling s2c path can only raise it. `B` is the CLI
+  flag **`--max-added-latency-ms` (default 10)** — the knob for acceptable interactive
+  delay. Lower `B` ⇒ higher `q` ⇒ more parity ⇒ tighter latency.
+- **ε = 0.01 %**, and redundancy = `redundancy_for_stall_bound(n, q, ε) + 0.05` (the
+  margin errs toward more parity), clamped `[0.1, 2.0]`, recomputed from the *current* `n`.
+- **Carrier policy (chosen): bound redundancy, let carriers grow to `max_connections`.**
+  The client grows carriers while the server's redundancy exceeds `kRedundancyCap = 0.3`.
+  Because redundancy falls as `n` grows, this **plateaus below max when the latency target
+  is achievable**, and only rides up to `max_connections` on links where the target is
+  infeasible (so much loss/HoL that even max parity can't hold `B`). No separate carrier
+  ceiling.
+- **Validated:** clean link (any base latency) → `q=0`, redundancy at the 0.10 floor,
+  carriers at the floor. Caveat: `B` must exceed the link's *normal* inter-shard spread;
+  if a loss HoL-blocks a carrier it delays a *burst* of shards (so a 5 %-spike link can
+  read `q≈25 %` and correctly max out — `B`=10 ms is then simply infeasible there).
