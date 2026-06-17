@@ -211,12 +211,14 @@ int run_server(const Args& args) {
   std::deque<uint64_t> c2s_small_extra_copy_gap_ns;  // copy 1->2 gap for small packets (c2s)
   static constexpr size_t kMaxSpreadSamples = 100;
   // Per-shard loss (q) estimation for the probability-bounded redundancy model.
-  // Over each adapt window: shards sent (sum of n over decoded c2s groups), shards that
-  // were present at decode (~k per group), and redundant shards that arrived late. Loss
-  // q = (sent - present_at_decode - late) / sent. See REDUNDANCY_MODEL.md.
-  uint64_t qest_n_sum = 0;
-  uint64_t qest_present_sum = 0;
-  uint64_t qest_late_sum = 0;
+  // A shard counts as "late" if it arrives more than the latency budget B after its
+  // group's first shard (it would have added > B of head-of-line delay). Over each adapt
+  // window: total shard-gaps seen and how many exceeded B. q = late/total. This is the
+  // absolute-budget criterion (NOT RTT-relative): B is the acceptable interactive delay.
+  // See REDUNDANCY_MODEL.md.
+  static constexpr uint64_t kLatencyBudgetNs = 10 * 1000000ULL;   // 10 ms acceptable HoL delay
+  uint64_t qest_total_gaps = 0;
+  uint64_t qest_late_gaps = 0;
   double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
   bool     have_loss_q = false;
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
@@ -481,17 +483,19 @@ int run_server(const Args& args) {
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     }
   };
-  recv_cb.on_rs_decode = [&](unsigned shards_received, unsigned n,
+  recv_cb.on_rs_decode = [&](unsigned /*shards_received*/, unsigned /*n*/,
                               uint64_t spread_ns, uint64_t gap_final_ns) {
     c2s_shard_spread_ns.push_back(spread_ns);
     while (c2s_shard_spread_ns.size() > kMaxSpreadSamples) c2s_shard_spread_ns.pop_front();
     c2s_gap_final_ns.push_back(gap_final_ns);
     while (c2s_gap_final_ns.size() > kMaxSpreadSamples) c2s_gap_final_ns.pop_front();
-    // Loss estimation: this group sent n shards; shards_received were present at decode.
-    qest_n_sum += n;
-    qest_present_sum += shards_received;
   };
-  recv_cb.on_rs_late_shard = [&]() { qest_late_sum += 1; };
+  // Latency-budget loss estimate: every shard's gap from its group's first shard; a gap
+  // beyond the budget means it would have added > B of head-of-line delay (late).
+  recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
+    qest_total_gaps += 1;
+    if (gap_ns > kLatencyBudgetNs) qest_late_gaps += 1;
+  };
   recv_cb.on_rs_extra_shard = [&](uint64_t gap_ns) {
     c2s_extra_shard_gap_ns.push_back(gap_ns);
     while (c2s_extra_shard_gap_ns.size() > kMaxSpreadSamples) c2s_extra_shard_gap_ns.pop_front();
@@ -1155,16 +1159,13 @@ int run_server(const Args& args) {
       // redundancy high regardless of n, so carriers grew to the cap).
       static constexpr double kTargetStallProb = 0.0001;   // 0.01%
       static constexpr float  kRedundancyMargin = 0.05f;   // headroom over the formula
-      if (qest_n_sum >= 50) {
-        double recvd = static_cast<double>(qest_present_sum + qest_late_sum);
-        double sent  = static_cast<double>(qest_n_sum);
-        double q = (sent > recvd) ? (sent - recvd) / sent : 0.0;
-        if (q < 0.0) q = 0.0;
+      if (qest_total_gaps >= 100) {
+        double q = static_cast<double>(qest_late_gaps) / static_cast<double>(qest_total_gaps);
         if (q > 0.5) q = 0.5;   // beyond this, RS won't save us; reconnect path handles it
         // Light smoothing so a single noisy window doesn't swing the config.
         est_loss_q = have_loss_q ? (0.5 * est_loss_q + 0.5 * q) : q;
         have_loss_q = true;
-        qest_n_sum = qest_present_sum = qest_late_sum = 0;
+        qest_total_gaps = qest_late_gaps = 0;
       }
       // s2c struggle (reported by the client) can only raise the loss estimate, never
       // lower it, so a lossy return path is still protected even though we measure c2s.
@@ -1180,6 +1181,9 @@ int run_server(const Args& args) {
       unsigned copies = carrier_adapt::small_copies_for_loss(q_used, kTargetStallProb);
       runtime_small_packet_redundancy =
           std::min(std::max(2u, n_now), std::max(2u, copies));
+      if (dbg) fprintf(dbg, "[adapt-model t=%llu q=%.3f n=%u r_model=%.2f copies=%u]\n",
+                       (unsigned long long)(now_ns_val/1000000ULL), q_used, n_now,
+                       (double)runtime_rs_redundancy, copies);
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
