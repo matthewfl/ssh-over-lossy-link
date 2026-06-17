@@ -84,6 +84,12 @@ struct ReceiveCallbacks {
   std::function<void(uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
                      float fraction_struggling, uint32_t rs_pending_count,
                      bool can_decrease_rs, bool can_decrease_small)> on_client_metrics;
+  // Fired for EVERY shard of an RS group as it arrives, with the gap between this shard
+  // and the group's FIRST shard (the first shard reports gap 0). Used to estimate the
+  // per-shard "late" probability q against an absolute latency budget B: a shard with
+  // gap > B would have added > B of head-of-line delay, so it counts as late. q feeds the
+  // stall-probability model (REDUNDANCY_MODEL.md). Independent of RTT by construction.
+  std::function<void(uint64_t gap_ns)> on_rs_shard_gap;
   // When we have ≥2 copies of a small packet: gap_ns from first to median arrival.
   // We don't know which copy would be dropped when reducing N→N-1; median is representative.
   std::function<void(uint64_t gap_ns)> on_small_extra_copy;

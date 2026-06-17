@@ -27,6 +27,7 @@ const struct option LONG_OPTS[] = {
   { "rtt-ms",               required_argument, nullptr, 't' },
   { "connect-timeout",      required_argument, nullptr, 'T' },
   { "min-data-per-minute",  required_argument, nullptr, 'M' },
+  { "max-added-latency-ms", required_argument, nullptr, 'L' },
   { "file-lock",            required_argument, nullptr, 'F' },
   { "reconnect-timeout",    required_argument, nullptr, 'e' },
   { "server",               no_argument,       nullptr, 'S' },
@@ -94,6 +95,9 @@ void usage(const char* program_name) {
     << c.connect_timeout_sec << "\n"
     << "  --min-data-per-minute N       Send keepalive data so each carrier sends ≥N bytes/min. Default: "
     << c.min_data_per_minute << "\n"
+    << "  --max-added-latency-ms N      RS redundancy budget: a shard arriving >N ms after its group's\n"
+    << "                                first counts as 'late'; lower N = more parity for tighter latency. Default: "
+    << c.max_added_latency_ms << "\n"
     << "  --reconnect-timeout N         Global idle timeout (s); 0 = adaptive (12×RTT, min 60 s, max 300 s); else 1–7200. Default: "
     << c.reconnect_timeout_sec << "\n"
     << "  --file-lock PATH              Acquire exclusive lock on PATH before client start (15s timeout)\n"
@@ -106,7 +110,7 @@ void usage(const char* program_name) {
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:F:e:Su:Dh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:L:F:e:Su:Dh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -144,6 +148,9 @@ bool parse_args(int argc, char* argv[], Args& out) {
           break;
         case 'M':
           out.config.min_data_per_minute = parse_unsigned(optarg, "--min-data-per-minute");
+          break;
+        case 'L':
+          out.config.max_added_latency_ms = parse_unsigned(optarg, "--max-added-latency-ms");
           break;
         case 'F':
           out.file_lock = optarg;

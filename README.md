@@ -245,6 +245,10 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 //   uint64_t avg_extra_shard_gap_ns; float fraction_struggling; uint32_t rs_pending_count;
 //   uint8_t can_decrease_rs; uint8_t can_decrease_small; }. Reports server→client path quality
 //   so the server (which owns redundancy in auto mode) can adapt using both directions.
+//   NOTE: in the probability-bounded redundancy model the `fraction_struggling` field carries
+//   the client's s2c per-shard loss estimate q (fraction of received shards arriving later than
+//   the latency budget B after their group's first shard); the server uses max(c2s_q, s2c_q).
+//   The avg_* and can_decrease_* fields are legacy and currently unused by the server.
 
 ```
 

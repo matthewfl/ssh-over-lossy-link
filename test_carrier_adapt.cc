@@ -269,6 +269,37 @@ void test_reap_send_only_zombie() {
         "zombie: idle (not actively sending) is not reaped peer-independently");
 }
 
+// ── probability-bounded redundancy model ─────────────────────────────────────
+// Values pinned against an independent exact-binomial computation (REDUNDANCY_MODEL.md).
+void test_stall_bound_model() {
+  const double eps = 0.0001;  // 0.01%
+
+  // min_parity_for_stall_bound matches the table.
+  check(min_parity_for_stall_bound(10, 0.01, eps) == 3, "model: q1% n10 -> m=3");
+  check(min_parity_for_stall_bound(20, 0.01, eps) == 3, "model: q1% n20 -> m=3");
+  check(min_parity_for_stall_bound(20, 0.03, eps) == 5, "model: q3% n20 -> m=5");
+  check(min_parity_for_stall_bound(30, 0.03, eps) == 6, "model: q3% n30 -> m=6");
+  check(min_parity_for_stall_bound(20, 0.05, eps) == 6, "model: q5% n20 -> m=6");
+  check(min_parity_for_stall_bound(30, 0.05, eps) == 7, "model: q5% n30 -> m=7");
+  check(min_parity_for_stall_bound(40, 0.05, eps) == 9, "model: q5% n40 -> m=9");
+
+  // No loss -> no parity needed.
+  check(min_parity_for_stall_bound(30, 0.0, eps) == 0, "model: q=0 -> m=0");
+
+  // Redundancy fraction falls as carriers grow at fixed loss (the key feedback).
+  float r20 = redundancy_for_stall_bound(20, 0.05, eps);
+  float r40 = redundancy_for_stall_bound(40, 0.05, eps);
+  float r80 = redundancy_for_stall_bound(80, 0.05, eps);
+  check(approx(r20, 6.0f/14.0f), "model: q5% n20 -> r=6/14");
+  check(r40 < r20 && r80 < r40, "model: redundancy decreases as carriers grow");
+
+  // Small-packet copies: smallest c with q^c <= eps.
+  check(small_copies_for_loss(0.01, eps) == 2, "model: q1% -> 2 copies");
+  check(small_copies_for_loss(0.03, eps) == 3, "model: q3% -> 3 copies");
+  check(small_copies_for_loss(0.05, eps) == 4, "model: q5% -> 4 copies");
+  check(small_copies_for_loss(0.0,  eps) == 1, "model: q=0 -> 1 copy");
+}
+
 }  // namespace
 
 int main() {
@@ -279,6 +310,7 @@ int main() {
   test_health_predicates();
   test_reap_no_churn_while_link_up();
   test_reap_send_only_zombie();
+  test_stall_bound_model();
   if (g_failures) {
     std::fprintf(stderr, "carrier_adapt tests: %d failure(s)\n", g_failures);
     return 1;

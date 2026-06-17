@@ -101,6 +101,24 @@ bool should_send_idle_ping(bool write_buf_empty, uint64_t now_ns,
                            uint64_t last_send_ns, uint64_t last_recv_ns,
                            uint64_t ping_idle_ns);
 
+// ── Probability-bounded redundancy model ──────────────────────────────────────
+// An RS group of n shards (k data + m parity, one shard per carrier) stalls — needs a
+// retransmit, ~1 RTT of head-of-line block — when MORE than m of the n shards are late
+// (lost, or stuck behind a per-carrier TCP retransmit). Treating shard lateness as ~iid
+// with probability q, the number late ~ Binomial(n, q) and P(stall) = P(X > m). These
+// pick the redundancy / copies that hold P(stall) <= eps. See REDUNDANCY_MODEL.md.
+
+// Smallest m (parity shards) with P(Binomial(n,q) > m) <= eps. 0 when q<=0; capped so
+// k = n-m >= 1 (a returned m == n-1 with r still too high means "add carriers").
+unsigned min_parity_for_stall_bound(unsigned n, double q, double eps);
+
+// Redundancy fraction r = m/(n-m) for that minimal m. n<2 -> a large value (RS needs
+// >=2 carriers); caller clamps and/or falls back to small-packet duplication.
+float redundancy_for_stall_bound(unsigned n, double q, double eps);
+
+// Smallest number of duplicate copies c for a SMALL packet so P(all lost)=q^c <= eps.
+unsigned small_copies_for_loss(double q, double eps);
+
 }  // namespace carrier_adapt
 
 }  // namespace ssholl

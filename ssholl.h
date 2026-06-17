@@ -119,6 +119,8 @@ struct Config {
   unsigned connect_timeout_sec = 30;  // SSH ConnectTimeout; 0 = no timeout (wait indefinitely)
   unsigned min_data_per_minute = 0;   // when >0, send keepalive data so each carrier sends ≥N bytes/min
   unsigned reconnect_timeout_sec = 0; // global idle timeout; 0 = adaptive (12×RTT, min 60 s, max 300 s)
+  unsigned max_added_latency_ms = 10; // RS stall-model latency budget B: a shard arriving >B after
+                                      // its group's first shard counts as "late" (drives redundancy)
 };
 
 // -----------------------------------------------------------------------------

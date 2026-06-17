@@ -165,16 +165,17 @@ bool process_carrier_read(
         return false;
       }
       unsigned n = prs->n, k = prs->k;
-      if (id < next_deliver_id) {
-        // Group already decoded; this is an "extra" shard arriving late.
-        // If it's the first extra shard for this group, fire on_rs_extra_shard so
-        // the caller can measure the gap between the k-th and (k+1)-th shard.
-        if (callbacks.on_rs_extra_shard) {
-          auto it = recently_decoded_ns.find(id);
-          if (it != recently_decoded_ns.end()) {
-            callbacks.on_rs_extra_shard(now_ns() - it->second);
-            recently_decoded_ns.erase(it);  // only report first extra shard per group
-          }
+      if (id < next_deliver_id || reassembly.count(id)) {
+        // Redundant shard for an already-decoded group (already delivered, or decoded but
+        // still waiting on an earlier group). Measure its gap from the group's first shard
+        // for loss estimation, then drop it. Counting EVERY late shard (not just the first)
+        // is what makes the per-shard "late" fraction q meaningful; recently_decoded_ns
+        // holds each group's first-shard arrival time.
+        auto it = recently_decoded_ns.find(id);
+        if (it != recently_decoded_ns.end()) {
+          uint64_t gap = now_ns() - it->second;
+          if (callbacks.on_rs_shard_gap) callbacks.on_rs_shard_gap(gap);
+          if (callbacks.on_rs_extra_shard) callbacks.on_rs_extra_shard(gap);
         }
         s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
         continue;
@@ -204,6 +205,9 @@ bool process_carrier_read(
         rp.shards[idx].assign(prs->data, prs->data + block_sz);
         rp.shard_recv_ns[idx] = t;
         s.last_recv_ns = t;
+        // Per-shard gap from the group's first shard, for the latency-budget loss estimate.
+        if (callbacks.on_rs_shard_gap)
+          callbacks.on_rs_shard_gap(t > rp.first_recv_ns ? t - rp.first_recv_ns : 0);
       }
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total_rs);
       if (rp.shards.size() >= static_cast<size_t>(k)) {
@@ -246,9 +250,11 @@ bool process_carrier_read(
           if (callbacks.on_rs_decode)
             callbacks.on_rs_decode(static_cast<unsigned>(rp.shards.size()), rp.n,
                                    shard_spread_ns, gap_final_ns);
-          // Record decode time so we can measure the k→(k+1) gap when the next shard arrives.
-          if (callbacks.on_rs_extra_shard) {
-            recently_decoded_ns[id] = decode_time_ns;
+          // Remember the group's FIRST-shard arrival time so redundant shards arriving
+          // after decode can be measured as a gap from it (latency-budget loss estimate).
+          (void)decode_time_ns;
+          if (callbacks.on_rs_shard_gap || callbacks.on_rs_extra_shard) {
+            recently_decoded_ns[id] = rp.first_recv_ns;
             // Prune to avoid unbounded growth: keep only the last 64 decoded groups.
             while (recently_decoded_ns.size() > 64)
               recently_decoded_ns.erase(recently_decoded_ns.begin());

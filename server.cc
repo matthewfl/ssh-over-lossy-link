@@ -210,10 +210,20 @@ int run_server(const Args& args) {
   std::deque<uint64_t> c2s_extra_shard_gap_ns;
   std::deque<uint64_t> c2s_small_extra_copy_gap_ns;  // copy 1->2 gap for small packets (c2s)
   static constexpr size_t kMaxSpreadSamples = 100;
+  // Per-shard loss (q) estimation for the probability-bounded redundancy model.
+  // A shard counts as "late" if it arrives more than the latency budget B after its
+  // group's first shard (it would have added > B of head-of-line delay). Over each adapt
+  // window: total shard-gaps seen and how many exceeded B. q = late/total. This is the
+  // absolute-budget criterion (NOT RTT-relative): B is the acceptable interactive delay.
+  // See REDUNDANCY_MODEL.md.
+  const uint64_t kLatencyBudgetNs =
+      std::max<uint64_t>(1, args.config.max_added_latency_ms) * 1000000ULL;  // acceptable HoL delay
+  uint64_t qest_total_gaps = 0;
+  uint64_t qest_late_gaps = 0;
+  double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
+  bool     have_loss_q = false;
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
-  float s2c_fraction_struggling = 0.0f;
-  bool s2c_can_decrease_rs = false;
-  bool s2c_can_decrease_small = false;
+  float s2c_loss_q = 0.0f;   // client-reported s2c per-shard late fraction (latency-budget method)
   uint64_t s2c_last_received_ns = 0;
   // Shared map for tracking when RS groups decoded so extra shards can be timed.
   std::map<uint64_t, uint64_t> recently_decoded_ns;
@@ -479,6 +489,12 @@ int run_server(const Args& args) {
     c2s_gap_final_ns.push_back(gap_final_ns);
     while (c2s_gap_final_ns.size() > kMaxSpreadSamples) c2s_gap_final_ns.pop_front();
   };
+  // Latency-budget loss estimate: every shard's gap from its group's first shard; a gap
+  // beyond the budget means it would have added > B of head-of-line delay (late).
+  recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
+    qest_total_gaps += 1;
+    if (gap_ns > kLatencyBudgetNs) qest_late_gaps += 1;
+  };
   recv_cb.on_rs_extra_shard = [&](uint64_t gap_ns) {
     c2s_extra_shard_gap_ns.push_back(gap_ns);
     while (c2s_extra_shard_gap_ns.size() > kMaxSpreadSamples) c2s_extra_shard_gap_ns.pop_front();
@@ -534,9 +550,10 @@ int run_server(const Args& args) {
     (void)avg_shard_spread_ns;
     (void)avg_extra_shard_gap_ns;
     (void)rs_pending_count;
-    s2c_fraction_struggling = fraction_struggling;
-    s2c_can_decrease_rs = can_decrease_rs;
-    s2c_can_decrease_small = can_decrease_small;
+    (void)can_decrease_rs;
+    (void)can_decrease_small;
+    // fraction_struggling now carries the client's latency-budget s2c loss estimate q.
+    s2c_loss_q = fraction_struggling;
     s2c_last_received_ns = now_ns();
   };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
@@ -1134,24 +1151,40 @@ int run_server(const Args& args) {
       last_adapt_ns = now_ns_val;
       const uint64_t s2c_stale_ns = 2 * metrics_interval_ns;
 
-      auto c2s = carrier_adapt::compute_from_deques(c2s_shard_spread_ns, c2s_gap_final_ns,
-                                                    c2s_extra_shard_gap_ns, c2s_small_extra_copy_gap_ns);
-      carrier_adapt::PathMetrics s2c;
-      s2c.fraction_struggling = s2c_fraction_struggling;
-      s2c.can_decrease_rs = s2c_can_decrease_rs;
-      s2c.can_decrease_small = s2c_can_decrease_small;
-      bool s2c_fresh = (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
-      auto merged = carrier_adapt::merge(c2s, s2c, s2c_fresh);
-
-      auto res = carrier_adapt::run_adapt(merged, runtime_rs_redundancy,
-                                          runtime_small_packet_redundancy,
-                                          static_cast<unsigned>(carriers.size()));
-      runtime_rs_redundancy = res.rs_redundancy;
-      runtime_small_packet_redundancy = res.small_packet_redundancy;
-      if (res.clear_spread) {
-        c2s_shard_spread_ns.clear();
-        c2s_gap_final_ns.clear();
+      // Probability-bounded redundancy model (see REDUNDANCY_MODEL.md): estimate the
+      // per-shard loss q from this window, then set redundancy to the minimum that holds
+      // the per-block stall probability at <= kTargetStallProb, plus a fixed safety margin.
+      // Because the redundancy is computed from the CURRENT carrier count, it falls as
+      // carriers are added — which is the feedback the old heuristic lacked (it kept
+      // redundancy high regardless of n, so carriers grew to the cap).
+      static constexpr double kTargetStallProb = 0.0001;   // 0.01%
+      static constexpr float  kRedundancyMargin = 0.05f;   // headroom over the formula
+      if (qest_total_gaps >= 100) {
+        double q = static_cast<double>(qest_late_gaps) / static_cast<double>(qest_total_gaps);
+        if (q > 0.5) q = 0.5;   // beyond this, RS won't save us; reconnect path handles it
+        // Light smoothing so a single noisy window doesn't swing the config.
+        est_loss_q = have_loss_q ? (0.5 * est_loss_q + 0.5 * q) : q;
+        have_loss_q = true;
+        qest_total_gaps = qest_late_gaps = 0;
       }
+      // A single redundancy value governs BOTH directions, so size it for the worse one:
+      // take the max of our c2s loss estimate and the client's reported s2c loss estimate
+      // (both measured the same latency-budget way). This protects a lopsided link.
+      bool s2c_fresh = (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
+      double q_used = est_loss_q;
+      if (s2c_fresh) q_used = std::max(q_used, static_cast<double>(s2c_loss_q));
+
+      const unsigned n_now = static_cast<unsigned>(carriers.size());
+      float r_model = carrier_adapt::redundancy_for_stall_bound(n_now, q_used, kTargetStallProb)
+                      + kRedundancyMargin;
+      runtime_rs_redundancy = std::min(2.0f, std::max(0.1f, r_model));
+      unsigned copies = carrier_adapt::small_copies_for_loss(q_used, kTargetStallProb);
+      runtime_small_packet_redundancy =
+          std::min(std::max(2u, n_now), std::max(2u, copies));
+      if (dbg) fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u]\n",
+                       (unsigned long long)(now_ns_val/1000000ULL), q_used,
+                       est_loss_q, (double)s2c_loss_q, n_now,
+                       (double)runtime_rs_redundancy, copies);
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
