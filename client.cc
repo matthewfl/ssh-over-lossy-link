@@ -1650,7 +1650,6 @@ int run_client(const Args& args) {
         //   5. server_rs_pending pressure: server has many c2s RS groups stuck (lossy c2s path).
         //   6. small_packet saturation: small_packet_redundancy >= carriers means we're capped;
         //      adding carriers lets us use that redundancy and improves RS group diversity.
-        static constexpr uint64_t REDUNDANCY_PRESSURE_ADD_INTERVAL_NS = 25 * 1000000000ULL;
         // Redundancy ceiling. The server now computes redundancy from the probability
         // model as a function of the carrier count (REDUNDANCY_MODEL.md), so it FALLS as
         // carriers are added. We add carriers only while the server's redundancy is above
@@ -1658,10 +1657,17 @@ int run_client(const Args& args) {
         // parity, the server's value drops below the cap and growth stops — a real
         // terminating condition instead of growing to max_connections on any lossy link.
         static constexpr float kRedundancyCap = 0.3f;
+        // Adaptive growth rate: gentle when redundancy is moderate, but when redundancy is
+        // pinned near its 2.0 max, parity can't protect the latency target any further —
+        // carriers are the only remaining lever, so ramp them much faster.
+        uint64_t redundancy_pressure_interval_ns =
+            (effective_rs_redundancy >= 1.9f) ? 3000000000ULL :      // saturated -> ~3s
+            (effective_rs_redundancy >= 1.0f) ? 10000000000ULL :     // high      -> ~10s
+                                                25000000000ULL;       // moderate  -> ~25s
         bool small_packet_saturation = effective_small_packet_redundancy >= carriers.size();
         bool redundancy_pressure = args.config.auto_adapt
                                    && (effective_rs_redundancy > kRedundancyCap || small_packet_saturation)
-                                   && (now - last_redundancy_pressure_add_ns >= REDUNDANCY_PRESSURE_ADD_INTERVAL_NS
+                                   && (now - last_redundancy_pressure_add_ns >= redundancy_pressure_interval_ns
                                        || last_redundancy_pressure_add_ns == 0);
         bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;
         bool need_more = (total_write > backpressure_write_threshold)
