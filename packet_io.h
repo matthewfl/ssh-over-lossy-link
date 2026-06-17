@@ -53,6 +53,9 @@ struct ReceiveCallbacks {
   // Client -> server START_CONNECTION: the new carrier's shared carrier_id. Server records
   // fd -> carrier_id so it can name this carrier in health/attribution messages.
   std::function<void(int fd, uint64_t carrier_id)> on_start_connection;
+  // Peer's CARRIER_STATUS: shared_carrier_ids the peer sees as dead (its receive side is
+  // silent on them). Lets each side learn about carriers dead in the *other* direction.
+  std::function<void(const std::vector<uint64_t>& dead_carrier_ids)> on_carrier_status;
   // Client -> server PING; server should send PONG. Server -> client PING; client should send PONG.
   // payload_size: if >0, PING had keepalive payload; responder should send PONG with payload.
   std::function<void(int fd, uint64_t id, size_t payload_size)> on_ping;
@@ -151,6 +154,7 @@ void append_ping(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload, size_t payload_len);
 void append_ready(std::vector<uint8_t>& out);
 void append_start_connection(std::vector<uint8_t>& out, uint64_t carrier_id);
+void append_carrier_status(std::vector<uint8_t>& out, const std::vector<uint64_t>& dead_carrier_ids);
 void append_suggest_close(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
                            uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,

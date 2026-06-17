@@ -25,6 +25,7 @@ enum class PacketKind : uint8_t {
   READY = 9,              // server -> client; sent when carrier connects, confirms link is up
   SUGGEST_CLOSE = 10,     // server -> client; suggests client close this carrier (dead or slow)
   CLIENT_METRICS = 11,    // client -> server; s2c path quality so server can adapt using both directions
+  CARRIER_STATUS = 12,    // either direction; shared_carrier_ids the sender sees as dead (sent over a healthy carrier)
 };
 
 #pragma pack(push, 1)
@@ -106,6 +107,16 @@ struct PacketClientMetrics {
   uint32_t rs_pending_count;
   uint8_t can_decrease_rs;    // p90 extra-shard gap < 0.5ms on s2c
   uint8_t can_decrease_small; // p90 first→median gap < 1.5ms on s2c
+};
+
+// Either direction: the shared_carrier_ids the sender currently believes are dead (its
+// receive side has gone silent on them while peers keep delivering). Sent over a healthy
+// carrier so the news arrives even though nothing succeeds on the dead carrier itself.
+// Header followed by `count` little-endian uint64 carrier ids.
+struct PacketCarrierStatus {
+  PacketHeader header;
+  uint16_t count;
+  // uint64_t dead_carrier_ids[count];
 };
 
 #pragma pack(pop)

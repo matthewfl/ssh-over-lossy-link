@@ -121,6 +121,19 @@ bool process_carrier_read(
                                    cm.can_decrease_rs != 0, cm.can_decrease_small != 0);
       continue;
     }
+    if (h->packet_kind == PacketKind::CARRIER_STATUS) {
+      if (s.read_buf.size() < sizeof(PacketCarrierStatus)) break;
+      PacketCarrierStatus cs_hdr;
+      std::memcpy(&cs_hdr, s.read_buf.data(), sizeof(cs_hdr));
+      size_t total = sizeof(PacketCarrierStatus) + static_cast<size_t>(cs_hdr.count) * sizeof(uint64_t);
+      if (s.read_buf.size() < total) break;
+      std::vector<uint64_t> ids(cs_hdr.count);
+      for (uint16_t i = 0; i < cs_hdr.count; ++i)
+        std::memcpy(&ids[i], s.read_buf.data() + sizeof(PacketCarrierStatus) + i * sizeof(uint64_t), sizeof(uint64_t));
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + total);
+      if (callbacks.on_carrier_status) callbacks.on_carrier_status(ids);
+      continue;
+    }
     if (h->packet_kind == PacketKind::START_CONNECTION) {
       if (s.read_buf.size() < sizeof(PacketStartConnection)) break;
       PacketStartConnection psc;
@@ -425,6 +438,16 @@ void append_start_connection(std::vector<uint8_t>& out, uint64_t carrier_id) {
   p.header.packet_kind = PacketKind::START_CONNECTION;
   p.carrier_id = carrier_id;
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&p), reinterpret_cast<uint8_t*>(&p) + sizeof p);
+}
+
+void append_carrier_status(std::vector<uint8_t>& out, const std::vector<uint64_t>& dead_carrier_ids) {
+  PacketCarrierStatus p{};
+  p.header.id = 0;
+  p.header.packet_kind = PacketKind::CARRIER_STATUS;
+  p.count = static_cast<uint16_t>(dead_carrier_ids.size());
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&p), reinterpret_cast<uint8_t*>(&p) + sizeof p);
+  for (uint64_t id : dead_carrier_ids)
+    out.insert(out.end(), reinterpret_cast<uint8_t*>(&id), reinterpret_cast<uint8_t*>(&id) + sizeof id);
 }
 
 void append_suggest_close(std::vector<uint8_t>& out) {

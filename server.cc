@@ -202,6 +202,7 @@ int run_server(const Args& args) {
   const size_t max_server_recent_rtt = 50;
   const uint64_t metrics_interval_ns = 400 * 1000000ULL;  // 400ms
   uint64_t last_metrics_ns = 0;
+  uint64_t last_carrier_status_ns = 0;
   // Rolling shard spread samples for the client→server direction.
   std::deque<uint64_t> c2s_shard_spread_ns;
   // gap_final: time between (k-1)-th and k-th shard per group (how close to the edge).
@@ -853,6 +854,39 @@ int run_server(const Args& args) {
         carrier_infos.push_back({cfd, cs.last_rtt_ns, cs.last_recv_ns, cs.connect_ns, cs.last_send_ns});
       }
       auto quality = carrier_adapt::assess_carriers(carrier_infos, now_ns_val, scaled_ns);
+
+      // CARRIER_STATUS: tell the client which carriers look dead from OUR (c2s) receive
+      // side, named by shared_carrier_id, sent over a healthy load-spread carrier (the one
+      // we've sent on least recently, excluding the dead ones). This reaches the client
+      // even though nothing succeeds on the dead carrier itself. (Phase 2: report only;
+      // the client logs it and does not yet act.)
+      if (now_ns_val - last_carrier_status_ns >= 1000000000ULL) {
+        last_carrier_status_ns = now_ns_val;
+        std::set<int> dead_set(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end());
+        std::vector<uint64_t> dead_ids;
+        for (int dfd : quality.dead_idle_fds) {
+          auto di = carriers.find(dfd);
+          if (di != carriers.end() && di->second.shared_carrier_id != 0)
+            dead_ids.push_back(di->second.shared_carrier_id);
+        }
+        if (!dead_ids.empty()) {
+          // Pick the non-dead carrier we've sent on least recently (spread control load;
+          // every carrier is an equal TCP connection, so "freshness" is noise).
+          int best = -1; uint64_t oldest_send = 0;
+          for (auto& [cfd, cstate] : carriers) {
+            if (dead_set.count(cfd)) continue;
+            uint64_t age = now_ns_val - cstate.last_send_ns;
+            if (best < 0 || age > oldest_send) { best = cfd; oldest_send = age; }
+          }
+          if (best >= 0) {
+            packet_io::append_carrier_status(carriers[best].write_buf, dead_ids);
+            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = best;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, best, &ev);
+            if (dbg) fprintf(dbg, "[carrier-status-sent t=%llu over_fd=%d dead_count=%zu]\n",
+                             (unsigned long long)(now_ns_val/1000000ULL), best, dead_ids.size());
+          }
+        }
+      }
 
       // Reap confidently-dead carriers ourselves. The server can normally only
       // SUGGEST_CLOSE (the client is the master that opens/closes carriers), but a

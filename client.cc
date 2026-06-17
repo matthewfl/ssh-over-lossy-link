@@ -335,6 +335,10 @@ int run_client(const Args& args) {
   if (effective_max_packet == 0) effective_max_packet = 800;
   std::map<int, std::deque<std::pair<uint64_t, uint64_t>>> carrier_pending_acks;  // fd -> [(id, time_ns)]
   uint64_t next_carrier_id_global = 1;
+  // shared_carrier_id -> last time the server reported it dead (via CARRIER_STATUS).
+  // Phase 2: populated and logged only. Phase 3 will act on it (reap the union of this
+  // and our own s2c-dead detection).
+  std::map<uint64_t, uint64_t> server_reported_dead_ns;
 
   // Effective config: when auto_adapt and we have SERVER_CONFIG, use server's; else use local.
   bool has_server_config = false;
@@ -583,6 +587,16 @@ int run_client(const Args& args) {
   recv_cb.on_rs_extra_shard = [&](uint64_t gap_ns) {
     s2c_extra_shard_gap_ns.push_back(gap_ns);
     while (s2c_extra_shard_gap_ns.size() > kMaxSpreadSamples) s2c_extra_shard_gap_ns.pop_front();
+  };
+  recv_cb.on_carrier_status = [&](const std::vector<uint64_t>& dead_ids) {
+    uint64_t now = now_ns();
+    for (uint64_t cid : dead_ids) server_reported_dead_ns[cid] = now;
+    if (dbg) {
+      std::string s;
+      for (uint64_t cid : dead_ids) { s += std::to_string(cid); s += ' '; }
+      fprintf(dbg, "[carrier-status-recv t=%llu server_says_dead=[ %s]]\n",
+              (unsigned long long)(now/1000000ULL), s.c_str());
+    }
   };
   // s2c latency-budget loss estimate (mirrors the server's c2s measurement).
   recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
