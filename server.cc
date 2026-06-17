@@ -223,9 +223,7 @@ int run_server(const Args& args) {
   double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
   bool     have_loss_q = false;
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
-  float s2c_fraction_struggling = 0.0f;
-  bool s2c_can_decrease_rs = false;
-  bool s2c_can_decrease_small = false;
+  float s2c_loss_q = 0.0f;   // client-reported s2c per-shard late fraction (latency-budget method)
   uint64_t s2c_last_received_ns = 0;
   // Shared map for tracking when RS groups decoded so extra shards can be timed.
   std::map<uint64_t, uint64_t> recently_decoded_ns;
@@ -552,9 +550,10 @@ int run_server(const Args& args) {
     (void)avg_shard_spread_ns;
     (void)avg_extra_shard_gap_ns;
     (void)rs_pending_count;
-    s2c_fraction_struggling = fraction_struggling;
-    s2c_can_decrease_rs = can_decrease_rs;
-    s2c_can_decrease_small = can_decrease_small;
+    (void)can_decrease_rs;
+    (void)can_decrease_small;
+    // fraction_struggling now carries the client's latency-budget s2c loss estimate q.
+    s2c_loss_q = fraction_struggling;
     s2c_last_received_ns = now_ns();
   };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
@@ -1168,12 +1167,12 @@ int run_server(const Args& args) {
         have_loss_q = true;
         qest_total_gaps = qest_late_gaps = 0;
       }
-      // s2c struggle (reported by the client) can only raise the loss estimate, never
-      // lower it, so a lossy return path is still protected even though we measure c2s.
-      double q_used = est_loss_q;
+      // A single redundancy value governs BOTH directions, so size it for the worse one:
+      // take the max of our c2s loss estimate and the client's reported s2c loss estimate
+      // (both measured the same latency-budget way). This protects a lopsided link.
       bool s2c_fresh = (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
-      if (s2c_fresh && s2c_fraction_struggling > 0.05f && q_used < 0.05)
-        q_used = 0.05;
+      double q_used = est_loss_q;
+      if (s2c_fresh) q_used = std::max(q_used, static_cast<double>(s2c_loss_q));
 
       const unsigned n_now = static_cast<unsigned>(carriers.size());
       float r_model = carrier_adapt::redundancy_for_stall_bound(n_now, q_used, kTargetStallProb)
@@ -1182,8 +1181,9 @@ int run_server(const Args& args) {
       unsigned copies = carrier_adapt::small_copies_for_loss(q_used, kTargetStallProb);
       runtime_small_packet_redundancy =
           std::min(std::max(2u, n_now), std::max(2u, copies));
-      if (dbg) fprintf(dbg, "[adapt-model t=%llu q=%.3f n=%u r_model=%.2f copies=%u]\n",
-                       (unsigned long long)(now_ns_val/1000000ULL), q_used, n_now,
+      if (dbg) fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u]\n",
+                       (unsigned long long)(now_ns_val/1000000ULL), q_used,
+                       est_loss_q, (double)s2c_loss_q, n_now,
                        (double)runtime_rs_redundancy, copies);
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {

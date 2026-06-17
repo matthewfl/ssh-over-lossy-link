@@ -359,6 +359,14 @@ int run_client(const Args& args) {
   std::deque<uint64_t> s2c_gap_final_ns;
   std::deque<uint64_t> s2c_extra_shard_gap_ns;
   std::deque<uint64_t> s2c_small_extra_copy_gap_ns;  // copy 1->2 gap for small packets (s2c)
+  // s2c per-shard loss estimate (same latency-budget method the server runs for c2s):
+  // a received shard is "late" if its gap from the group's first shard exceeds B. Reported
+  // to the server via CLIENT_METRICS so it can size redundancy for the worse direction.
+  const uint64_t s2c_latency_budget_ns =
+      std::max<uint64_t>(1, args.config.max_added_latency_ms) * 1000000ULL;
+  uint64_t s2c_qest_total_gaps = 0;
+  uint64_t s2c_qest_late_gaps = 0;
+  float    s2c_loss_q = 0.0f;   // smoothed s2c late-fraction; sent in CLIENT_METRICS
   // c2s metrics reported back by server in SERVER_METRICS.
   uint64_t c2s_avg_shard_spread_ns  = 0;
   uint64_t c2s_avg_extra_shard_gap_ns = 0;
@@ -500,9 +508,17 @@ int run_client(const Args& args) {
     if (it == carriers.end()) return;
     auto m = carrier_adapt::compute_from_deques(s2c_shard_spread_ns, s2c_gap_final_ns,
                                                 s2c_extra_shard_gap_ns, s2c_small_extra_copy_gap_ns);
+    // Refresh the s2c loss estimate from the latency-budget counters and send it in the
+    // (repurposed) fraction_struggling field; the server takes max(c2s_q, s2c_q).
+    if (s2c_qest_total_gaps >= 100) {
+      float q = static_cast<float>(s2c_qest_late_gaps) / static_cast<float>(s2c_qest_total_gaps);
+      if (q > 0.5f) q = 0.5f;
+      s2c_loss_q = 0.5f * s2c_loss_q + 0.5f * q;
+      s2c_qest_total_gaps = s2c_qest_late_gaps = 0;
+    }
     packet_io::append_client_metrics(it->second.write_buf,
                                     m.avg_shard_spread_ns, m.avg_extra_shard_gap_ns,
-                                    m.fraction_struggling,
+                                    s2c_loss_q,
                                     static_cast<uint32_t>(rs_pending.size()),
                                     m.can_decrease_rs, m.can_decrease_small);
     ev.events = EPOLLIN | EPOLLOUT;
@@ -567,6 +583,11 @@ int run_client(const Args& args) {
   recv_cb.on_rs_extra_shard = [&](uint64_t gap_ns) {
     s2c_extra_shard_gap_ns.push_back(gap_ns);
     while (s2c_extra_shard_gap_ns.size() > kMaxSpreadSamples) s2c_extra_shard_gap_ns.pop_front();
+  };
+  // s2c latency-budget loss estimate (mirrors the server's c2s measurement).
+  recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
+    s2c_qest_total_gaps += 1;
+    if (gap_ns > s2c_latency_budget_ns) s2c_qest_late_gaps += 1;
   };
   recv_cb.on_small_extra_copy = [&](uint64_t gap_ns) {
     s2c_small_extra_copy_gap_ns.push_back(gap_ns);
