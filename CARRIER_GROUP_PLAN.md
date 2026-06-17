@@ -1,6 +1,13 @@
 # Plan: manage carriers as a synced group
 
-Status: design / not yet implemented. Goal: cut interactive latency on a high-RTT,
+Status: IMPLEMENTED on branch `carrier-group` (phases 1–6). One design change during
+build: the per-shard `first_carrier` field proved unnecessary — because every group sends
+one shard per carrier (`n` = carrier count), a carrier silent while peers deliver already
+*is* the "didn't deliver its assigned shard" signal via the phase-1 `fd→shared_carrier_id`
+map. So attribution needs no extra wire field; `rx_dead` (silent-while-peers-active) is the
+detector. Each phase was verified in isolation and the full suite stayed 23/23 throughout.
+
+Goal: cut interactive latency on a high-RTT,
 lossy, many-carrier link by (a) removing self-inflicted head-of-line delay from routine
 control traffic, and (b) detecting dead carriers from the data we already send instead
 of from blanket pings.
