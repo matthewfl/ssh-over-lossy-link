@@ -122,7 +122,12 @@ bool process_carrier_read(
       continue;
     }
     if (h->packet_kind == PacketKind::START_CONNECTION) {
-      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketHeader));
+      if (s.read_buf.size() < sizeof(PacketStartConnection)) break;
+      PacketStartConnection psc;
+      memcpy(&psc, s.read_buf.data(), sizeof(psc));
+      s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketStartConnection));
+      s.shared_carrier_id = psc.carrier_id;
+      if (callbacks.on_start_connection) callbacks.on_start_connection(fd, psc.carrier_id);
       continue;
     }
     if (h->packet_kind == PacketKind::READY) {
@@ -412,6 +417,14 @@ void append_ready(std::vector<uint8_t>& out) {
   h.id = 0;
   h.packet_kind = PacketKind::READY;
   out.insert(out.end(), reinterpret_cast<uint8_t*>(&h), reinterpret_cast<uint8_t*>(&h) + sizeof h);
+}
+
+void append_start_connection(std::vector<uint8_t>& out, uint64_t carrier_id) {
+  PacketStartConnection p{};
+  p.header.id = 0;
+  p.header.packet_kind = PacketKind::START_CONNECTION;
+  p.carrier_id = carrier_id;
+  out.insert(out.end(), reinterpret_cast<uint8_t*>(&p), reinterpret_cast<uint8_t*>(&p) + sizeof p);
 }
 
 void append_suggest_close(std::vector<uint8_t>& out) {

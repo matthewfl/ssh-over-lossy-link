@@ -53,6 +53,14 @@ struct PacketReedSolomon {
   uint8_t data[1];     // variable; exactly size bytes
 };
 
+// Client -> server: first packet on a newly connected carrier. Tells the server this
+// connection's shared carrier id (the client is the sole carrier authority), so both
+// sides can name the same carrier when reporting health / attributing RS shards.
+struct PacketStartConnection {
+  PacketHeader header;
+  uint64_t carrier_id;
+};
+
 // Client -> server: configure redundancy and transmission.
 struct PacketConfig {
   PacketHeader header;

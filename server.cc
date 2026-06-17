@@ -506,6 +506,12 @@ int run_server(const Args& args) {
     c2s_small_extra_copy_gap_ns.push_back(gap_ns);
     while (c2s_small_extra_copy_gap_ns.size() > kMaxSpreadSamples) c2s_small_extra_copy_gap_ns.pop_front();
   };
+  recv_cb.on_start_connection = [&](int fd, uint64_t carrier_id) {
+    auto it = carriers.find(fd);
+    if (it != carriers.end()) it->second.shared_carrier_id = carrier_id;
+    if (dbg) fprintf(dbg, "[carrier-hello fd=%d shared_carrier_id=%llu]\n",
+                     fd, (unsigned long long)carrier_id);
+  };
   recv_cb.on_ping = [&](int fd, uint64_t id, size_t payload_size) { send_pong(fd, id, payload_size); };
   // Client may send SUGGEST_CLOSE when it has decided a carrier is dead or being
   // replaced. Mark it and close in the event loop after packet parsing returns.

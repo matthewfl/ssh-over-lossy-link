@@ -25,6 +25,7 @@ struct CarrierState {
   std::vector<uint8_t> write_buf;
   size_t write_pos = 0;
   uint64_t carrier_id = 0;   // logical, monotonically increasing id; distinct from OS fd
+  uint64_t shared_carrier_id = 0;  // client-assigned id synced to BOTH sides (group namespace)
   bool connecting = false;    // client: true until connect() completes
   uint64_t last_rtt_ns = 0;   // last RTT measured via ACK on this carrier
   uint64_t last_recv_ns = 0;  // last time any packet arrived on this carrier
@@ -49,6 +50,9 @@ struct ReceiveCallbacks {
   // Delivered contiguous data. completing_fd is the carrier whose shard triggered delivery (use for ACK).
   // Server writes to backend and queues ACK on completing_fd; client writes to stdout and ACKs on completing_fd.
   std::function<void(int completing_fd, uint64_t id, const uint8_t* data, size_t len)> on_deliver;
+  // Client -> server START_CONNECTION: the new carrier's shared carrier_id. Server records
+  // fd -> carrier_id so it can name this carrier in health/attribution messages.
+  std::function<void(int fd, uint64_t carrier_id)> on_start_connection;
   // Client -> server PING; server should send PONG. Server -> client PING; client should send PONG.
   // payload_size: if >0, PING had keepalive payload; responder should send PONG with payload.
   std::function<void(int fd, uint64_t id, size_t payload_size)> on_ping;
@@ -146,6 +150,7 @@ void append_pong(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload,
 void append_ping(std::vector<uint8_t>& out, uint64_t id);
 void append_ping(std::vector<uint8_t>& out, uint64_t id, const uint8_t* payload, size_t payload_len);
 void append_ready(std::vector<uint8_t>& out);
+void append_start_connection(std::vector<uint8_t>& out, uint64_t carrier_id);
 void append_suggest_close(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
                            uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,

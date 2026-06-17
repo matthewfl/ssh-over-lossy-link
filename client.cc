@@ -1029,6 +1029,15 @@ int run_client(const Args& args) {
           if (err == 0) {
             it->second.connecting = false;
             it->second.connect_ns = now_ns();
+            // First packet on a new carrier: tell the server its shared carrier id so both
+            // sides can name this carrier in health/attribution messages. The client's
+            // local carrier_id IS the shared id (the client is the carrier authority).
+            if (it->second.carrier_id == 0) it->second.carrier_id = next_carrier_id_global++;
+            it->second.shared_carrier_id = it->second.carrier_id;
+            packet_io::append_start_connection(it->second.write_buf, it->second.carrier_id);
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
             // Catch-up cumulative ACK: a freshly connected carrier is our first chance
             // to tell the server how much s2c data we've already delivered to stdout, in
             // case ACKs were lost while carriers were down. Without this the server can
