@@ -843,11 +843,6 @@ int run_server(const Args& args) {
     // 500 ms: detect dead carriers promptly so we send SUGGEST_CLOSE and client can recover quickly.
     if (now_ns_val - last_ping_check_ns >= 500000000ULL) {
       last_ping_check_ns = now_ns_val;
-      // Keepalive ping floor MUST stay below the dead-idle floor (3 s in assess_carriers):
-      // otherwise an idle carrier is flagged dead at 3 s before this ping fires, the dead-skip
-      // below never pings it, and it drifts to "dead_idle" forever (never kept warm). See the
-      // matching comment in client.cc.
-      uint64_t ping_idle_ns = scaled_ns(2, 2000000000ULL, 30000000000ULL);
 
       std::vector<carrier_adapt::CarrierInfo> carrier_infos;
       for (auto& [cfd, cs] : carriers) {
@@ -926,37 +921,10 @@ int run_server(const Args& args) {
           !backend_pending.empty() ||
           !reassembly.empty() ||
           !rs_pending.empty();
-      uint64_t ping_fail_ns = scaled_ns(8, 30000000000ULL, 180000000000ULL);  // 30s..180s
-
-      // Send PING to idle carriers; dead ones get SUGGEST_CLOSE (skip PING).
-      for (auto& [cfd, cs] : carriers) {
-        bool is_dead = std::find(quality.dead_idle_fds.begin(), quality.dead_idle_fds.end(), cfd)
-            != quality.dead_idle_fds.end();
-        if (is_dead) continue;
-        if (auto itp = outstanding_ping_ns.find(cfd); itp != outstanding_ping_ns.end()) {
-          uint64_t age_ns = now_ns_val - itp->second;
-          if (age_ns > ping_fail_ns && heavy_backlog
-              && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
-            last_suggest_close_ns = now_ns_val;
-            packet_io::append_suggest_close(cs.write_buf);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-            if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=ping_timeout age_ms=%llu]\n",
-                             (unsigned long long)(now_ns_val/1000000ULL), cfd,
-                             (unsigned long long)(age_ns/1000000ULL));
-          }
-          continue;  // don't stack another ping while one is outstanding
-        }
-        if (carrier_adapt::should_send_idle_ping(cs.write_buf.empty(), now_ns_val,
-                                                 cs.last_send_ns, cs.last_recv_ns, ping_idle_ns)) {
-          packet_io::append_ping(cs.write_buf, 0);
-          outstanding_ping_ns[cfd] = now_ns_val;
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = cfd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-        }
-      }
+      // (Blanket idle-pinging removed: a lost PING head-of-line-blocks that carrier's next
+      // s2c data shard. Dead carriers are now detected from data — our c2s rx_dead feeds
+      // CARRIER_STATUS to the client, and the client detects s2c-dead itself — and s2c RTT
+      // comes from client ACKs. min-data keepalive below still covers firewall/NAT.)
 
       // --min-data-per-minute: keep each carrier sending at a slow, *steady* rate so a
       // firewall/NAT never sees a long idle gap. The per-minute budget is spread over
@@ -976,7 +944,6 @@ int run_server(const Args& args) {
             cs.last_window_reset_ns = now_ns_val;
           }
           if (cs.bytes_sent_this_window < target && cs.write_buf.empty()) {
-            if (outstanding_ping_ns.count(cfd)) continue;
             size_t len = std::min<size_t>(target - cs.bytes_sent_this_window, pkt_max);
             std::vector<uint8_t> payload(len);
             std::uniform_int_distribution<int> byte_dist(0, 255);
