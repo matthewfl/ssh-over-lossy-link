@@ -222,6 +222,7 @@ int run_server(const Args& args) {
   uint64_t qest_late_gaps = 0;
   double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
   bool     have_loss_q = false;
+  std::deque<uint64_t> qest_recent_gaps;  // recent shard gaps (for percentile diagnostics / B tuning)
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
   float s2c_loss_q = 0.0f;   // client-reported s2c per-shard late fraction (latency-budget method)
   uint64_t s2c_last_received_ns = 0;
@@ -494,6 +495,8 @@ int run_server(const Args& args) {
   recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
     qest_total_gaps += 1;
     if (gap_ns > kLatencyBudgetNs) qest_late_gaps += 1;
+    qest_recent_gaps.push_back(gap_ns);
+    if (qest_recent_gaps.size() > 2000) qest_recent_gaps.pop_front();
   };
   recv_cb.on_rs_extra_shard = [&](uint64_t gap_ns) {
     c2s_extra_shard_gap_ns.push_back(gap_ns);
@@ -1181,10 +1184,25 @@ int run_server(const Args& args) {
       unsigned copies = carrier_adapt::small_copies_for_loss(q_used, kTargetStallProb);
       runtime_small_packet_redundancy =
           std::min(std::max(2u, n_now), std::max(2u, copies));
-      if (dbg) fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u]\n",
-                       (unsigned long long)(now_ns_val/1000000ULL), q_used,
-                       est_loss_q, (double)s2c_loss_q, n_now,
-                       (double)runtime_rs_redundancy, copies);
+      if (dbg) {
+        // Shard-gap percentiles (ms) so the latency budget B can be tuned: set B above the
+        // "normal" spread (around p50-p90) but below a retransmit-scale delay (the tail).
+        uint64_t g50 = 0, g90 = 0, g99 = 0;
+        if (!qest_recent_gaps.empty()) {
+          std::vector<uint64_t> g(qest_recent_gaps.begin(), qest_recent_gaps.end());
+          std::sort(g.begin(), g.end());
+          g50 = g[g.size() * 50 / 100];
+          g90 = g[g.size() * 90 / 100];
+          g99 = g[std::min(g.size() - 1, g.size() * 99 / 100)];
+        }
+        fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u "
+                     "B_ms=%llu gap_ms_p50=%.1f p90=%.1f p99=%.1f]\n",
+                (unsigned long long)(now_ns_val/1000000ULL), q_used,
+                est_loss_q, (double)s2c_loss_q, n_now,
+                (double)runtime_rs_redundancy, copies,
+                (unsigned long long)(kLatencyBudgetNs/1000000ULL),
+                g50/1e6, g90/1e6, g99/1e6);
+      }
 
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
