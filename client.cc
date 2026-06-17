@@ -1299,7 +1299,12 @@ int run_client(const Args& args) {
             pending_connect_started_ns.erase(idx);
           }
         }
-        uint64_t ping_idle_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
+        // Keepalive ping floor MUST stay below the dead-idle floor (3 s in assess_carriers):
+        // otherwise an idle carrier is flagged dead at 3 s before this 5 s ping ever fires,
+        // and the dead-skip below then never pings it — so it is never kept warm and drifts
+        // to "dead_idle" forever (NAT/firewall then silently drops it -> dead-but-open). At
+        // 2 s + one ~500 ms loop it always refreshes (last_send + PONG) before the 3 s flag.
+        uint64_t ping_idle_ns = scaled_ns(2, 2000000000ULL, 30000000000ULL);
 
         std::vector<carrier_adapt::CarrierInfo> carrier_infos;
         for (auto& [cfd, cs] : carriers) {

@@ -817,7 +817,11 @@ int run_server(const Args& args) {
     // 500 ms: detect dead carriers promptly so we send SUGGEST_CLOSE and client can recover quickly.
     if (now_ns_val - last_ping_check_ns >= 500000000ULL) {
       last_ping_check_ns = now_ns_val;
-      uint64_t ping_idle_ns = scaled_ns(2, 5000000000ULL, 30000000000ULL);
+      // Keepalive ping floor MUST stay below the dead-idle floor (3 s in assess_carriers):
+      // otherwise an idle carrier is flagged dead at 3 s before this ping fires, the dead-skip
+      // below never pings it, and it drifts to "dead_idle" forever (never kept warm). See the
+      // matching comment in client.cc.
+      uint64_t ping_idle_ns = scaled_ns(2, 2000000000ULL, 30000000000ULL);
 
       std::vector<carrier_adapt::CarrierInfo> carrier_infos;
       for (auto& [cfd, cs] : carriers) {
