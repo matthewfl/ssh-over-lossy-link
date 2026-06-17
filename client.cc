@@ -407,7 +407,6 @@ int run_client(const Args& args) {
 
   // Timing for periodic operations that don't depend on carrier events.
   uint64_t last_ping_check_ns       = 0;
-  uint64_t last_keepalive_check_ns  = 0;
   uint64_t last_client_metrics_ns    = 0;
   const uint64_t client_metrics_interval_ns = 400 * 1000000ULL;  // 400ms, match server SERVER_METRICS
   uint64_t last_rs_drain_ns                = 0;
@@ -1354,21 +1353,28 @@ int run_client(const Args& args) {
           }
         }
 
-        // --min-data-per-minute: send keepalive data every few seconds so links stay active.
+        // --min-data-per-minute: keep each carrier sending at a slow, *steady* rate so a
+        // firewall/NAT never sees a long idle gap. The per-minute budget is spread over
+        // 3-second windows (60s / 3s = 20 windows/min): each window must carry min_bpm/20
+        // bytes, topped up with a small keepalive when real traffic (data, ACKs, idle pings)
+        // falls short. Spreading it this way — rather than one 60s budget — stops a carrier
+        // from satisfying its whole minute quota in an early burst and then going silent for
+        // the rest of the minute (which is exactly when a firewall would drop it). This runs
+        // every ping-check tick (~500 ms), so the top-up lands inside the same window it
+        // counts toward (no every-other-window alternation).
         const unsigned min_bpm = args.config.min_data_per_minute;
-        if (min_bpm > 0 && now_p - last_keepalive_check_ns >= 4000000000ULL) {
-          last_keepalive_check_ns = now_p;
-          const uint64_t minute_ns = 60 * 1000000000ULL;
+        if (min_bpm > 0) {
+          const uint64_t window_ns = 3000000000ULL;                      // 3 s
+          const uint64_t target = std::max<uint64_t>(1, min_bpm / 20);   // bytes per window
+          const size_t pkt_max = std::max<size_t>(1, effective_max_packet);
           for (auto& [cfd, cs] : carriers) {
             if (cs.connecting) continue;
-            if (now_p - cs.last_minute_reset_ns >= minute_ns) {
-              cs.bytes_sent_this_minute = 0;
-              cs.last_minute_reset_ns = now_p;
+            if (now_p - cs.last_window_reset_ns >= window_ns) {
+              cs.bytes_sent_this_window = 0;
+              cs.last_window_reset_ns = now_p;
             }
-            if (cs.bytes_sent_this_minute < min_bpm && cs.write_buf.empty()) {
-              size_t pkt_max = effective_max_packet;
-              std::uniform_int_distribution<size_t> len_dist(50, std::max(size_t(50), pkt_max));
-              size_t len = len_dist(keepalive_gen);
+            if (cs.bytes_sent_this_window < target && cs.write_buf.empty()) {
+              size_t len = std::min<size_t>(target - cs.bytes_sent_this_window, pkt_max);
               std::vector<uint8_t> payload(len);
               std::uniform_int_distribution<int> byte_dist(0, 255);
               for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(byte_dist(keepalive_gen));

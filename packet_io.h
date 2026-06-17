@@ -30,8 +30,8 @@ struct CarrierState {
   uint64_t last_recv_ns = 0;  // last time any packet arrived on this carrier
   uint64_t last_send_ns = 0;  // last time bytes were actually written to this carrier fd
   uint64_t connect_ns = 0;    // when this carrier finished connecting (set by caller)
-  uint64_t bytes_sent_this_minute = 0;  // for --min-data-per-minute keepalive
-  uint64_t last_minute_reset_ns = 0;    // when bytes_sent_this_minute was last reset
+  uint64_t bytes_sent_this_window = 0;  // bytes flushed in the current --min-data keepalive window
+  uint64_t last_window_reset_ns = 0;    // when bytes_sent_this_window was last reset
 };
 
 // Per-id state when collecting Reed-Solomon shards.

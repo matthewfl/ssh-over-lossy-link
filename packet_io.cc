@@ -475,7 +475,7 @@ void flush_carrier_writes(
         goto next;
       }
       s.write_pos += n;
-      s.bytes_sent_this_minute += static_cast<size_t>(n);
+      s.bytes_sent_this_window += static_cast<size_t>(n);
       s.last_send_ns = static_cast<uint64_t>(
           std::chrono::steady_clock::now().time_since_epoch().count());
     }
