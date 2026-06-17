@@ -433,6 +433,7 @@ int run_client(const Args& args) {
   const uint64_t client_metrics_interval_ns = 400 * 1000000ULL;  // 400ms, match server SERVER_METRICS
   uint64_t last_rs_drain_ns                = 0;
   uint64_t next_deliver_id_stuck_since_ns  = 0;  // when gap at next_deliver_id first appeared
+  uint64_t last_deliver_advance_ns = 0;  // last time we delivered s2c data (for mass-death stall detection)
   uint64_t last_retransmit_check_ns = 0;
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
@@ -572,6 +573,7 @@ int run_client(const Args& args) {
   packet_io::ReceiveCallbacks recv_cb;
   recv_cb.on_deliver = [&](int cfd, uint64_t id, const uint8_t* data, size_t len) {
     stdout_buf.insert(stdout_buf.end(), data, data + len);
+    last_deliver_advance_ns = now_ns();
     // ACK on the completing carrier so the server gets per-carrier RTT measurements.
     // Fall back to any carrier if completing_fd was already closed.
     if (carriers.empty()) return;
@@ -1399,6 +1401,24 @@ int run_client(const Args& args) {
           const uint64_t report_fresh_ns = 2500000000ULL;       // server "currently dead"
           const uint64_t confirm_timeout_ns = scaled_ns(8, 2000000000ULL, 30000000000ULL);
           std::set<int> rx_dead(quality.rx_dead_fds.begin(), quality.rx_dead_fds.end());
+          // Mass-death fast path: if s2c delivery has stalled (data pending but next_deliver_id
+          // not advancing) AND a large subset of carriers just went silent, this is a
+          // correlated drop that IS blocking latency — don't wait out the per-carrier confirm
+          // ping, batch-reap the silent carriers now so the floor reopens fresh ones. (When
+          // delivery is still flowing, redundancy is covering the loss, so a single dead
+          // carrier is in no rush and takes the confirm path.)
+          size_t n_live = 0;
+          for (auto& [f, c] : carriers) if (!c.connecting) ++n_live;
+          bool data_pending = !rs_pending.empty() || !reassembly.empty();
+          uint64_t stall_ns = scaled_ns(4, 1500000000ULL, 30000000000ULL);
+          bool delivery_stalled = data_pending && last_deliver_advance_ns > 0 &&
+                                  (now_p - last_deliver_advance_ns > stall_ns);
+          bool mass_death = delivery_stalled &&
+                            rx_dead.size() >= std::max<size_t>(2, n_live / 4);
+          if (mass_death && dbg)
+            fprintf(dbg, "[mass-death t=%llu rx_dead=%zu live=%zu stalled_ms=%llu]\n",
+                    (unsigned long long)(now_p/1000000ULL), rx_dead.size(), n_live,
+                    (unsigned long long)((now_p - last_deliver_advance_ns)/1000000ULL));
           std::vector<std::pair<int,const char*>> to_reap;
           for (auto& [cfd, cs] : carriers) {
             if (cs.connecting) continue;
@@ -1410,8 +1430,10 @@ int run_client(const Args& args) {
                 continue;
               }
             }
-            // s2c dead (silent while peers deliver): confirm with a targeted ping.
+            // s2c dead (silent while peers deliver).
             if (rx_dead.count(cfd)) {
+              if (mass_death) { to_reap.push_back({cfd, "mass_death"}); continue; }
+              // Otherwise confirm with a targeted ping (no rush — redundancy is covering).
               auto cp = confirm_ping_sent_ns.find(cfd);
               if (cp == confirm_ping_sent_ns.end()) {
                 packet_io::append_ping(cs.write_buf, next_send_id);
