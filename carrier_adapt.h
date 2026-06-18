@@ -79,6 +79,10 @@ struct CarrierQualityResult {
   // receives, so without this the server would retain stale carriers forever and waste
   // retransmits on them instead of reaching the client's live carriers.
   std::vector<int> reap_fds;
+  // Carriers silent on our receive side while a peer carrier received much more recently
+  // ("rx-dead": delivering nothing while the link is clearly up). Distinct from idle_dead
+  // (everyone quiet) — used for group dead-carrier detection without blanket pings.
+  std::vector<int> rx_dead_fds;
   int rtt_outlier_fd = -1;         // worst carrier when 5× median; -1 if none
 };
 

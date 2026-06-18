@@ -204,6 +204,7 @@ CarrierQualityResult assess_carriers(
       if (recv_gap > dead_idle_ns)
         rx_dead = true;
     }
+    if (rx_dead) res.rx_dead_fds.push_back(c.fd);
 
     // Send-only zombie: we are actively writing to this carrier (so the idle test above
     // is defeated by an advancing last_send_ns) but it has delivered nothing back for a

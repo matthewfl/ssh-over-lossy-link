@@ -25,6 +25,7 @@ enum class PacketKind : uint8_t {
   READY = 9,              // server -> client; sent when carrier connects, confirms link is up
   SUGGEST_CLOSE = 10,     // server -> client; suggests client close this carrier (dead or slow)
   CLIENT_METRICS = 11,    // client -> server; s2c path quality so server can adapt using both directions
+  CARRIER_STATUS = 12,    // either direction; shared_carrier_ids the sender sees as dead (sent over a healthy carrier)
 };
 
 #pragma pack(push, 1)
@@ -51,6 +52,14 @@ struct PacketReedSolomon {
   uint8_t k;
   uint8_t shard_index; // which shard 0..n-1
   uint8_t data[1];     // variable; exactly size bytes
+};
+
+// Client -> server: first packet on a newly connected carrier. Tells the server this
+// connection's shared carrier id (the client is the sole carrier authority), so both
+// sides can name the same carrier when reporting health / attributing RS shards.
+struct PacketStartConnection {
+  PacketHeader header;
+  uint64_t carrier_id;
 };
 
 // Client -> server: configure redundancy and transmission.
@@ -100,6 +109,16 @@ struct PacketClientMetrics {
   uint8_t can_decrease_small; // p90 first→median gap < 1.5ms on s2c
 };
 
+// Either direction: the shared_carrier_ids the sender currently believes are dead (its
+// receive side has gone silent on them while peers keep delivering). Sent over a healthy
+// carrier so the news arrives even though nothing succeeds on the dead carrier itself.
+// Header followed by `count` little-endian uint64 carrier ids.
+struct PacketCarrierStatus {
+  PacketHeader header;
+  uint16_t count;
+  // uint64_t dead_carrier_ids[count];
+};
+
 #pragma pack(pop)
 
 // -----------------------------------------------------------------------------
@@ -117,7 +136,10 @@ struct Config {
   float max_delay_ms = 1.0f;
   unsigned rtt_hint_ms = 0;  // 0 = auto from observed latency; else hint for cold-start timeouts
   unsigned connect_timeout_sec = 30;  // SSH ConnectTimeout; 0 = no timeout (wait indefinitely)
-  unsigned min_data_per_minute = 0;   // when >0, send keepalive data so each carrier sends ≥N bytes/min
+  unsigned min_data_per_minute = 100;  // keepalive: each carrier sends >=N bytes/min (spread over
+                                       // 10s windows) so an idle link still touches every carrier and
+                                       // a firewall/NAT doesn't close it. 0 disables. This is the ONLY
+                                       // idle keepalive (blanket pinging was removed); default it on.
   unsigned reconnect_timeout_sec = 0; // global idle timeout; 0 = adaptive (12×RTT, min 60 s, max 300 s)
   unsigned max_added_latency_ms = 10; // RS stall-model latency budget B: a shard arriving >B after
                                       // its group's first shard counts as "late" (drives redundancy)
