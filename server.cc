@@ -926,17 +926,16 @@ int run_server(const Args& args) {
       // CARRIER_STATUS to the client, and the client detects s2c-dead itself — and s2c RTT
       // comes from client ACKs. min-data keepalive below still covers firewall/NAT.)
 
-      // --min-data-per-minute: keep each carrier sending at a slow, *steady* rate so a
-      // firewall/NAT never sees a long idle gap. The per-minute budget is spread over
-      // 3-second windows (60s / 3s = 20 windows/min): each window carries min_bpm/20 bytes,
-      // topped up with a small keepalive when real traffic falls short — so a carrier can't
-      // satisfy its whole minute quota in an early burst and then go silent for the rest of
-      // the minute. Runs every ping-check tick (~500 ms) so the top-up lands inside the same
-      // window it counts toward. (See the matching block in client.cc.)
+      // --min-data-per-minute: the link's idle keepalive (on by default). Keep each carrier
+      // sending at a slow, steady rate so a firewall/NAT never sees a long idle gap. The
+      // per-minute budget is spread over 10-second windows (6 windows/min): each carries
+      // min_bpm/6 bytes, topped up with a small keepalive when real traffic falls short. A
+      // 10s window keeps the default packet rate low (~6/min/carrier) while bounding the idle
+      // gap to ~10s. Runs every ping-check tick (~500 ms). (See the matching block in client.cc.)
       const unsigned min_bpm = args.config.min_data_per_minute;
       if (min_bpm > 0) {
-        const uint64_t window_ns = 3000000000ULL;                      // 3 s
-        const uint64_t target = std::max<uint64_t>(1, min_bpm / 20);   // bytes per window
+        const uint64_t window_ns = 10000000000ULL;                    // 10 s
+        const uint64_t target = std::max<uint64_t>(1, min_bpm / 6);   // bytes per 10s window
         const size_t pkt_max = std::max<size_t>(1, std::min(max_packet, static_cast<size_t>(MAX_PACKET_PAYLOAD)));
         for (auto& [cfd, cs] : carriers) {
           if (now_ns_val - cs.last_window_reset_ns >= window_ns) {

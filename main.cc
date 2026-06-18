@@ -93,7 +93,7 @@ void usage(const char* program_name) {
     << c.rtt_hint_ms << "\n"
     << "  --connect-timeout N           SSH ConnectTimeout (seconds); 0 = no limit. Default: "
     << c.connect_timeout_sec << "\n"
-    << "  --min-data-per-minute N       Send keepalive data so each carrier sends ≥N bytes/min. Default: "
+    << "  --min-data-per-minute N       Idle keepalive: each carrier sends >=N bytes/min (10s windows) so a firewall doesn't close an idle link; 0 disables. Default: "
     << c.min_data_per_minute << "\n"
     << "  --max-added-latency-ms N      RS redundancy budget: a shard arriving >N ms after its group's\n"
     << "                                first counts as 'late'; lower N = more parity for tighter latency. Default: "

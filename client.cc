@@ -1473,19 +1473,19 @@ int run_client(const Args& args) {
           }
         }
 
-        // --min-data-per-minute: keep each carrier sending at a slow, *steady* rate so a
-        // firewall/NAT never sees a long idle gap. The per-minute budget is spread over
-        // 3-second windows (60s / 3s = 20 windows/min): each window must carry min_bpm/20
-        // bytes, topped up with a small keepalive when real traffic (data, ACKs, idle pings)
-        // falls short. Spreading it this way — rather than one 60s budget — stops a carrier
-        // from satisfying its whole minute quota in an early burst and then going silent for
-        // the rest of the minute (which is exactly when a firewall would drop it). This runs
-        // every ping-check tick (~500 ms), so the top-up lands inside the same window it
-        // counts toward (no every-other-window alternation).
+        // --min-data-per-minute: the link's idle keepalive (on by default). Keep each carrier
+        // sending at a slow, *steady* rate so a firewall/NAT never sees a long idle gap and
+        // closes the carrier. The per-minute budget is spread over 10-second windows
+        // (60s / 10s = 6 windows/min): each window must carry min_bpm/6 bytes, topped up with
+        // a small keepalive when real traffic (data, ACKs) falls short. Spreading it — rather
+        // than one 60s budget — stops a carrier from satisfying its whole minute quota in an
+        // early burst and then going silent for the rest of the minute. A 10s window keeps the
+        // default packet rate low (~6/min/carrier) while bounding the idle gap to ~10s. Runs
+        // every ping-check tick (~500 ms) so the top-up lands inside the window it counts toward.
         const unsigned min_bpm = args.config.min_data_per_minute;
         if (min_bpm > 0) {
-          const uint64_t window_ns = 3000000000ULL;                      // 3 s
-          const uint64_t target = std::max<uint64_t>(1, min_bpm / 20);   // bytes per window
+          const uint64_t window_ns = 10000000000ULL;                    // 10 s
+          const uint64_t target = std::max<uint64_t>(1, min_bpm / 6);   // bytes per 10s window
           const size_t pkt_max = std::max<size_t>(1, effective_max_packet);
           for (auto& [cfd, cs] : carriers) {
             if (cs.connecting) continue;

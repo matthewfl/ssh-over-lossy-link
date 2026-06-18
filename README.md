@@ -84,7 +84,7 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --max-delay [N]               Max delay in ms for sending data while waiting for buffer to fill for Reed–Solomon.  Default 1ms
 --rtt-ms [N]                  Hint RTT (ms) for cold-start timeouts; 0 = auto from observed link latency. Use on high-latency links to avoid premature timeouts before first ACK. Default 0
 --connect-timeout [N]         SSH ConnectTimeout in seconds for carrier connections; 0 = no limit. Default 30
---min-data-per-minute [N]     Send keepalive data so each carrier sends ≥N bytes/min in each direction (keeps NAT/firewall state alive on idle links). Default 0 (off)
+--min-data-per-minute [N]     Idle keepalive: each carrier sends ≥N bytes/min in each direction (spread over 10s windows) so a firewall/NAT doesn't close an idle link. This is the only idle keepalive (blanket pinging was removed). Default 100; set 0 to disable
 --reconnect-timeout [N]       Global idle timeout in seconds before giving up; 0 = adaptive (12×RTT, min 60 s, max 300 s); else 1–7200. Default 0
 --file-lock PATH              Acquire an exclusive lock on PATH (flock, 15 s timeout) before client start, to serialize concurrent client launches.
 --debug                       Write verbose debug logs to /tmp/ssh-oll-{client,server}-<pid>.log.
