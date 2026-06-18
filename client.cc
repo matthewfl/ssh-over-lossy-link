@@ -382,9 +382,11 @@ int run_client(const Args& args) {
   std::vector<int> pending_reap;  // carriers to close once a replacement has connected (or slowly when above target)
   uint64_t last_reap_ns = 0;
   uint64_t last_reduction_close_ns = 0;  // rate-limit: at most 1 close per 60s when reducing from above target
+  uint64_t last_excess_release_ns = 0;   // rate-limit: release 1 excess carrier per interval when rs is low
   uint64_t last_recovery_log_ns = 0;  // rate-limit: "still waiting" message when carriers.empty()
   const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
   static constexpr uint64_t reduction_close_interval_ns = 60 * 1000000000ULL;  // 60s between reduction closes
+  static constexpr uint64_t excess_release_interval_ns = 15 * 1000000000ULL;   // 15s between excess releases
 
   // RTT-scaled timeouts: use observed latency so low-latency links get tighter timeouts,
   // high-latency links get longer. Cold start uses rtt_hint_ms or 5 s conservative default,
@@ -1523,6 +1525,31 @@ int run_client(const Args& args) {
         size_t backlog_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
         const bool heavy_backlog = carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_sends.size());
+
+        // Release excess carriers when redundancy is low (the link is good): we grow above
+        // target under redundancy pressure (rs > 0.3), so when rs falls well below that the
+        // extra carriers aren't needed — reduce back toward target so the count tracks need
+        // instead of ratcheting up. Hysteresis (shrink <0.2, grow >0.3) + a slow rate avoid
+        // oscillation. Runs in ALL modes (the dead-idle reap below is gated and skipped in
+        // light SSH traffic, which would otherwise leave grown carriers stuck forever).
+        if (args.config.auto_adapt && carriers.size() > target_carriers && !heavy_backlog
+            && effective_rs_redundancy < 0.2f
+            && now_p - last_excess_release_ns >= excess_release_interval_ns) {
+          int to_close = -1;
+          for (auto& [cfd, cs] : carriers) {
+            if (cs.connecting) continue;
+            if (std::find(pending_reap.begin(), pending_reap.end(), cfd) != pending_reap.end()) continue;
+            to_close = cfd; break;
+          }
+          if (to_close >= 0) {
+            last_excess_release_ns = now_p;
+            packet_io::append_suggest_close(carriers[to_close].write_buf);
+            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = to_close;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, to_close, &ev);
+            remove_carrier(to_close, "excess_release");
+          }
+        }
+
         // In SSH mode, false-positive dead-idle classification can trigger
         // self-inflicted carrier churn. Only run dead-idle reap logic when
         // backlog pressure is genuinely high.

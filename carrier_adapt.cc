@@ -197,11 +197,20 @@ CarrierQualityResult assess_carriers(
     // time while at least one peer *has* recently received data. This catches
     // "zombie" carriers that we can still write to (so last_send_ns keeps
     // advancing) but that never deliver shards back.
+    //
+    // The threshold MUST exceed the idle-keepalive interval (--min-data, ~10s windows):
+    // an alive carrier receives a keepalive PONG / data at least every ~10s, so its gap
+    // behind the freshest carrier stays well under this. Using the short dead_idle (3s)
+    // here mis-flagged healthy carriers that were merely *between* keepalives (or between
+    // interactive bursts) while another carrier had just received — reaping live carriers
+    // and churning the count. A genuinely dead carrier gets no keepalive and blows past
+    // this bound; single-carrier detection is intentionally slow (redundancy covers it,
+    // and a correlated mass drop is caught fast by the stall path).
+    uint64_t rx_dead_ns = scaled_ns(8, 25000000000ULL, 120000000000ULL);  // >> ~10s keepalive
     bool rx_dead = false;
     if (!idle_dead && latest_recv_ns > 0 && c.last_recv_ns > 0) {
-      // Require that this carrier lags far behind the best receiver.
       uint64_t recv_gap = latest_recv_ns - c.last_recv_ns;
-      if (recv_gap > dead_idle_ns)
+      if (recv_gap > rx_dead_ns)
         rx_dead = true;
     }
     if (rx_dead) res.rx_dead_fds.push_back(c.fd);

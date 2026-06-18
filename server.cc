@@ -180,8 +180,12 @@ int run_server(const Args& args) {
   uint64_t next_send_id = 0;
   std::vector<uint8_t> backend_read_buf;
   size_t max_packet = std::min(args.config.packet_size, static_cast<unsigned>(MAX_PACKET_PAYLOAD));
-  float runtime_rs_redundancy = args.config.rs_redundancy;
-  unsigned runtime_small_packet_redundancy = args.config.small_packet_redundancy;
+  // Cold-start redundancy until the probability model has enough samples to take over.
+  // In auto mode the client's SET_CONFIG no longer seeds these (the server owns them), so
+  // start moderately protected rather than at the bare 0.1 floor.
+  float runtime_rs_redundancy = args.config.auto_adapt
+      ? std::max(args.config.rs_redundancy, 0.5f) : args.config.rs_redundancy;
+  unsigned runtime_small_packet_redundancy = std::max(2u, args.config.small_packet_redundancy);
   bool runtime_auto_adapt = false;  // set from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
   uint32_t runtime_reconnect_timeout_sec = (uint32_t)args.config.reconnect_timeout_sec;
   // --max-delay (client-provided via SET_CONFIG): hold a backend→client sub-block remainder
@@ -570,12 +574,17 @@ int run_server(const Args& args) {
     runtime_auto_adapt = (pc.auto_adapt != 0);
     max_packet = std::min(static_cast<size_t>(pc.packet_size), MAX_PACKET_PAYLOAD);
     if (max_packet == 0) max_packet = 800;
-    runtime_small_packet_redundancy = pc.small_packet_redundancy;
-    if (runtime_small_packet_redundancy == 0) runtime_small_packet_redundancy = 2;
-    if (runtime_small_packet_redundancy < 2u) runtime_small_packet_redundancy = 2u;
-    runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(2u, static_cast<unsigned>(carriers.size())));
-    runtime_rs_redundancy = pc.reed_solomon_redundancy;
-    if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
+    // In auto_adapt the SERVER owns redundancy (the probability model) and pushes it via
+    // SERVER_CONFIG; do NOT let the client's SET_CONFIG clobber the model's rs/small here,
+    // or the two fight and produce inconsistent (rs, copies) snapshots. Only honor the
+    // client's redundancy values in manual mode.
+    if (!runtime_auto_adapt) {
+      runtime_small_packet_redundancy = pc.small_packet_redundancy;
+      if (runtime_small_packet_redundancy < 2u) runtime_small_packet_redundancy = 2u;
+      runtime_small_packet_redundancy = std::min(runtime_small_packet_redundancy, std::max(2u, static_cast<unsigned>(carriers.size())));
+      runtime_rs_redundancy = pc.reed_solomon_redundancy;
+      if (runtime_rs_redundancy < 0.1f) runtime_rs_redundancy = 0.1f;
+    }
     runtime_reconnect_timeout_sec = pc.reconnect_timeout_sec;
     runtime_max_delay_ns = static_cast<uint64_t>(pc.max_delay_ms * 1000000.0f);
     if (dbg) fprintf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d reconnect_timeout_sec=%u]\n",
