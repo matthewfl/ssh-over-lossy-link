@@ -29,6 +29,7 @@ import argparse
 import os
 import queue
 import random
+import re
 import select
 import socket
 import string
@@ -1257,6 +1258,38 @@ def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, co
             os.unlink(proxy_path)
 
 
+def check_carrier_stability(client_pid, max_removes, warmup_s=15.0):
+    """Parse the client --debug log and count carrier-remove events with a non-benign reason
+    after a startup warmup. On a scenario with no injected carrier death/blackout these should
+    be ~0; many of them means the carrier count is churning (the bug class this guards). Returns
+    0 (pass) or 1 (fail)."""
+    log = f"/tmp/ssh-oll-client-{client_pid}.log"
+    if not os.path.exists(log):
+        print(f"carrier-stability: client debug log {log} not found (need client debug)",
+              file=sys.stderr, flush=True)
+        return 1
+    txt = open(log, errors="replace").read()
+    ts = re.findall(r"\bt=(\d+)", txt)
+    if not ts:
+        print("carrier-stability: no timestamps in client log; skipping", flush=True)
+        return 0
+    warmup_end = int(ts[0]) + int(warmup_s * 1000)
+    benign = {"slow_reduction", "excess_release"}  # intended reductions, not churn
+    churn = 0
+    reasons = {}
+    for m in re.finditer(r"carrier-remove t=(\d+)[^\n]*reason=([a-z_0-9]+)", txt):
+        t, reason = int(m.group(1)), m.group(2)
+        if t < warmup_end or reason in benign:
+            continue
+        churn += 1
+        reasons[reason] = reasons.get(reason, 0) + 1
+    ok = churn <= max_removes
+    detail = ", ".join(f"{r}={c}" for r, c in sorted(reasons.items())) or "none"
+    print(f"carrier-stability: {churn} churn-removes after {warmup_s:.0f}s warmup "
+          f"(limit {max_removes}) [{detail}] -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test ssh-oll: proxy socket, TCP backend, latency measurements."
@@ -1522,6 +1555,15 @@ def main():
         default=False,
         help="Pass --debug to ssh-oll client; debug log will be at /tmp/ssh-oll-client-<pid>.log.",
     )
+    parser.add_argument(
+        "--assert-max-carrier-removes",
+        type=int,
+        default=None,
+        help="After the run, fail if the client closed more than N carriers for a non-benign "
+             "reason (read_error/peer_suggest_close/dead/etc.) after startup. Detects carrier-count "
+             "instability/churn. Only use on scenarios that do NOT inject carrier death/blackout. "
+             "Implies client debug.",
+    )
     args = parser.parse_args()
 
     # Build delay spec: constant seconds or callable() -> seconds for randomize mode
@@ -1662,7 +1704,8 @@ def main():
     proxy_thread.start()
 
     # 4. Start client with --unix-socket-connection
-    _client_debug = getattr(args, "client_debug", False)
+    _client_debug = getattr(args, "client_debug", False) or \
+        getattr(args, "assert_max_carrier_removes", None) is not None
     client_cmd = [
         args.ssh_oll_path,
         "--unix-socket-connection",
@@ -1751,25 +1794,32 @@ def main():
     if not validate_payload(_got, _warm, "TCP→client (warmup)", None):
         print("Warmup TCP→client payload validation failed.", file=sys.stderr)
 
+    def _finalize(rc):
+        # Carrier-count stability gate (opt-in): the run functions have already stopped the
+        # client, so its --debug log holds the whole run. Combine its verdict into the rc.
+        if getattr(args, "assert_max_carrier_removes", None) is not None:
+            rc = (rc or 0) | check_carrier_stability(client_proc.pid, args.assert_max_carrier_removes)
+        return rc
+
     if getattr(args, "scenario_wifi_heavy", False):
         # Attach the scenario config so the test can use timing info.
         args._scenario_cfg = scenario_cfg
-        return _run_wifi_heavy(
+        return _finalize(_run_wifi_heavy(
             client_proc,
             tcp_conn,
             stop_proxy,
             tcp_listen,
             args,
-        )
+        ))
 
     if args.continuous:
-        return _run_continuous(
+        return _finalize(_run_continuous(
             client_proc,
             tcp_conn,
             stop_proxy,
             tcp_listen,
             args,
-        )
+        ))
 
     for i in range(args.iterations):
         # Measurement 1: client stdin -> TCP (client sends, we read on TCP)
@@ -1862,7 +1912,7 @@ def main():
         print("\nTEST FAILED:", file=sys.stderr)
         for f in test_failures:
             print(f"  FAIL: {f}", file=sys.stderr)
-        return 1
+        return _finalize(1)
 
     _has_criteria = any(
         getattr(args, k, None) is not None
@@ -1871,7 +1921,7 @@ def main():
     )
     if _has_criteria:
         print("\nTEST PASSED: all criteria met.")
-    return 0
+    return _finalize(0)
 
 
 if __name__ == "__main__":

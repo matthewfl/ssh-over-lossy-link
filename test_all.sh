@@ -136,6 +136,7 @@ echo ""
 #    Post-warmup avg should settle near 2× the injected latency (both directions).
 # ============================================================================
 run_test "fixed-10ms" \
+    --assert-max-carrier-removes 3 \
     --continuous --continuous-duration 60 \
     --latency-ms 10 \
     --test-max-latency        200 \
@@ -148,6 +149,7 @@ run_test "fixed-10ms" \
 #    Observed: avg ~101 ms, max ~103 ms, ~600 packets/60 s.
 # ============================================================================
 run_test "fixed-100ms" \
+    --assert-max-carrier-removes 3 \
     --continuous --continuous-duration 60 \
     --latency-ms 100 \
     --test-max-latency        500 \
@@ -162,6 +164,7 @@ run_test "fixed-100ms" \
 #    Observed: avg ~15 ms, max ~111 ms, ~3500 packets/60 s.
 # ============================================================================
 run_test "random-10ms-base-100ms-spike-5pct" \
+    --assert-max-carrier-removes 8 \
     --continuous --continuous-duration 60 \
     --latency-random \
     --latency-random-low-ms  10  \
@@ -178,6 +181,7 @@ run_test "random-10ms-base-100ms-spike-5pct" \
 #    Observed: avg ~107 ms, max ~905 ms, ~730 packets/90 s.
 # ============================================================================
 run_test "random-100ms-base-1000ms-spike-5pct" \
+    --assert-max-carrier-removes 8 \
     --continuous --continuous-duration 90 \
     --latency-random \
     --latency-random-low-ms  100  \
@@ -194,6 +198,7 @@ run_test "random-100ms-base-1000ms-spike-5pct" \
 #    Observed: avg ~175 ms, max ~2001 ms, ~1200 packets/120 s.
 # ============================================================================
 run_test "random-100ms-base-2000ms-spike-5pct" \
+    --assert-max-carrier-removes 8 \
     --continuous --continuous-duration 120 \
     --latency-random \
     --latency-random-low-ms  100  \
@@ -491,6 +496,7 @@ run_test "long-blackout-recover-reconnect-timeout" \
 #    Thresholds are relaxed compared to adaptive mode (no RS tuning).
 # ============================================================================
 run_test "no-auto-adapt-fixed-10ms" \
+    --assert-max-carrier-removes 3 \
     --continuous --continuous-duration 60 \
     --latency-ms 10 \
     --test-max-latency       1000 \
@@ -503,6 +509,7 @@ run_test "no-auto-adapt-fixed-10ms" \
 #     payload corruption occurs across a 15-second run.
 # ============================================================================
 run_test "sanity-integrity" \
+    --assert-max-carrier-removes 3 \
     --continuous --continuous-duration 15 \
     --latency-ms 5
 
