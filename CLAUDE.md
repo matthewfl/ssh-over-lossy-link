@@ -50,15 +50,22 @@ and runs the client with `--unix-socket-connection <proxy>`. No real SSH involve
 ```
 
 **Deterministic unit tests** (fast, no sockets — run these first when touching the
-wire/reassembly code):
+wire/reassembly/adapt code):
 ```bash
-make && ./test_reed_solomon && ./test_packet_io
+make check   # builds + runs test_reed_solomon, test_packet_io, test_carrier_adapt
 ```
 `test_packet_io.cc` drives `packet_io::process_carrier_read` directly to lock in the
 reconnect-critical invariants: in-order delivery of out-of-order packets, **a
 duplicate of an already-delivered id is dropped (not re-delivered)** — which is what
 makes retransmit-after-reconnect safe — gap-blocking, and RS decode + extra-shard
-handling.
+handling. `test_carrier_adapt.cc` pins the pure decision logic: the stall-probability
+model (`min_parity_for_stall_bound` etc. against an exact-binomial table) and
+`assess_carriers` (dead-idle, rx-dead, no-churn-while-link-up).
+
+**Carrier-count stability** is guarded end-to-end by `--assert-max-carrier-removes N`
+(fails a run if too many carriers are closed for a non-benign reason after startup);
+it's enabled on the death/blackout-free scenarios in `test_all.sh`. Run those whenever
+touching carrier add/reap/adapt logic.
 
 Test scenarios in `test_all.sh` cover: fixed latency, random-spike latency (simulated
 loss), connection death in each direction, combined latency+death, high-latency links,
@@ -75,11 +82,14 @@ macOS test failures are tolerated (timing flakiness).
 | `client.cc` | `run_client` — ~2500 lines. Launches server over SSH, opens carriers, multiplexes stdin/stdout. Master for the link. |
 | `server.cc` | `run_server` — daemonizes, creates Unix socket, accepts carriers, bridges to backend `localhost:22`. |
 | `packet_io.{h,cc}` | Shared wire (de)serialization: `append_*` builders, `process_carrier_read` parser + reassembly/RS-decode, `flush_carrier_writes`, `CarrierState`, `RsPending`, `ReceiveCallbacks`. |
-| `carrier_adapt.{h,cc}` | Pure adaptation logic shared by both sides: `compute_from_deques`, `merge`, `run_adapt` (redundancy), `assess_carriers` (which carriers are dead/slow). Thresholds are `constexpr` here. |
+| `carrier_adapt.{h,cc}` | Pure decision logic shared by both sides. **Redundancy: the probability model** — `min_parity_for_stall_bound` / `redundancy_for_stall_bound` / `small_copies_for_loss` (see REDUNDANCY_MODEL.md). `assess_carriers` (dead-idle / `rx_dead_fds` / `reap_fds` / rtt-outlier). `compute_from_deques` / `merge` / `run_adapt` are the **legacy** struggling-spread heuristic, now bypassed by the server (kept only as the s2c metric path). Thresholds are `constexpr` here. |
 | `reed_solomon.{h,cc}` | Vendored systematic RS erasure coding over GF(2^8). `encode(k,m,...)` / `decode(n,k,...)`. First k shards = data, next m = parity; any k of n reconstructs. |
-| `test_ssh_oll.py` | Python integration harness (no SSH). |
+| `net_util.h` | Shared `now_ns()`, `p90_ns`, `scaled_ns(mult,min,max,rtt)`, `UnackedItem`. |
+| `REDUNDANCY_MODEL.md` | Derivation of the stall-probability redundancy model (q, ε, latency budget B). |
+| `CARRIER_GROUP_PLAN.md` | Design of the synced-carrier-group / data-based dead detection. |
+| `test_ssh_oll.py` | Python integration harness (no SSH); `--assert-max-carrier-removes` stability gate. |
 | `test_all.sh` | Scenario suite with assertions. |
-| `test_reed_solomon.cc` | Unit test for the RS codec. |
+| `test_reed_solomon.cc` / `test_packet_io.cc` / `test_carrier_adapt.cc` | Unit tests (`make check`). |
 
 ## Core mental model
 
@@ -95,25 +105,34 @@ comments — it relies on retransmit or the global idle timeout instead).
 
 ### Two packet encodings (see `PacketKind` in ssholl.h)
 - **SMALL** (`PacketKind::SMALL`): payload `< packet_size`. Sent as N identical copies
-  (`small_packet_redundancy`) over different carriers. Recovery = duplication.
+  (`small_packet_redundancy`) over different carriers. Recovery = duplication. N comes
+  from the model: `ceil(ln ε / ln q)`.
 - **REED_SOLOMON** (`PacketKind::REED_SOLOMON`): one packet carries one shard. A group
   of `n` shards (k data + m parity) shares one `id`; any `k` reconstruct the block.
   `k = floor(n_carriers / (1 + rs_redundancy))`, one shard per carrier round-robin, so
-  **adding a carrier raises `k` and thus throughput** — that's why redundancy pressure
-  triggers adding carriers.
+  every carrier carries one shard per group. Because the model computes the needed
+  redundancy from the *current* carrier count, **adding a carrier lets the redundancy
+  fraction drop** (carriers and redundancy trade off) — and a carrier silent while peers
+  deliver is the data-based dead signal (no shard arrived for it).
 
 Control packets (PING/PONG/ACK/SET_CONFIG/START_CONNECTION/READY/SUGGEST_CLOSE/
-SERVER_METRICS/SERVER_CONFIG/CLIENT_METRICS) are header-only or small structs;
-see ssholl.h and the `append_*` helpers in packet_io.
+SERVER_METRICS/SERVER_CONFIG/CLIENT_METRICS/**CARRIER_STATUS**) are header-only or small
+structs; see ssholl.h and the `append_*` helpers in packet_io. Two carry payload worth
+noting: `START_CONNECTION` carries the client-assigned `carrier_id` (synced to both
+sides); `CARRIER_STATUS` carries a list of shared carrier ids the sender sees as dead.
 
 ### Who is in charge
 The **client is the master**: it decides carrier count, opens/closes carriers, and
-launches the server. The **server cannot open connections** — it can only *suggest*
-closing one via `SUGGEST_CLOSE`; the client performs the actual close. Both sides
-adapt redundancy, but in default `auto_adapt` mode the **server owns the redundancy
-value** and pushes it via `SERVER_CONFIG`; the client feeds it s2c quality via
-`CLIENT_METRICS`. In `--no-auto` the client computes redundancy and pushes
-`SET_CONFIG`.
+launches the server. The **server cannot open connections** — it reports carriers it
+sees as dead via `CARRIER_STATUS` (sent over a *healthy* carrier, so the news arrives
+even though nothing succeeds on the dead one) and the client performs the actual close.
+(`SUGGEST_CLOSE` is the legacy version that had to ride the dead carrier itself; still
+sent but superseded.) In default `auto_adapt` mode the **server owns the redundancy
+value**: it runs the probability model and pushes the value via `SERVER_CONFIG`; the
+client applies it and feeds back its s2c loss estimate `q` via `CLIENT_METRICS`. The
+client still sends `SET_CONFIG` for non-redundancy settings, but the server **ignores
+its redundancy fields in auto mode** (else client and model fight). In `--no-auto` the
+client's `SET_CONFIG` fully controls redundancy and the server doesn't adapt.
 
 ### RTT and ACKs (bidirectional)
 - Server sends `ACK` when it has written client→server data to the backend; client
@@ -125,29 +144,49 @@ value** and pushes it via `SERVER_CONFIG`; the client feeds it s2c quality via
   multi-second-RTT links. `--rtt-ms` hints the cold-start RTT before any ACK arrives
   (default cold value ~5 s).
 
-### Adaptation (carrier_adapt.cc — read this for the heuristics)
-The signals are designed to be **independent of base RTT** (a uniformly slow link
-where shards arrive slow-but-together reads as healthy):
-- **Increase RS**: a decoded group is "struggling" if shard spread (1st→k-th) > 2 ms
-  *and* the final inter-shard gap is > half the spread (the last needed shard was the
-  bottleneck). >5% struggling → big bump; >1% → medium bump.
-- **Decrease RS**: p90 of k→(k+1) "extra shard" gaps < 0.5 ms (parity was essentially
-  free) *and* <1% struggling → small decrement.
-- **Small-packet copies**: decreased via their own p90 first→median copy gap signal.
-- RS redundancy clamped to **[0.1, 2.0]**.
-- `assess_carriers` decides dead-idle and RTT-outlier carriers (5× median + absolute
-  floor). It also catches "send-only zombies" (we keep writing, nothing comes back
-  while peers receive). Dead-idle threshold was deliberately lowered to ~5×RTT/min 3 s
-  so wifi drops recover fast — see the comment in `assess_carriers`.
+### Adaptation: redundancy (probability model — see REDUNDANCY_MODEL.md)
+Redundancy is **not** the old struggling-spread heuristic anymore (that lives in
+`run_adapt`/`compute_from_deques`, now bypassed). The server runs a stall-probability
+model every ~300 ms:
+- A block stalls iff **more than `m`** of its `n` shards are *late*. With per-shard late
+  probability `q`, that's `P(Binomial(n,q) > m)`. Pick the smallest `m` (smallest
+  redundancy `r = m/k`) holding `P(stall) ≤ ε` (ε = 0.01 %), then add a `+0.05` margin;
+  clamp to **[0.1, 2.0]**. `m` uses the *current* carrier count, so r falls as carriers grow.
+- **"late" = absolute latency budget**, not RTT-relative: a shard is late if it arrives
+  more than `B` (= `--max-added-latency-ms`, default 10 ms) after its group's first shard.
+- **`q` estimate**: fraction of received shards whose gap-from-first exceeds `B`, sliding
+  window. Server measures c2s; client measures s2c and reports it (repurposed
+  `fraction_struggling` field in `CLIENT_METRICS`); server uses `max(c2s, s2c)`.
+- **Small-packet copies**: `ceil(ln ε / ln q)`, clamped `[2, n]`.
+
+### Adaptation: carrier count (client.cc)
+- **Floor** `max(2, --connections)` always maintained; grow up to `--max-connections`.
+- **Grow** on write-backlog, rtt-outlier, or **redundancy pressure** (server's redundancy
+  > ~0.3). Redundancy-pressure add rate is adaptive: ~25 s normally, ~3 s when redundancy
+  is pinned at the 2.0 max.
+- **Release excess** when above floor *and* redundancy is low (< 0.2) *and* no backlog:
+  one carrier per ~15 s. Hysteresis (grow >0.3 / shrink <0.2) prevents oscillation, so the
+  count tracks need (floor on a clean link, higher on a lossy one).
+- `assess_carriers` flags: `rx_dead_fds` (silent while a peer is delivering — **threshold
+  ~25 s, deliberately > the ~10 s keepalive interval** so a carrier merely between
+  keepalives isn't falsely flagged), idle-dead, rtt-outlier (5× median + floor), and the
+  total-outage zombie reap. **History note:** rx-dead was once 3 s, which mis-flagged
+  healthy carriers between keepalives and churned the count — keep it above the keepalive
+  interval.
 
 ### Reliability mechanisms
 - **Unacked buffer** (`unacked_sends` / `unacked_data`): every SMALL and RS group is
   kept until ACKed. Retransmit paths: (1) on reconnect, replay all unacked onto the new
   carrier; (2) periodic (~500 ms), resend items older than ~4×RTT to a healthy carrier,
   tracked by *logical carrier_id* (not fd) so churn doesn't cause dupes.
-- **Dead-connection detection**: immediate (EPOLLHUP / read / write EPIPE), keepalive
-  PING when idle, and inactivity timeout. epoll_wait timeout is capped (~500 ms) so the
-  periodic checks always run.
+- **Dead-connection detection (data-based, no blanket pings)**: immediate (EPOLLHUP /
+  read / write EPIPE); **rx-dead** (carrier silent while peers deliver) reported peer→peer
+  via `CARRIER_STATUS` over a healthy carrier, with the client confirming its own s2c
+  suspects via a single targeted `PING` before closing; and a **mass-death fast path**
+  (delivery stalled + a large subset silent → batch-close immediately). Blanket pinging
+  was *removed* — a lost ping HoL-blocks that carrier's next data shard and inflates the
+  measured loss. **Idle keepalive is `--min-data-per-minute`** (default 100, 10 s windows),
+  not pings. epoll_wait timeout is capped (~500 ms) so the periodic checks always run.
 - **Stale RS groups**: incomplete groups older than ~4×RTT are dropped to bound memory
   (and on the client, advance past the gap as a last resort).
 - **Global idle / reconnect timeout**: if nothing is received for `12×RTT`
@@ -170,16 +209,25 @@ where shards arrive slow-but-together reads as healthy):
 - Reproduce link conditions locally with `test_ssh_oll.py --latency-ms` /
   `--latency-random` and the named scenarios in `test_all.sh` (e.g. the
   `wifi-stop-then-recover*` and `connection-death-*` tests for reconnection bugs).
-- Recent crash/robustness fixes clustered around slow-ping / long-RTT and
-  reconnection handling — when touching timeouts or carrier reaping, run the
-  high-latency and wifi-blackout scenarios specifically.
+- Server `--debug` has an `[adapt-model t=… q=… q_c2s=… q_s2c=… n=… r_model=… copies=…
+  B_ms=… gap_ms_p50/p90/p99=…]` line — the live loss estimate and model decision. If
+  redundancy is pinned at 2.0 and carriers climb, the link's inter-shard spread exceeds
+  `B`; the gap percentiles tell you where to set `--max-added-latency-ms`.
+- Client `--debug` has a periodic `[carriers-diag …]` line (per-carrier recv/send-ago,
+  dead/pending flags) and `[carrier-remove … reason=…]` lines — use these for carrier
+  churn / stability questions.
+- When touching timeouts or carrier add/reap/adapt, run the high-latency, wifi-blackout,
+  and the stability-asserted (`--assert-max-carrier-removes`) scenarios specifically.
 
 ## Conventions / gotchas
 
 - Everything is in `namespace ssholl` (with `packet_io`, `carrier_adapt`,
   `reed_solomon` sub-namespaces). Wire structs are `#pragma pack(push,1)`.
-- "carrier_id" is a **logical** monotonically increasing id, intentionally distinct
-  from the OS fd (fds get reused; retransmit dedup keys on carrier_id).
+- Two logical ids on `CarrierState`, both distinct from the OS fd (fds get reused):
+  `carrier_id` is **each side's own** monotonically-increasing id (retransmit dedup keys
+  on it); `shared_carrier_id` is the **client-assigned id synced to both sides** (via
+  `START_CONNECTION`) and is what `CARRIER_STATUS` / cross-link naming uses. The client
+  sets `shared_carrier_id = carrier_id`; the server gets it from the wire.
 - `next_send_id` vs `next_deliver_id`: send-side counter vs receive-side contiguous
   delivery cursor. Don't conflate them.
 - When changing the wire format, update **both** the structs in `ssholl.h`, the
