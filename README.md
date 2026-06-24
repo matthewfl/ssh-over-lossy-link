@@ -79,9 +79,10 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --connections [N]             How many carrier SSH connections to open initially.  Default 10 (a reasonable default for moderate loss; increase for worse links).
 --max-connections [N]         Max number of carrier connections that can be opened.  Default 50
 --packet-size [N]             The max bytes of a single "packet" sent across a connection.  Default 400
---small-packet-redundancy [N] For buffered data smaller than packet-size, send N copies without Reed–Solomon. Default 2
---rs-redundancy [N]           Number of extra packets when using Reed–Solomon, as a fraction.  Default 0.1
+--small-packet-redundancy [N] For buffered data smaller than packet-size, send N copies without Reed–Solomon. In auto mode this is the cold-start value; the redundancy model then sets it. Default 2
+--rs-redundancy [N]           Reed–Solomon parity as a fraction of data (m/k). In auto mode this is the cold-start value; the probability model then sets it. Default 0.1
 --max-delay [N]               Max delay in ms for sending data while waiting for buffer to fill for Reed–Solomon.  Default 1ms
+--max-added-latency-ms [N]    Latency budget B for the redundancy model: a shard arriving more than N ms after its group's first shard counts as "late". Lower N spends more parity/carriers for tighter latency; raise it on a high-jitter link to avoid over-provisioning. Default 10
 --rtt-ms [N]                  Hint RTT (ms) for cold-start timeouts; 0 = auto from observed link latency. Use on high-latency links to avoid premature timeouts before first ACK. Default 0
 --connect-timeout [N]         SSH ConnectTimeout in seconds for carrier connections; 0 = no limit. Default 30
 --min-data-per-minute [N]     Idle keepalive: each carrier sends ≥N bytes/min in each direction (spread over 10s windows) so a firewall/NAT doesn't close an idle link. This is the only idle keepalive (blanket pinging was removed). Default 100; set 0 to disable
@@ -109,52 +110,49 @@ Auto mode controls two things: how many carrier connections to maintain, and how
 
 A *floor* of `max(2, --connections)` connections is always maintained, in both auto and non-auto mode. The client checks every 50 ms (when zero connections are alive) or 100 ms (otherwise) and opens a new connection if it is below the floor.
 
-In auto mode, extra connections (up to `floor × 3`) are opened when any of the following triggers fires:
+In auto mode, extra connections (up to `--max-connections`) are opened when any of the following triggers fires:
 
 | Trigger | Meaning |
 |---------|---------|
 | **Write backlog** | Total queued outgoing bytes across all carriers exceeds 150 × packet_size — the existing carriers can't keep up. |
 | **RTT outlier** | A carrier's measured ACK round-trip time is both above 1 s and more than 5× the median peer RTT — that carrier is stalled while others are fine. |
-| **Redundancy pressure** | RS redundancy has been raised above 0.4 due to packet loss. Because each RS group uses exactly `n_carriers` shards (one per carrier), every new carrier directly increases `k` (the data shards per group) and restores effective throughput. Rate-limited to at most one add per 25 s so each new connection can influence the ratio before another is added. |
+| **Redundancy pressure** | The model's RS redundancy is above a cap (~0.3). Each RS group uses one shard per carrier, so adding a carrier raises `k` (data shards per group) and lets the model *lower* the redundancy fraction — i.e. carriers and redundancy trade off. The add rate is adaptive: ~25 s apart normally, but ~3 s apart when redundancy is pinned at its 2.0 max (carriers are then the only lever to cut latency). |
 
-Conversely, a carrier is *reaped* in auto mode when: the carrier count is above the floor, the carrier's RTT is above 3 s, and it is more than 3× the median peer RTT. The reap check runs every 2 s.
+**Releasing carriers.** When the count is above the floor and redundancy is low (the link is good: model redundancy < 0.2) and there is no backlog, one excess carrier is released every ~15 s, so the count drifts back toward the floor instead of ratcheting up. The hysteresis (grow when redundancy > 0.3, shrink when < 0.2) keeps it from oscillating. The count therefore tracks actual need: at the floor on a clean link, higher on a lossy one.
 
-#### Reed-Solomon redundancy
+**Reaping dead carriers** is driven by the *data*, not by pings (see [Dead-connection detection](#dead-connection-detection)): a carrier that goes silent while its peers keep delivering is identified, confirmed, and closed, and a correlated drop of many carriers is rerouted immediately.
 
-RS redundancy is adjusted every ~300 ms using two complementary timing signals measured on decoded RS groups. Both are independent of the link's base RTT — a uniformly high-latency link where all shards arrive slow but *together* reads as healthy.
+#### Reed-Solomon redundancy (probability model)
 
-**Increase signal — spread + final gap:** For each decoded group, if the total shard spread (first → k-th shard) exceeds 2 ms *and* the last inter-shard gap (k-1-th → k-th shard) accounts for more than half the total spread, the group is marked "struggling" — the last needed shard was a bottleneck, meaning one more loss would have stalled delivery.
+Redundancy is set from a stall-probability model rather than ad-hoc bump/decay heuristics. The full derivation is in [`REDUNDANCY_MODEL.md`](REDUNDANCY_MODEL.md); the summary:
 
-| Condition | Action |
-|-----------|--------|
-| > 5 % of groups struggling | Increase RS redundancy by +0.5 (aggressive) |
-| > 1 % struggling | Increase RS redundancy by +0.25 |
+An RS group is `n` shards (`k` data + `m` parity, one shard per carrier). It is delivered as soon as any `k` arrive, so it **stalls** (must wait for a retransmit — a head-of-line delay) only if **more than `m`** of its `n` shards are *late*. Treating shard lateness as roughly independent with probability `q`, the number late is `~Binomial(n, q)` and the stall probability is `P(X > m)`. The model picks the smallest `m` (hence the smallest redundancy `r = m/k`) that holds `P(stall) ≤ ε`, with `ε = 0.01 %`, plus a small `+0.05` safety margin. Because `m` is computed from the *current* carrier count `n`, the redundancy **falls as carriers are added** — that is the feedback that lets carriers and redundancy trade off (and stops carriers from ratcheting up forever). Redundancy is clamped to `[0.1, 2.0]`.
 
-**Decrease signal — extra-shard gap:** When a group decodes from its k-th shard, the arrival time of the (k+1)-th shard is recorded. If the 90th-percentile of recent k→(k+1) gaps is below 0.5 ms, it means an extra shard was essentially free nearly every time — the link has consistent headroom and parity can be reduced.
+**"Late" is an absolute latency budget, not RTT-relative.** A shard counts as late if it arrives more than `B` after its group's first shard, where `B = --max-added-latency-ms` (default 10 ms). This is the acceptable head-of-line delay for the inner SSH stream — far tighter than the link's RTT (which may be hundreds of ms). On a 1–5 % loss link the arrival distribution is bimodal: shards that ride through arrive within a few ms of each other, while a shard hit by loss waits ~one RTT for a TCP retransmit; `B` sits in the gap, so the measured `q` ≈ the real loss/retransmit rate.
 
-| Condition | Action |
-|-----------|--------|
-| Extra-shard p90 < 0.5 ms **and** < 1 % struggling | Decrease RS redundancy by −0.02 (gradual) |
+**Estimating `q`:** each side counts, over a sliding window, the fraction of received shards whose gap from their group's first shard exceeds `B`. The server measures the client→server direction; the client measures server→client the same way and reports it in `CLIENT_METRICS`. A single redundancy value governs both directions, so it is sized for the worse one: `q = max(c2s, s2c)`. Re-evaluated every ~300 ms.
 
-RS redundancy is clamped to [0.1, 2.0]. Both directions are monitored: the server reports c2s shard spread and average extra-shard gap to the client in `SERVER_METRICS` every 400 ms; the client measures s2c locally.
+**Small-packet copies** (duplicate-on-distinct-carriers, used for sub-packet-size sends) come from the same `q`: the smallest `c` with `q^c ≤ ε`, i.e. `c = ⌈ln ε / ln q⌉`, clamped to `[2, carrier count]`.
 
-**Small-packet copies** use a separate decrease signal: when duplicate small packets (copy 2) arrive, the gap from copy 1→copy 2 is measured. If the 90th-percentile of these gaps is below 0.5 ms, going from N→N−1 copies would add negligible latency, so small_packet_redundancy is decreased. This is independent of the RS extra-shard signal — with 20 copies, the 20th copy matters less; we care whether the 2nd copy arrives promptly.
+In `--auto` mode the **server owns** redundancy: it runs the model and pushes the value via `SERVER_CONFIG`; the client applies that and reports its s2c `q` back via `CLIENT_METRICS`. (The client still sends `SET_CONFIG` for non-redundancy settings such as packet size, but the server **ignores its redundancy fields in auto mode** so the model isn't overridden.) In manual mode the client's `SET_CONFIG` fully controls redundancy and no adaptation happens.
 
-In `--auto` mode the server manages its own redundancy and reports its chosen value via `SERVER_CONFIG`; in manual mode the client pushes `SET_CONFIG` whenever its computed value changes.
+> Tuning note: if you see redundancy pinned at 2.0 and the carrier count growing, the link's natural inter-shard spread exceeds `B` (10 ms can't be met). Check the `gap_ms_p50/p90/p99` figures in the server `--debug` log (`[adapt-model ...]` line) and raise `--max-added-latency-ms` toward `p90` to trade some latency for far fewer carriers.
 
 #### RTT-scaled timeouts
 
-Retransmit, inactivity, keepalive, and reap timeouts are scaled by observed link RTT rather than hardcoded. On low-latency links this yields tighter timeouts; on high-latency links (e.g. 5–10 s RTT) timeouts lengthen accordingly. Use `--rtt-ms N` to hint the expected RTT for cold-start (before any ACKs arrive); otherwise a conservative 5 s default is used until RTT is measured.
+Retransmit, inactivity, and reap timeouts are scaled by observed link RTT rather than hardcoded (the idle keepalive is a fixed-cadence exception — see below). On low-latency links this yields tighter timeouts; on high-latency links (e.g. 5–10 s RTT) timeouts lengthen accordingly. Use `--rtt-ms N` to hint the expected RTT for cold-start (before any ACKs arrive); otherwise a conservative 5 s default is used until RTT is measured.
 
 #### Dead-connection detection
 
-Connections can be detected as dead in three ways:
+Dead carriers are detected from the data already flowing, **not** by pinging every carrier (a blanket ping is itself harmful: a lost ping triggers a TCP retransmit that head-of-line-blocks that carrier's next data shard, inflating the very lateness the redundancy model measures). The mechanisms:
 
 1. **Immediate error**: `EPOLLHUP`, a failed `read()`, or a failed `write()` (returns `EPIPE`) removes the carrier immediately.
-2. **Keepalive ping**: if a carrier has had no send *and* no receive activity for 2×RTT (min 5 s) and its write buffer is empty, a `PING` packet is sent. The peer replies with a `PONG`, which counts as activity. If a `PING` then goes unanswered past a longer timeout (6×RTT on the client, 8×RTT on the server, both with floors), the carrier is treated as dead-but-open: the server sends `SUGGEST_CLOSE` and the client reaps it. This catches carriers that still accept writes (so the inactivity timer below keeps resetting) but never deliver anything back.
-3. **Inactivity timeout**: if nothing has been *received* on a carrier for ~5×RTT (after a 2×RTT post-connect grace period), the carrier is forcibly removed.
+2. **Silent-while-peers-deliver (the data signal)**: since each group sends one shard per carrier, a healthy carrier delivers something on roughly every group. A carrier that delivers *nothing* while its peers keep delivering is suspect. The threshold is deliberately longer than the idle-keepalive interval (~25 s) so a carrier that is merely between keepalives or interactive bursts is **not** flagged. Each side reports the carriers it sees as dead, by their shared carrier id, to the peer via `CARRIER_STATUS` — sent over a *healthy* carrier, so the news arrives even though nothing succeeds on the dead one (the old `SUGGEST_CLOSE` had to ride the dead carrier itself). A carrier is closed if **either** direction reports it dead; the client confirms its own (server→client) suspects with a single targeted `PING` first, then closes only if that delivers nothing back. The client is the master and performs all closes/opens.
+3. **Mass-death fast path**: if delivery stalls (data pending but the in-order cursor not advancing) *and* a large fraction of carriers go silent at once, the whole silent set is closed and rerouted immediately rather than waiting out the per-carrier confirmation — this is the case that actually blocks latency.
 
-The `epoll_wait` timeout is capped so the inactivity check always runs even when no I/O events arrive.
+A single dead carrier is therefore detected somewhat slowly (~25 s), which is fine: redundancy covers its absence in the meantime, and a correlated outage takes the fast path. Carriers are kept warm on an idle link by `--min-data-per-minute` (see below), not by these checks. The `epoll_wait` timeout is capped so these periodic checks always run even when no I/O events arrive.
+
+**Idle keepalive.** With blanket pinging removed, an otherwise-idle link still needs to touch every carrier so a firewall/NAT doesn't close it. `--min-data-per-minute N` (default 100) ensures each carrier sends at least `N` bytes/minute, spread over 10-second windows (so the per-carrier gap stays ≤ ~10 s); real traffic counts toward the budget, so it only emits keepalive bytes when a carrier would otherwise be quiet. Set `0` to disable.
 
 #### Retransmission and data recovery
 
@@ -190,13 +188,14 @@ enum packet_kind_e : uint8_t {
     PACKET_SMALL = 2,
     PACKET_REED_SOLOMON = 3,
     PACKET_SET_CONFIG = 4,        // client -> server; adjust redundancy / packet size etc.
-    PACKET_START_CONNECTION = 5,  // sent when a new carrier joins; used to associate the carrier with the logical stream
+    PACKET_START_CONNECTION = 5,  // client -> server; first packet on a new carrier, carries its shared carrier_id
     PACKET_ACK = 6,               // both directions; cumulative ack: all data up to and including header.id delivered (for latency measurement)
     PACKET_SERVER_METRICS = 7,    // server -> client; max RTT observed by server (server→client path) for client adapt
     PACKET_SERVER_CONFIG = 8,     // server -> client; server's current redundancy (when server manages it; auto_adapt)
     PACKET_READY = 9,             // server -> client; sent when carrier connects, confirms link is up before client sends
-    PACKET_SUGGEST_CLOSE = 10,   // server -> client; suggests client close this carrier (dead or slow); client does the actual close
-    PACKET_CLIENT_METRICS = 11,  // client -> server; server→client path quality so the server can adapt redundancy using both directions
+    PACKET_SUGGEST_CLOSE = 10,   // server -> client; legacy "close this carrier" hint (rides the carrier itself); CARRIER_STATUS is now the primary dead-carrier signal
+    PACKET_CLIENT_METRICS = 11,  // client -> server; server→client path quality (incl. s2c loss estimate q) so the server can size redundancy for both directions
+    PACKET_CARRIER_STATUS = 12,  // either direction; list of shared_carrier_ids the sender sees as dead, sent over a healthy carrier
 };
 struct __attribute__((__packed__)) packet_header {
     uint64_t id;
@@ -223,6 +222,25 @@ struct __attribute__((__packed__)) packet_config : packet_header {
     uint8_t auto_adapt;  // 1 = server may adapt and send SERVER_CONFIG; 0 = client manages via SET_CONFIG
 };
 
+struct __attribute__((__packed__)) packet_start_connection : packet_header {
+    uint64_t carrier_id;   // client-assigned shared id for this carrier; the server records
+                           // fd -> carrier_id so both sides can name the same carrier
+};
+
+struct __attribute__((__packed__)) packet_carrier_status : packet_header {
+    uint16_t count;        // followed by `count` little-endian uint64 shared carrier ids
+    // uint64_t dead_carrier_ids[count];
+};
+
+// PACKET_START_CONNECTION: client -> server. First packet the client writes on a freshly
+// connected carrier, carrying that carrier's shared carrier_id (the client is the sole
+// carrier authority). Lets health/attribution messages refer to a carrier across the link.
+
+// PACKET_CARRIER_STATUS: either direction. The shared_carrier_ids the sender's receive side
+// currently sees as dead (silent while peers keep delivering). Sent over a healthy carrier so
+// it arrives even though nothing succeeds on the dead carrier. The client closes a carrier if
+// either its own detection or the peer's CARRIER_STATUS flags it.
+
 // PACKET_ACK: header only. header.id = acked_id (all data with id <= acked_id delivered).
 // Server sends ACK when it has written to the backend (client measures client→server RTT).
 // Client sends ACK when it has written to stdout (server measures server→client RTT).
@@ -234,9 +252,9 @@ struct __attribute__((__packed__)) packet_config : packet_header {
 // PACKET_SERVER_CONFIG: server -> client. Same payload as packet_config (no auto_adapt).
 // When auto_adapt is on, server adapts redundancy and sends this so the client stays in sync.
 
-// PACKET_SUGGEST_CLOSE: server -> client. Header only. Server sends on a carrier it thinks is dead
-// (no data, no PONG) or very slow (RTT outlier). Client closes the carrier; server cannot open
-// new connections, so only the client reaps to avoid stalls.
+// PACKET_SUGGEST_CLOSE: server -> client. Header only. Legacy per-carrier "close this" hint that
+// rides the carrier itself; superseded by CARRIER_STATUS (which can name a dead carrier over a
+// healthy one). The client performs all closes; the server cannot open connections.
 
 // PACKET_READY: server -> client. Header only. Sent when a carrier connects so the client
 // knows the bidirectional path is up before it sends data; avoids premature timeouts.
@@ -260,7 +278,9 @@ A Python script `test_ssh_oll.py` exercises the stack without SSH:
 2. Starts `ssh-oll --server localhost <port>` and reads its Unix socket path.
 3. Creates a proxy Unix socket (e.g. `/tmp/ssh-oll-test-script.<suffix>`) that forwards to the server socket, with optional `--latency-ms` to simulate delay.
 4. Runs the client with `--unix-socket-connection <proxy>` so the client connects via the proxy (no SSH).
-5. Measures latency: client stdin → TCP and TCP → client stdout.
+5. Measures latency: client stdin → TCP and TCP → client stdout, and validates byte-stream integrity.
+
+The proxy can inject fixed/random latency (`--latency-ms`, `--latency-random*`), per-connection death (`--connection-death-probability`), and Wi-Fi-style blackout scenarios. `--assert-max-carrier-removes N` makes a run also fail if the client closed more than `N` carriers for a non-benign reason after startup — a guard against carrier-count instability/churn (use only on scenarios that don't inject carrier death). `test_all.sh` runs the full scenario suite with pass/fail bounds (and the stability assertion on the death/blackout-free scenarios); `make check` runs the deterministic unit tests (`test_reed_solomon`, `test_packet_io`, `test_carrier_adapt`).
 
 Example:
 
