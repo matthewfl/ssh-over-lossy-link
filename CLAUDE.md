@@ -152,21 +152,42 @@ model every ~300 ms:
   probability `q`, that's `P(Binomial(n,q) > m)`. Pick the smallest `m` (smallest
   redundancy `r = m/k`) holding `P(stall) ≤ ε` (ε = 0.01 %), then add a `+0.05` margin;
   clamp to **[0.1, 2.0]**. `m` uses the *current* carrier count, so r falls as carriers grow.
-- **"late" = absolute latency budget**, not RTT-relative: a shard is late if it arrives
-  more than `B` (= `--max-added-latency-ms`, default 10 ms) after its group's first shard.
-- **`q` estimate**: fraction of received shards whose gap-from-first exceeds `B`, sliding
-  window. Server measures c2s; client measures s2c and reports it (repurposed
-  `fraction_struggling` field in `CLIENT_METRICS`); server uses `max(c2s, s2c)`.
+- **"late" = a retransmit-scale STALL threshold** — *not* the old fixed
+  `--max-added-latency-ms` budget (that saturated `q→0.5` on any link whose median
+  inter-shard jitter exceeded 10 ms, pinning everything at max). A stall = waiting for a TCP
+  retransmit, costing `~max(RTT, RTO_min≈200 ms)`; on a low-RTT link that's ~200 ms, NOT the
+  RTT. So `carrier_adapt::stall_threshold_ns(rtt) = max(RTT, 200 ms)/4` — ~50 ms on a fast
+  link, `RTT/4` on a high-RTT link. Tying it to the *retransmit cost* (not RTT) keeps it
+  above the host scheduling-jitter band in both regimes, so it needs no hand-tuned floor.
+  Hence `q ≈ 1−(1−p)^λ` (`p`=background loss, `λ`=packets/carrier/window): **background loss
+  is `q`'s floor, carrier overload is the lever.** `--max-added-latency-ms` is reserved/unused.
+- **`q` estimate**: fraction of received shards whose gap-from-first exceeds the stall
+  threshold, sliding window. Server measures c2s; client measures s2c and reports it
+  (repurposed `fraction_struggling` field in `CLIENT_METRICS`); server uses `max(c2s, s2c)`.
 - **Small-packet copies**: `ceil(ln ε / ln q)`, clamped `[2, n]`.
 
-### Adaptation: carrier count (client.cc)
+### Adaptation: carrier count (client.cc) — LOAD×LOSS-driven, not redundancy-driven
 - **Floor** `max(2, --connections)` always maintained; grow up to `--max-connections`.
-- **Grow** on write-backlog, rtt-outlier, or **redundancy pressure** (server's redundancy
-  > ~0.3). Redundancy-pressure add rate is adaptive: ~25 s normally, ~3 s when redundancy
-  is pinned at the 2.0 max.
-- **Release excess** when above floor *and* redundancy is low (< 0.2) *and* no backlog:
-  one carrier per ~15 s. Hysteresis (grow >0.3 / shrink <0.2) prevents oscillation, so the
-  count tracks need (floor on a clean link, higher on a lossy one).
+- **Primary lever = stall fraction.** The client sizes from the measured per-shard stall
+  fraction `ρ̄` (= `s2c_loss_q`), holding it near `ρ_target`≈0.02: `desired_carriers_dyn =
+  clamp(⌈n·ln(1−ρ̄)/ln(1−ρ_target)⌉, floor, max)` (`carrier_adapt::carrier_target_from_stall`).
+  Since `ρ̄ = 1−(1−p)^λ`, a **clean** link (`ρ̄≈0`) stays at the **floor regardless of
+  throughput** — *load alone does not grow carriers* (this is what stopped a clean
+  high-throughput flood from over-provisioning to the cap, e.g. fixed-10ms at 4000 pps which
+  previously grew to 50); a **lossy/overloaded** link grows (more carriers→lower `λ`→lower
+  `ρ̄`). The c2s direction's stalls are covered by the server's redundancy (Lever 2). The
+  fleet packet rate is measured for the diag log only.
+- **Grow** on: `load_pressure` (count < desired), write-backlog, rtt-outlier, **`link_stalled`**
+  (recovery), and rs-pending. `link_stalled` fires on (a) unacked data + short RTT-scaled
+  receive-silence, OR (b) *no receive at all* for > the keepalive interval (covers s2c-only
+  traffic, where the client sends nothing so unacked is always empty) → open fresh carriers
+  to bypass dead-but-connected ones. This explicit recovery path *replaced* the old
+  redundancy-pressure growth, which had driven reconnection by accident.
+- **The old `redundancy_pressure` (rs>0.3 → add) trigger is GONE** — it drove the cap-out
+  when the redundancy signal saturated on jitter. Redundancy no longer feeds carrier count.
+- **Release excess** when count > `desired_carriers_dyn` and no heavy backlog: one carrier
+  per ~15 s, so the count tracks load×loss (floor on a clean link even at high throughput,
+  higher on a lossy/overloaded one).
 - `assess_carriers` flags: `rx_dead_fds` (silent while a peer is delivering — **threshold
   ~25 s, deliberately > the ~10 s keepalive interval** so a carrier merely between
   keepalives isn't falsely flagged), idle-dead, rtt-outlier (5× median + floor), and the
@@ -210,12 +231,15 @@ model every ~300 ms:
   `--latency-random` and the named scenarios in `test_all.sh` (e.g. the
   `wifi-stop-then-recover*` and `connection-death-*` tests for reconnection bugs).
 - Server `--debug` has an `[adapt-model t=… q=… q_c2s=… q_s2c=… n=… r_model=… copies=…
-  B_ms=… gap_ms_p50/p90/p99=…]` line — the live loss estimate and model decision. If
-  redundancy is pinned at 2.0 and carriers climb, the link's inter-shard spread exceeds
-  `B`; the gap percentiles tell you where to set `--max-added-latency-ms`.
-- Client `--debug` has a periodic `[carriers-diag …]` line (per-carrier recv/send-ago,
-  dead/pending flags) and `[carrier-remove … reason=…]` lines — use these for carrier
-  churn / stability questions.
+  stall_ms=… gap_ms_p50/p90/p99=…]` line — `q` is the per-shard stall fraction, `stall_ms`
+  the RTT-relative threshold it's measured against, and the gap percentiles show the actual
+  arrival spread. A high `q` here is real loss/overload (not jitter), so high redundancy is
+  warranted; it should no longer pin at 2.0 on a merely-jittery link.
+- Client `--debug` has a periodic `[carriers-diag … n=… desired=… rate_pps=… …]` line
+  (`desired` = load-driven target, `rate_pps` = measured fleet packet rate) plus per-carrier
+  recv/send-ago/dead flags, and `[carrier-add … reason=…]` / `[carrier-remove … reason=…]`
+  lines (reasons incl. `load_pressure`, `link_stall`, `excess_release`) — use these for
+  carrier count / churn / recovery questions.
 - When touching timeouts or carrier add/reap/adapt, run the high-latency, wifi-blackout,
   and the stability-asserted (`--assert-max-carrier-removes`) scenarios specifically.
 

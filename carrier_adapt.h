@@ -123,6 +123,33 @@ float redundancy_for_stall_bound(unsigned n, double q, double eps);
 // Smallest number of duplicate copies c for a SMALL packet so P(all lost)=q^c <= eps.
 unsigned small_copies_for_loss(double q, double eps);
 
+// Retransmit-scale "stall" threshold. A received shard arriving more than this after its
+// group's FIRST shard indicates its carrier stalled — a per-carrier TCP retransmit, which
+// takes >= ~1 RTT — as opposed to normal inter-carrier jitter (a small fraction of RTT on a
+// high-RTT link, plus host scheduling jitter that on a fast link can reach a few tens of ms
+// under load). The redundancy model is driven by the fraction of shards this late (the
+// per-shard stall probability rho-bar ~= 1-(1-p)^lambda): so background loss p is rho-bar's
+// FLOOR (lambda ~= 1 packet/carrier) and carrier OVERLOAD (high lambda) is the lever that
+// raises it. Crucially this does NOT saturate on the link's base jitter the way a fixed
+// small latency budget did (the old q-vs-B that pinned everything at max). The 100 ms floor
+// keeps host/loopback scheduling jitter on a low-RTT link from reading as a stall.
+uint64_t stall_threshold_ns(uint64_t rtt_ns);
+
+// Carrier target (Lever 1, primary) = load × loss. Spreading the offered load over more
+// carriers only helps when carriers are actually *stalling*: with per-carrier stall prob
+// `rho_bar = 1-(1-p)^lambda` (`lambda = R*W/n` packets per recovery window), more carriers
+// lowers `lambda` and hence `rho_bar` — but only while loss `p > 0`. So:
+//   • a CLEAN link (`rho_bar < rho_gate`) needs only the floor, *regardless of throughput* —
+//     this is what stops a clean high-throughput flood from being over-provisioned to the cap;
+//   • a LOSSY/overloaded link caps per-carrier load at `tau`: `n* = ceil(R*W/tau)`, so a
+//     genuinely lossy flood grows while a lossy but low-rate (interactive) link — whose
+//     carriers aren't overloaded — stays at the floor and lets redundancy cover the loss.
+// Sizing from the measured rate (not feeding back on `n`) keeps it stable: a transient stall
+// spike can't ratchet the count up. Result clamped to [floor, cap].
+unsigned carrier_target_for_load(double packets_per_s, uint64_t recovery_window_ns,
+                                 double tau, double rho_bar, double rho_gate,
+                                 unsigned floor, unsigned cap);
+
 }  // namespace carrier_adapt
 
 }  // namespace ssholl

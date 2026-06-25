@@ -141,8 +141,11 @@ struct Config {
                                        // a firewall/NAT doesn't close it. 0 disables. This is the ONLY
                                        // idle keepalive (blanket pinging was removed); default it on.
   unsigned reconnect_timeout_sec = 0; // global idle timeout; 0 = adaptive (12×RTT, min 60 s, max 300 s)
-  unsigned max_added_latency_ms = 10; // RS stall-model latency budget B: a shard arriving >B after
-                                      // its group's first shard counts as "late" (drives redundancy)
+  unsigned max_added_latency_ms = 10; // RESERVED / currently unused. The redundancy model used to
+                                      // count a shard "late" if it arrived >B(=this) after its
+                                      // group's first shard, but that saturated on base jitter; the
+                                      // stall threshold is now RTT-relative (carrier_adapt::
+                                      // stall_threshold_ns). Kept so the flag still parses.
 };
 
 // -----------------------------------------------------------------------------

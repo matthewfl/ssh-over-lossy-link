@@ -44,6 +44,36 @@ unsigned small_copies_for_loss(double q, double eps) {
   return ci < 1 ? 1u : ci;
 }
 
+uint64_t stall_threshold_ns(uint64_t rtt_ns) {
+  // A "stall" is a block waiting for a TCP retransmit, which costs ~max(RTT, RTO_min). Linux's
+  // RTO floor is ~200 ms, so on a LOW-RTT link a stall costs ~200 ms — NOT the RTT. The
+  // threshold must therefore be a fraction of the *retransmit cost*, not of the RTT: tying it
+  // to RTT would, on a fast link, push it down into the host's scheduling-jitter band (tens of
+  // ms) and mistake jitter for stalls (inflating q -> spurious redundancy). A quarter of the
+  // retransmit cost lands safely between jitter and a retransmit in BOTH regimes — ~50 ms on a
+  // fast link, RTT/4 on a high-RTT link. This is what makes q robust to the RTT regime (and to
+  // this constant) instead of needing a hand-tuned absolute floor that we have to keep above
+  // whatever the link's jitter happens to be.
+  constexpr uint64_t kRtoFloorNs = 200000000ULL;  // ~Linux TCP RTO_min
+  uint64_t retransmit_cost = rtt_ns > kRtoFloorNs ? rtt_ns : kRtoFloorNs;
+  return retransmit_cost / 4;
+}
+
+unsigned carrier_target_for_load(double packets_per_s, uint64_t recovery_window_ns,
+                                 double tau, double rho_bar, double rho_gate,
+                                 unsigned floor, unsigned cap) {
+  if (rho_bar < rho_gate) return floor;      // essentially no stalls -> floor regardless of load
+  if (tau <= 0.0) tau = 1.0;
+  double w_s = static_cast<double>(recovery_window_ns) / 1e9;
+  double in_flight = packets_per_s * w_s;    // packets resident on the fleet per window
+  double want = std::ceil(in_flight / tau);
+  if (!(want >= 0.0)) want = static_cast<double>(floor);   // guard NaN
+  unsigned n = (want > static_cast<double>(cap)) ? cap : static_cast<unsigned>(want);
+  if (n < floor) n = floor;
+  if (n > cap) n = cap;
+  return n;
+}
+
 PathMetrics compute_from_deques(
     const std::deque<uint64_t>& shard_spread_ns,
     const std::deque<uint64_t>& gap_final_ns,

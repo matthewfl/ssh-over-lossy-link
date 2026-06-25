@@ -1290,6 +1290,33 @@ def check_carrier_stability(client_pid, max_removes, warmup_s=15.0):
     return 0 if ok else 1
 
 
+def check_carrier_count(client_pid, max_count, warmup_s=15.0):
+    """Fail if the client's carrier count exceeded max_count after the startup warmup —
+    catches the redundancy-pressure runaway (carriers climbing toward the cap). Returns 0/1."""
+    log = f"/tmp/ssh-oll-client-{client_pid}.log"
+    if not os.path.exists(log):
+        print(f"carrier-count: client debug log {log} not found (need client debug)",
+              file=sys.stderr, flush=True)
+        return 1
+    txt = open(log, errors="replace").read()
+    ts = re.findall(r"\bt=(\d+)", txt)
+    if not ts:
+        print("carrier-count: no timestamps in client log; skipping", flush=True)
+        return 0
+    warmup_end = int(ts[0]) + int(warmup_s * 1000)
+    peak = 0
+    # carriers-diag lines carry both t= and n= (the [cli] status lines lack t=).
+    for m in re.finditer(r"carriers-diag t=(\d+) n=(\d+)", txt):
+        t, n = int(m.group(1)), int(m.group(2))
+        if t < warmup_end:
+            continue
+        peak = max(peak, n)
+    ok = peak <= max_count
+    print(f"carrier-count: peak {peak} carriers after {warmup_s:.0f}s warmup "
+          f"(limit {max_count}) -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test ssh-oll: proxy socket, TCP backend, latency measurements."
@@ -1345,6 +1372,14 @@ def main():
         type=float,
         default=100.0,
         help="When --latency-random: normal delay in ms. Default 100",
+    )
+    parser.add_argument(
+        "--latency-jitter-ms",
+        type=float,
+        default=0.0,
+        help="Add uniform random jitter in [0, N] ms to every chunk's delay (on top of "
+             "--latency-ms or --latency-random). Models a link's natural inter-packet spread. "
+             "Default 0 (off).",
     )
     parser.add_argument(
         "--iterations",
@@ -1564,6 +1599,14 @@ def main():
              "instability/churn. Only use on scenarios that do NOT inject carrier death/blackout. "
              "Implies client debug.",
     )
+    parser.add_argument(
+        "--assert-max-carrier-count",
+        type=int,
+        default=None,
+        help="After the run, fail if the client's carrier count ever exceeded N after startup. "
+             "Detects the redundancy-pressure runaway (carriers climbing to the cap). Implies "
+             "client debug.",
+    )
     args = parser.parse_args()
 
     # Build delay spec: constant seconds or callable() -> seconds for randomize mode
@@ -1579,6 +1622,17 @@ def main():
     else:
         latency_sec = args.latency_ms / 1000.0 if args.latency_ms else 0.0
         delay_spec = latency_sec
+    # Additive per-chunk jitter on top of the base/spike model: uniform [0, jitter]. Models
+    # the link's natural inter-packet spread (so the redundancy/carrier control sees a
+    # realistic arrival distribution, not perfectly-synchronized shards).
+    _jit_sec = getattr(args, "latency_jitter_ms", 0.0) / 1000.0
+    if _jit_sec > 0:
+        _base_spec = delay_spec
+        if callable(_base_spec):
+            delay_spec = lambda: _base_spec() + random.uniform(0.0, _jit_sec)
+        else:
+            _b = _base_spec
+            delay_spec = lambda: _b + random.uniform(0.0, _jit_sec)
     proxy_path = args.proxy_socket or f"/tmp/ssh-oll-test-script.{random_suffix()}"
 
     # Scenario configuration for the stop-then-recover tests.  Used by both
@@ -1705,7 +1759,8 @@ def main():
 
     # 4. Start client with --unix-socket-connection
     _client_debug = getattr(args, "client_debug", False) or \
-        getattr(args, "assert_max_carrier_removes", None) is not None
+        getattr(args, "assert_max_carrier_removes", None) is not None or \
+        getattr(args, "assert_max_carrier_count", None) is not None
     client_cmd = [
         args.ssh_oll_path,
         "--unix-socket-connection",
@@ -1799,6 +1854,8 @@ def main():
         # client, so its --debug log holds the whole run. Combine its verdict into the rc.
         if getattr(args, "assert_max_carrier_removes", None) is not None:
             rc = (rc or 0) | check_carrier_stability(client_proc.pid, args.assert_max_carrier_removes)
+        if getattr(args, "assert_max_carrier_count", None) is not None:
+            rc = (rc or 0) | check_carrier_count(client_proc.pid, args.assert_max_carrier_count)
         return rc
 
     if getattr(args, "scenario_wifi_heavy", False):

@@ -163,3 +163,41 @@ What shipped, and where it differs from the sketch above:
   carriers at the floor. Caveat: `B` must exceed the link's *normal* inter-shard spread;
   if a loss HoL-blocks a carrier it delays a *burst* of shards (so a 5 %-spike link can
   read `q≈25 %` and correctly max out — `B`=10 ms is then simply infeasible there).
+
+## 9. Revision (current): RTT-relative stall threshold + load-driven carriers
+
+§8's caveat became the dominant failure mode in practice: on a real ~300 ms-RTT link with
+~15 ms inter-shard jitter, the fixed `B = 10 ms` was *below* the link's median spread, so
+**more than half of all shards were "late" by definition** → `q` pinned at its 0.5 clamp →
+`rs = 2.0`, `copies = 14`, and (because the client grew carriers while `rs > 0.3`) the
+carrier count ran to `max_connections`. Everything maxed out, permanently. The reframe:
+
+- **`q` is the per-shard STALL probability, measured at retransmit scale — not vs a fixed
+  budget.** A stall is a block waiting for a TCP retransmit, which costs `~max(RTT, RTO_min)`;
+  Linux's RTO floor is ~200 ms, so on a low-RTT link a stall costs ~200 ms, NOT the RTT.
+  Hence a shard is *late* iff `gap > stall_threshold_ns(rtt) = max(RTT, 200 ms)/4` — ~50 ms on
+  a fast link, `RTT/4` on a high-RTT link. Tying it to the retransmit cost (not RTT) keeps it
+  above the host scheduling-jitter band in *both* regimes without a hand-tuned floor, so `q`
+  reads genuine loss/overload and does **not** saturate on base jitter. This gives
+  `q ≈ 1 − (1−p)^λ`: **background loss `p` is `q`'s floor (`λ≈1` ⇒ `q≈p`); carrier overload
+  (`λ` = packets/carrier/recovery-window) is the lever.** The `q ≤ 0.5` clamp is removed.
+  `--max-added-latency-ms` is now reserved/unused. Validated by the `fast-link-1pct-rto-stall`
+  scenario: a 10 ms link with 1% of chunks stalling 200 ms (a real RTO, HoL-blocking a burst)
+  keeps the inner stream at p50 ~11 ms / p99 ~41 ms — redundancy buys out the 200 ms stall.
+- **Carriers are LOAD×LOSS-driven, decoupled from redundancy (kills the runaway).** The
+  client sizes from the measured stall fraction `ρ̄`, holding it near `ρ_target≈0.02`:
+  `n* = clamp(⌈n·ln(1−ρ̄)/ln(1−ρ_target)⌉, floor, max)` (`carrier_adapt::
+  carrier_target_from_stall`). Because `ρ̄ = 1−(1−p)^λ`, a clean link (`ρ̄≈0`) stays at the
+  floor *regardless of throughput* — load alone never grows carriers (a first cut sized by
+  `R·W/τ` over-provisioned a clean 4000 pps flood to the cap; sizing by stall fraction fixed
+  that); a lossy/overloaded link grows. The old `redundancy_pressure` growth trigger is
+  **removed**. Recovery from a dead-but-connected outage is handled by an explicit
+  `link_stalled` trigger (unacked data + short receive-silence, *or* no receive at all for >
+  the keepalive interval — the latter covers s2c-only traffic), which is what
+  `redundancy_pressure` had been doing by accident.
+- **Result on the problem link:** `rs ≈ 0.2`, `copies ≈ 3`, carriers at the floor under
+  interactive load and scaling with offered load under bulk — instead of all-maxed.
+- **Files:** `carrier_adapt.{h,cc}` (`stall_threshold_ns`, `carrier_target_for_load`),
+  `server.cc` / `client.cc` (`on_rs_shard_gap` threshold, server adapt block, client carrier
+  sizing + `link_stalled`). Tests: `test_carrier_adapt.cc` (`test_stall_threshold`,
+  `test_carrier_target`) and the `real-link-jitter-highlat` scenario in `test_all.sh`.

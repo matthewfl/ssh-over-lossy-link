@@ -82,7 +82,7 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --small-packet-redundancy [N] For buffered data smaller than packet-size, send N copies without Reed–Solomon. In auto mode this is the cold-start value; the redundancy model then sets it. Default 2
 --rs-redundancy [N]           Reed–Solomon parity as a fraction of data (m/k). In auto mode this is the cold-start value; the probability model then sets it. Default 0.1
 --max-delay [N]               Max delay in ms for sending data while waiting for buffer to fill for Reed–Solomon.  Default 1ms
---max-added-latency-ms [N]    Latency budget B for the redundancy model: a shard arriving more than N ms after its group's first shard counts as "late". Lower N spends more parity/carriers for tighter latency; raise it on a high-jitter link to avoid over-provisioning. Default 10
+--max-added-latency-ms [N]    Reserved / currently unused. The redundancy model previously used this as an absolute "late" budget, but that saturated on base jitter; the stall threshold is now RTT-relative. The flag is still accepted for compatibility. Default 10
 --rtt-ms [N]                  Hint RTT (ms) for cold-start timeouts; 0 = auto from observed link latency. Use on high-latency links to avoid premature timeouts before first ACK. Default 0
 --connect-timeout [N]         SSH ConnectTimeout in seconds for carrier connections; 0 = no limit. Default 30
 --min-data-per-minute [N]     Idle keepalive: each carrier sends ≥N bytes/min in each direction (spread over 10s windows) so a firewall/NAT doesn't close an idle link. This is the only idle keepalive (blanket pinging was removed). Default 100; set 0 to disable
@@ -110,15 +110,19 @@ Auto mode controls two things: how many carrier connections to maintain, and how
 
 A *floor* of `max(2, --connections)` connections is always maintained, in both auto and non-auto mode. The client checks every 50 ms (when zero connections are alive) or 100 ms (otherwise) and opens a new connection if it is below the floor.
 
+**The carrier count is driven by load × loss, not by redundancy.** This is the primary lever. The client measures the per-shard *stall fraction* `ρ̄` (the same retransmit-scale "late" measure that drives redundancy, for the server→client direction) and sizes the fleet to hold `ρ̄` near a small target `ρ_target` (≈2%). Since `ρ̄ = 1−(1−p)^λ` with `λ = R·W/n` (packets per carrier per recovery window), the count that yields `ρ_target` scales as `desired = clamp(⌈n · ln(1−ρ̄) / ln(1−ρ_target)⌉, floor, --max-connections)`. The key property: a **clean** link has `ρ̄ ≈ 0` and stays at the floor *no matter how high the throughput* (more data does not mean more stalls without loss) — so a fast bulk/LAN transfer is **not** over-provisioned; a **lossy or overloaded** link grows (more carriers ⇒ lower `λ` ⇒ lower `ρ̄`). Redundancy then covers whatever residual stalls remain at that count (the server's *secondary* lever, and the backstop for the client→server direction). This replaces the old "redundancy pressure" trigger, which — when the redundancy signal saturated on jitter — drove the carrier count to `--max-connections` on any imperfect link.
+
 In auto mode, extra connections (up to `--max-connections`) are opened when any of the following triggers fires:
 
 | Trigger | Meaning |
 |---------|---------|
-| **Write backlog** | Total queued outgoing bytes across all carriers exceeds 150 × packet_size — the existing carriers can't keep up. |
+| **Load pressure** | The stall-driven target `desired` (above) exceeds the current count — the measured stall fraction is above `ρ_target`, so spreading load over more carriers will lower it. |
+| **Write backlog** | Total queued outgoing bytes across all carriers exceeds 150 × packet_size — the existing carriers can't keep up (throughput need). |
 | **RTT outlier** | A carrier's measured ACK round-trip time is both above 1 s and more than 5× the median peer RTT — that carrier is stalled while others are fine. |
-| **Redundancy pressure** | The model's RS redundancy is above a cap (~0.3). Each RS group uses one shard per carrier, so adding a carrier raises `k` (data shards per group) and lets the model *lower* the redundancy fraction — i.e. carriers and redundancy trade off. The add rate is adaptive: ~25 s apart normally, but ~3 s apart when redundancy is pinned at its 2.0 max (carriers are then the only lever to cut latency). |
+| **Link stall** | Either (a) there is unacked data outstanding and nothing has come back for a short RTT-scaled interval, or (b) *nothing at all* has been received for longer than the keepalive interval (covers server→client-only traffic, where the client sends nothing). The existing carriers are most likely dead-but-still-connected (a blackout that blocked traffic without dropping the TCP sockets, which never error and so escape zombie/rx-dead detection). Fresh carriers are opened to bypass them; a new connection re-establishes the path the moment the link returns. |
+| **RS-pending pressure** | A direction has many RS groups stuck waiting to decode — a safety valve on a very lossy path (rare once redundancy is sized correctly). |
 
-**Releasing carriers.** When the count is above the floor and redundancy is low (the link is good: model redundancy < 0.2) and there is no backlog, one excess carrier is released every ~15 s, so the count drifts back toward the floor instead of ratcheting up. The hysteresis (grow when redundancy > 0.3, shrink when < 0.2) keeps it from oscillating. The count therefore tracks actual need: at the floor on a clean link, higher on a lossy one.
+**Releasing carriers.** When the count is above the stall-driven `desired` and there is no heavy backlog, one excess carrier is released every ~15 s, so the count drifts back toward `desired` (and ultimately the floor) instead of ratcheting up. The count therefore tracks actual load × loss: at the floor on a clean link (even a fast one), higher on a lossy or overloaded one.
 
 **Reaping dead carriers** is driven by the *data*, not by pings (see [Dead-connection detection](#dead-connection-detection)): a carrier that goes silent while its peers keep delivering is identified, confirmed, and closed, and a correlated drop of many carriers is rerouted immediately.
 
@@ -126,17 +130,19 @@ In auto mode, extra connections (up to `--max-connections`) are opened when any 
 
 Redundancy is set from a stall-probability model rather than ad-hoc bump/decay heuristics. The full derivation is in [`REDUNDANCY_MODEL.md`](REDUNDANCY_MODEL.md); the summary:
 
-An RS group is `n` shards (`k` data + `m` parity, one shard per carrier). It is delivered as soon as any `k` arrive, so it **stalls** (must wait for a retransmit — a head-of-line delay) only if **more than `m`** of its `n` shards are *late*. Treating shard lateness as roughly independent with probability `q`, the number late is `~Binomial(n, q)` and the stall probability is `P(X > m)`. The model picks the smallest `m` (hence the smallest redundancy `r = m/k`) that holds `P(stall) ≤ ε`, with `ε = 0.01 %`, plus a small `+0.05` safety margin. Because `m` is computed from the *current* carrier count `n`, the redundancy **falls as carriers are added** — that is the feedback that lets carriers and redundancy trade off (and stops carriers from ratcheting up forever). Redundancy is clamped to `[0.1, 2.0]`.
+An RS group is `n` shards (`k` data + `m` parity, one shard per carrier). It is delivered as soon as any `k` arrive, so it **stalls** (must wait for a retransmit — a head-of-line delay) only if **more than `m`** of its `n` shards are *late*. Treating shard lateness as roughly independent with probability `q`, the number late is `~Binomial(n, q)` and the stall probability is `P(X > m)`. The model picks the smallest `m` (hence the smallest redundancy `r = m/k`) that holds `P(stall) ≤ ε`, with `ε = 0.01 %`, plus a small `+0.05` safety margin. Redundancy is clamped to `[0.1, 2.0]`.
 
-**"Late" is an absolute latency budget, not RTT-relative.** A shard counts as late if it arrives more than `B` after its group's first shard, where `B = --max-added-latency-ms` (default 10 ms). This is the acceptable head-of-line delay for the inner SSH stream — far tighter than the link's RTT (which may be hundreds of ms). On a 1–5 % loss link the arrival distribution is bimodal: shards that ride through arrive within a few ms of each other, while a shard hit by loss waits ~one RTT for a TCP retransmit; `B` sits in the gap, so the measured `q` ≈ the real loss/retransmit rate.
+**`q` is a per-shard *stall* probability measured at retransmit scale — not a jitter-vs-budget fraction.** A shard counts as late only if it arrives more than a **retransmit-scale threshold** after its group's first shard. A "stall" is a block waiting for a TCP retransmit, which costs `~max(RTT, RTO_min)` — and Linux's RTO floor is ~200 ms, so on a *low-RTT* link a stall costs ~200 ms, **not** the RTT. The threshold is therefore a quarter of the *retransmit cost*, `stall_threshold_ns(rtt) = max(RTT, ~200 ms)/4` — i.e. ~50 ms on a fast link, `RTT/4` on a high-RTT link (e.g. 75 ms at 300 ms RTT). Tying it to the retransmit cost (not the RTT) keeps it above the host's scheduling-jitter band in *both* regimes, so `q` reflects genuine loss/overload rather than base jitter, without a hand-tuned absolute floor. This is the key fix over the previous "absolute 10 ms budget" rule, which saturated (`q → 0.5`, redundancy pinned at 2.0) on any link whose median inter-shard spread exceeded 10 ms.
 
-**Estimating `q`:** each side counts, over a sliding window, the fraction of received shards whose gap from their group's first shard exceeds `B`. The server measures the client→server direction; the client measures server→client the same way and reports it in `CLIENT_METRICS`. A single redundancy value governs both directions, so it is sized for the worse one: `q = max(c2s, s2c)`. Re-evaluated every ~300 ms.
+This gives `q` the right structure: `q ≈ 1 − (1−p)^λ`, where `p` is the background packet-loss rate and `λ` is the number of packets each carrier sends per recovery window. So **background loss `p` is the floor** (`λ ≈ 1` ⇒ `q ≈ p`) and **carrier overload is the lever** (more packets per carrier ⇒ higher `λ` ⇒ higher `q` ⇒ more parity). On the user-reported link (≈300 ms RTT, ~15 ms jitter, ~2 % loss) the model now settles at `rs ≈ 0.2`, `copies ≈ 3` instead of the old `rs = 2.0`, `copies = 14`.
+
+**Estimating `q`:** each side counts, over a sliding window, the fraction of received shards whose gap from their group's first shard exceeds the stall threshold. The server measures the client→server direction; the client measures server→client the same way and reports it in `CLIENT_METRICS`. A single redundancy value governs both directions, so it is sized for the worse one: `q = max(c2s, s2c)`. Re-evaluated every ~300 ms.
 
 **Small-packet copies** (duplicate-on-distinct-carriers, used for sub-packet-size sends) come from the same `q`: the smallest `c` with `q^c ≤ ε`, i.e. `c = ⌈ln ε / ln q⌉`, clamped to `[2, carrier count]`.
 
 In `--auto` mode the **server owns** redundancy: it runs the model and pushes the value via `SERVER_CONFIG`; the client applies that and reports its s2c `q` back via `CLIENT_METRICS`. (The client still sends `SET_CONFIG` for non-redundancy settings such as packet size, but the server **ignores its redundancy fields in auto mode** so the model isn't overridden.) In manual mode the client's `SET_CONFIG` fully controls redundancy and no adaptation happens.
 
-> Tuning note: if you see redundancy pinned at 2.0 and the carrier count growing, the link's natural inter-shard spread exceeds `B` (10 ms can't be met). Check the `gap_ms_p50/p90/p99` figures in the server `--debug` log (`[adapt-model ...]` line) and raise `--max-added-latency-ms` toward `p90` to trade some latency for far fewer carriers.
+> `--max-added-latency-ms` no longer gates redundancy (the stall threshold is RTT-relative). If you see redundancy higher than expected, check the `q`/`gap_ms_p50/p90/p99` and `stall_ms` figures in the server `--debug` log (`[adapt-model ...]` line): a high `q` there means real loss/overload, not jitter.
 
 #### RTT-scaled timeouts
 
@@ -264,8 +270,8 @@ struct __attribute__((__packed__)) packet_carrier_status : packet_header {
 //   uint8_t can_decrease_rs; uint8_t can_decrease_small; }. Reports server→client path quality
 //   so the server (which owns redundancy in auto mode) can adapt using both directions.
 //   NOTE: in the probability-bounded redundancy model the `fraction_struggling` field carries
-//   the client's s2c per-shard loss estimate q (fraction of received shards arriving later than
-//   the latency budget B after their group's first shard); the server uses max(c2s_q, s2c_q).
+//   the client's s2c per-shard stall estimate q (fraction of received shards arriving later than
+//   the RTT-relative stall threshold after their group's first shard); the server uses max(c2s_q, s2c_q).
 //   The avg_* and can_decrease_* fields are legacy and currently unused by the server.
 
 ```

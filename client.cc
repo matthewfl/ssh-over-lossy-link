@@ -350,8 +350,8 @@ int run_client(const Args& args) {
   const uint64_t add_carrier_interval_ns = 100 * 1000000ULL;  // 100ms
   uint64_t last_adapt_ns = 0;
   uint64_t last_add_carrier_ns = 0;
-  uint64_t last_redundancy_pressure_add_ns = 0;  // rate-limit: at most one add per 25s from rs ratio
   uint64_t last_rs_pending_pressure_add_ns = 0;  // rate-limit: add every 10s when rs_pending is very high
+  uint64_t last_stall_recovery_add_ns = 0;       // rate-limit: add a fresh carrier during a link stall
   // RTT outlier threshold: carrier must be both 5× median AND above this absolute. Scales with link.
   uint64_t backpressure_write_threshold = 150 * effective_max_packet;  // updated when effective_max_packet changes
   float last_sent_rs_redundancy = -1.0f;   // sentinel so we send initial config when auto
@@ -366,11 +366,18 @@ int run_client(const Args& args) {
   // s2c per-shard loss estimate (same latency-budget method the server runs for c2s):
   // a received shard is "late" if its gap from the group's first shard exceeds B. Reported
   // to the server via CLIENT_METRICS so it can size redundancy for the worse direction.
-  const uint64_t s2c_latency_budget_ns =
-      std::max<uint64_t>(1, args.config.max_added_latency_ms) * 1000000ULL;
   uint64_t s2c_qest_total_gaps = 0;
   uint64_t s2c_qest_late_gaps = 0;
   float    s2c_loss_q = 0.0f;   // smoothed s2c late-fraction; sent in CLIENT_METRICS
+  // Load measurement for the load-driven carrier target (Lever 1). Count physical packets
+  // crossing the fleet per window in both directions (c2s shards/copies we send + s2c shards
+  // we receive); the rate drives desired_carriers so each carrier carries only ~tau packets
+  // per recovery window. This decouples carrier count from redundancy (kills the old runaway).
+  uint64_t c2s_packets_sent_window = 0;
+  uint64_t s2c_shards_recv_window = 0;
+  uint64_t load_window_start_ns = 0;
+  double   measured_pkt_rate = 0.0;          // smoothed packets/s across the fleet
+  unsigned desired_carriers_dyn = std::max(2u, args.config.connections);  // load-driven target (>= floor)
   // c2s metrics reported back by server in SERVER_METRICS.
   uint64_t c2s_avg_shard_spread_ns  = 0;
   uint64_t c2s_avg_extra_shard_gap_ns = 0;
@@ -606,10 +613,12 @@ int run_client(const Args& args) {
               (unsigned long long)(now/1000000ULL), s.c_str());
     }
   };
-  // s2c latency-budget loss estimate (mirrors the server's c2s measurement).
+  // s2c per-shard stall estimate (mirrors the server's c2s measurement): a shard arriving
+  // beyond the retransmit-scale threshold (~RTT/2) means its carrier stalled, not jittered.
   recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
     s2c_qest_total_gaps += 1;
-    if (gap_ns > s2c_latency_budget_ns) s2c_qest_late_gaps += 1;
+    if (gap_ns > carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())) s2c_qest_late_gaps += 1;
+    s2c_shards_recv_window += 1;
   };
   recv_cb.on_small_extra_copy = [&](uint64_t gap_ns) {
     s2c_small_extra_copy_gap_ns.push_back(gap_ns);
@@ -872,6 +881,7 @@ int run_client(const Args& args) {
         int cfd = it->first;
         ui.small_sent_on.insert(it->second.carrier_id);
         queue_to_carrier(cfd, stdin_buf.data(), chunk, false);  // increments next_send_id
+        c2s_packets_sent_window += 1;
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = cfd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -910,6 +920,7 @@ int run_client(const Args& args) {
           ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
       }
       next_send_id++;
+      c2s_packets_sent_window += num_shards;
       if (!carriers.empty())
         next_rr = (next_rr + static_cast<unsigned>(num_shards)) % static_cast<unsigned>(carriers.size());
       stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
@@ -939,6 +950,7 @@ int run_client(const Args& args) {
         }
         if (!carriers.empty())
           next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
+        c2s_packets_sent_window += n_copies;
         if (n_copies > 1) next_send_id++;
         stdin_buf.clear();
         stdin_partial_since_ns = 0;
@@ -1379,10 +1391,10 @@ int run_client(const Args& args) {
             last_carrier_diag_ns = now_p;
             size_t connecting_n = 0;
             for (auto& [cfd, cs] : carriers) if (cs.connecting) connecting_n++;
-            fprintf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u pending_reap=%zu "
+            fprintf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u desired=%u rate_pps=%.0f pending_reap=%zu "
                          "dead_idle=%zu reap=%zu rtt_outlier=%d]\n",
                     (unsigned long long)(now_p/1000000ULL), carriers.size(), connecting_n,
-                    target_carriers, pending_reap.size(),
+                    target_carriers, desired_carriers_dyn, measured_pkt_rate, pending_reap.size(),
                     quality.dead_idle_fds.size(), quality.reap_fds.size(), quality.rtt_outlier_fd);
             for (auto& [cfd, cs] : carriers) {
               bool in_reap = std::find(pending_reap.begin(), pending_reap.end(), cfd) != pending_reap.end();
@@ -1526,14 +1538,13 @@ int run_client(const Args& args) {
         for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
         const bool heavy_backlog = carrier_adapt::is_heavy_backlog(backlog_bytes, unacked_sends.size());
 
-        // Release excess carriers when redundancy is low (the link is good): we grow above
-        // target under redundancy pressure (rs > 0.3), so when rs falls well below that the
-        // extra carriers aren't needed — reduce back toward target so the count tracks need
-        // instead of ratcheting up. Hysteresis (shrink <0.2, grow >0.3) + a slow rate avoid
-        // oscillation. Runs in ALL modes (the dead-idle reap below is gated and skipped in
-        // light SSH traffic, which would otherwise leave grown carriers stuck forever).
-        if (args.config.auto_adapt && carriers.size() > target_carriers && !heavy_backlog
-            && effective_rs_redundancy < 0.2f
+        // Release excess carriers when the load-driven target (Lever 1) has fallen below the
+        // current count: offered load dropped, so the extra carriers aren't needed — shrink
+        // back toward the target so the count tracks load instead of ratcheting up. A slow
+        // rate (1 per interval) plus the target's own smoothing avoids oscillation. Runs in
+        // ALL modes (the dead-idle reap below is gated and skipped in light SSH traffic, which
+        // would otherwise leave grown carriers stuck forever).
+        if (args.config.auto_adapt && carriers.size() > desired_carriers_dyn && !heavy_backlog
             && now_p - last_excess_release_ns >= excess_release_interval_ns) {
           int to_close = -1;
           for (auto& [cfd, cs] : carriers) {
@@ -1625,6 +1636,32 @@ int run_client(const Args& args) {
     if (args.config.auto_adapt && !carriers.empty()) {
       const uint64_t now = now_ns();
 
+      // Carrier target (Lever 1, primary) = load × loss. Measure the fleet packet rate (c2s
+      // shards/copies we send + s2c shards we receive, both incl. redundancy) and cap each
+      // carrier's load at ~tau packets per recovery window W (= RTT): n* = ceil(R·W/tau) —
+      // BUT only when the link is actually stalling (s2c stall fraction `s2c_loss_q` >= gate).
+      // A clean link (no stalls) stays at the floor regardless of throughput, so a fast flood
+      // is not over-provisioned; a lossy/overloaded link spreads its load out. A lossy but
+      // low-rate (interactive) link also stays near the floor — its carriers aren't overloaded
+      // — and lets redundancy cover the loss. Sizing from the rate (not feeding back on n)
+      // keeps it stable: a transient stall spike can't ratchet the count up. The c2s direction
+      // is covered by the server's redundancy (Lever 2). Redundancy never feeds carrier growth.
+      if (load_window_start_ns == 0) load_window_start_ns = now;
+      uint64_t load_elapsed = now - load_window_start_ns;
+      if (load_elapsed >= 1000000000ULL) {
+        double secs = static_cast<double>(load_elapsed) / 1e9;
+        double rate = static_cast<double>(c2s_packets_sent_window + s2c_shards_recv_window) / secs;
+        measured_pkt_rate = (measured_pkt_rate > 0.0) ? (0.5 * measured_pkt_rate + 0.5 * rate) : rate;
+        c2s_packets_sent_window = 0;
+        s2c_shards_recv_window = 0;
+        load_window_start_ns = now;
+        static constexpr double kTargetPktsPerCarrier = 1.5;   // tau
+        static constexpr double kStallGate = 0.01;             // below this, treat as clean
+        desired_carriers_dyn = carrier_adapt::carrier_target_for_load(
+            measured_pkt_rate, get_effective_rtt_ns(), kTargetPktsPerCarrier,
+            static_cast<double>(s2c_loss_q), kStallGate, target_carriers, max_connections);
+      }
+
       // Compute per-carrier stats for both carrier-add and reaping decisions.
       size_t total_write = 0;
       std::vector<uint64_t> rtt_samples;
@@ -1668,69 +1705,59 @@ int run_client(const Args& args) {
       if (any_rs_pending_pressure && add_interval > RS_PENDING_PRESSURE_ADD_INTERVAL_NS)
         add_interval = RS_PENDING_PRESSURE_ADD_INTERVAL_NS;
 
+      // Link-stall recovery: the carrier count is steady but nothing is arriving — the
+      // existing carriers are most likely dead-but-still-connected (a blackout that blocked
+      // traffic without dropping the TCP sockets, so they never error and zombie/rx-dead
+      // detection — which needs a live peer or an advancing last_send — can't fire). Open
+      // FRESH carriers to bypass them; a new connection re-establishes the path the moment
+      // the link returns. This is an explicit, redundancy-independent recovery trigger — it
+      // replaces the old behaviour where redundancy_pressure happened to keep adding carriers
+      // during an outage. Two ways to detect the stall:
+      //   • fast path — we have data outstanding (unacked) and nothing has come back for a
+      //     short, RTT-scaled silence (bidirectional / client→server traffic);
+      //   • slow path — we have received NOTHING for longer than the keepalive interval, even
+      //     though we keep sending min-data keepalives (covers server→client-only traffic,
+      //     where unacked_sends is always empty so the fast path can't fire). The threshold
+      //     must exceed the ~10 s keepalive so a healthy-but-idle link (whose PONGs keep recv
+      //     fresh) is not mistaken for a stall.
+      uint64_t stall_recovery_interval_ns = scaled_ns(4, 2000000000ULL, 15000000000ULL);
+      uint64_t recv_silence_ns = (last_global_recv_ns > 0) ? (now - last_global_recv_ns) : 0;
+      bool stalled_with_pending = !unacked_sends.empty()
+                                  && recv_silence_ns > scaled_ns(4, 2000000000ULL, 30000000000ULL);
+      bool stalled_silent = recv_silence_ns > scaled_ns(8, 15000000000ULL, 60000000000ULL);
+      bool link_stalled = args.config.auto_adapt
+                          && last_global_recv_ns > 0
+                          && (stalled_with_pending || stalled_silent)
+                          && (now - last_stall_recovery_add_ns >= stall_recovery_interval_ns
+                              || last_stall_recovery_add_ns == 0);
+      if (link_stalled && add_interval > stall_recovery_interval_ns)
+        add_interval = stall_recovery_interval_ns;
+
       if (carriers.size() < max_connections && now - last_add_carrier_ns >= add_interval) {
-        // Five triggers:
-        //   1. Write backlog: existing carriers can't drain fast enough.
-        //   2. RTT outlier: one carrier is clearly stalled vs peers; open a replacement.
-        //   3. Redundancy pressure: RS redundancy has climbed above 0.4 (link is lossy).
-        //   4. rs_pending pressure: client has many s2c RS groups stuck (lossy s2c path).
-        //   5. server_rs_pending pressure: server has many c2s RS groups stuck (lossy c2s path).
-        //   6. small_packet saturation: small_packet_redundancy >= carriers means we're capped;
-        //      adding carriers lets us use that redundancy and improves RS group diversity.
-        // Redundancy ceiling. The server now computes redundancy from the probability
-        // model as a function of the carrier count (REDUNDANCY_MODEL.md), so it FALLS as
-        // carriers are added. We add carriers only while the server's redundancy is above
-        // this cap; once enough carriers exist to hold the stall bound under ~this much
-        // parity, the server's value drops below the cap and growth stops — a real
-        // terminating condition instead of growing to max_connections on any lossy link.
-        static constexpr float kRedundancyCap = 0.3f;
-        // Adaptive growth rate: gentle when redundancy is moderate, but when redundancy is
-        // pinned near its 2.0 max, parity can't protect the latency target any further —
-        // carriers are the only remaining lever, so ramp them much faster.
-        uint64_t redundancy_pressure_interval_ns =
-            (effective_rs_redundancy >= 1.9f) ? 3000000000ULL :      // saturated -> ~3s
-            (effective_rs_redundancy >= 1.0f) ? 10000000000ULL :     // high      -> ~10s
-                                                25000000000ULL;       // moderate  -> ~25s
-        bool small_packet_saturation = effective_small_packet_redundancy >= carriers.size();
-        bool redundancy_pressure = args.config.auto_adapt
-                                   && (effective_rs_redundancy > kRedundancyCap || small_packet_saturation)
-                                   && (now - last_redundancy_pressure_add_ns >= redundancy_pressure_interval_ns
-                                       || last_redundancy_pressure_add_ns == 0);
+        // Carrier-add triggers (load and health only — redundancy NO LONGER drives growth):
+        //   1. Load pressure: the load-driven target wants more carriers (Lever 1) so each
+        //      carrier carries only ~tau packets per recovery window.
+        //   2. Write backlog: existing carriers can't drain fast enough (throughput need).
+        //   3. RTT outlier: one carrier is clearly stalled vs peers; open a replacement.
+        //   4./5. rs_pending pressure: a direction has many RS groups stuck (safety valve on a
+        //      very lossy path; with redundancy properly sized this rarely fires).
+        //   6. Link stall: pending data + prolonged receive-silence → bypass dead carriers.
+        // Redundancy is the server's Lever 2 and is decoupled from carrier count, so a lossy
+        // link raises parity (bounded) without dragging the carrier count to max_connections.
+        bool load_pressure = (carriers.size() < desired_carriers_dyn);
         bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;
-        bool need_more = (total_write > backpressure_write_threshold)
+        bool need_more = load_pressure
+                         || (total_write > backpressure_write_threshold)
                          || (rtt_outlier && !unacked_sends.empty())  // no replace-add when idle
-                         || redundancy_pressure
                          || any_rs_pending_pressure
+                         || link_stalled
                          || need_replacement;
         if (need_more) {
           last_add_carrier_ns = now;
-          if (redundancy_pressure)
-            last_redundancy_pressure_add_ns = now;
           if (any_rs_pending_pressure)
             last_rs_pending_pressure_add_ns = now;
-          // New carrier from redundancy pressure = more diversity; nudge RS/small down.
-          // Client sets config via SET_CONFIG; server applies and echoes SERVER_CONFIG.
-          if (redundancy_pressure && !carriers.empty()) {
-            if (effective_rs_redundancy > 0.3f) {
-              effective_rs_redundancy = std::max(0.1f, effective_rs_redundancy - 0.02f);
-              last_sent_rs_redundancy = effective_rs_redundancy;
-            }
-            if (effective_small_packet_redundancy > 4u) {
-              effective_small_packet_redundancy = std::max(2u, effective_small_packet_redundancy - 1u);
-              last_sent_small_packet_redundancy = effective_small_packet_redundancy;
-            }
-            effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(1u, static_cast<unsigned>(carriers.size())));
-            int fd = carriers.begin()->first;
-            queue_config_to_carrier(fd,
-                                   static_cast<uint16_t>(effective_max_packet),
-                                   static_cast<uint16_t>(effective_small_packet_redundancy),
-                                   args.config.max_delay_ms,
-                                   effective_rs_redundancy,
-                                   1u);  // keep auto_adapt
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = fd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-          }
+          if (link_stalled)
+            last_stall_recovery_add_ns = now;
           if (!args.unix_socket_connection.empty()) {
             int fd = connect_unix(socket_path);
             if (fd >= 0) {
@@ -1743,7 +1770,8 @@ int run_client(const Args& args) {
                 const char* add_reason =
                     (total_write > backpressure_write_threshold) ? "backpressure" :
                     (rtt_outlier && !unacked_sends.empty()) ? "rtt_outlier" :
-                    redundancy_pressure ? "redundancy_pressure" :
+                    load_pressure ? "load_pressure" :
+                    link_stalled ? "link_stall" :
                     any_rs_pending_pressure ? "rs_pending_pressure" :
                     need_replacement ? "need_replacement" : "need_more";
                 if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
@@ -1794,7 +1822,8 @@ int run_client(const Args& args) {
                 const char* add_reason =
                     (total_write > backpressure_write_threshold) ? "backpressure" :
                     (rtt_outlier && !unacked_sends.empty()) ? "rtt_outlier" :
-                    redundancy_pressure ? "redundancy_pressure" :
+                    load_pressure ? "load_pressure" :
+                    link_stalled ? "link_stall" :
                     any_rs_pending_pressure ? "rs_pending_pressure" :
                     need_replacement ? "need_replacement" : "need_more";
                 if (dbg) fprintf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",

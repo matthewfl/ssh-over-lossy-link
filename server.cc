@@ -219,10 +219,9 @@ int run_server(const Args& args) {
   // A shard counts as "late" if it arrives more than the latency budget B after its
   // group's first shard (it would have added > B of head-of-line delay). Over each adapt
   // window: total shard-gaps seen and how many exceeded B. q = late/total. This is the
-  // absolute-budget criterion (NOT RTT-relative): B is the acceptable interactive delay.
-  // See REDUNDANCY_MODEL.md.
-  const uint64_t kLatencyBudgetNs =
-      std::max<uint64_t>(1, args.config.max_added_latency_ms) * 1000000ULL;  // acceptable HoL delay
+  // Per-shard stall probability is measured against a retransmit-scale threshold
+  // (carrier_adapt::stall_threshold_ns, ~RTT/2), computed live from the RTT estimate — not a
+  // fixed latency budget. See REDUNDANCY_MODEL.md.
   uint64_t qest_total_gaps = 0;
   uint64_t qest_late_gaps = 0;
   double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
@@ -495,11 +494,13 @@ int run_server(const Args& args) {
     c2s_gap_final_ns.push_back(gap_final_ns);
     while (c2s_gap_final_ns.size() > kMaxSpreadSamples) c2s_gap_final_ns.pop_front();
   };
-  // Latency-budget loss estimate: every shard's gap from its group's first shard; a gap
-  // beyond the budget means it would have added > B of head-of-line delay (late).
+  // Per-shard stall estimate: every shard's gap from its group's first shard. A gap beyond
+  // the retransmit-scale stall threshold (~RTT/2) means its carrier stalled (TCP retransmit)
+  // rather than merely jittered, so this counts genuine loss/overload — NOT the link's base
+  // jitter. The late fraction is rho-bar, which drives redundancy (see stall_threshold_ns).
   recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
     qest_total_gaps += 1;
-    if (gap_ns > kLatencyBudgetNs) qest_late_gaps += 1;
+    if (gap_ns > carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())) qest_late_gaps += 1;
     qest_recent_gaps.push_back(gap_ns);
     if (qest_recent_gaps.size() > 2000) qest_recent_gaps.pop_front();
   };
@@ -1181,8 +1182,10 @@ int run_server(const Args& args) {
       static constexpr double kTargetStallProb = 0.0001;   // 0.01%
       static constexpr float  kRedundancyMargin = 0.05f;   // headroom over the formula
       if (qest_total_gaps >= 100) {
+        // q is now the per-shard STALL probability (gap > retransmit-scale threshold), not a
+        // jitter-vs-budget fraction, so it reflects real loss/overload and does not saturate
+        // on base jitter. No 0.5 clamp: a genuinely high stall rate should drive real parity.
         double q = static_cast<double>(qest_late_gaps) / static_cast<double>(qest_total_gaps);
-        if (q > 0.5) q = 0.5;   // beyond this, RS won't save us; reconnect path handles it
         // Light smoothing so a single noisy window doesn't swing the config.
         est_loss_q = have_loss_q ? (0.5 * est_loss_q + 0.5 * q) : q;
         have_loss_q = true;
@@ -1214,11 +1217,11 @@ int run_server(const Args& args) {
           g99 = g[std::min(g.size() - 1, g.size() * 99 / 100)];
         }
         fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u "
-                     "B_ms=%llu gap_ms_p50=%.1f p90=%.1f p99=%.1f]\n",
+                     "stall_ms=%llu gap_ms_p50=%.1f p90=%.1f p99=%.1f]\n",
                 (unsigned long long)(now_ns_val/1000000ULL), q_used,
                 est_loss_q, (double)s2c_loss_q, n_now,
                 (double)runtime_rs_redundancy, copies,
-                (unsigned long long)(kLatencyBudgetNs/1000000ULL),
+                (unsigned long long)(carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())/1000000ULL),
                 g50/1e6, g90/1e6, g99/1e6);
       }
 

@@ -300,6 +300,47 @@ void test_stall_bound_model() {
   check(small_copies_for_loss(0.0,  eps) == 1, "model: q=0 -> 1 copy");
 }
 
+// ── retransmit-scale stall threshold ─────────────────────────────────────────
+void test_stall_threshold() {
+  // A quarter of the retransmit cost = max(RTT, RTO_min~200ms)/4. High-RTT -> RTT/4; low-RTT
+  // -> RTO_min/4 (= 50ms), NOT RTT/4 (which would dip into the jitter band).
+  check(stall_threshold_ns(300000000ULL) == 75000000ULL, "stall: 300ms RTT -> 75ms (RTT/4)");
+  check(stall_threshold_ns(800000000ULL) == 200000000ULL, "stall: 800ms RTT -> 200ms (RTT/4)");
+  check(stall_threshold_ns(40000000ULL)  == 50000000ULL, "stall: 40ms RTT -> 50ms (RTO/4)");
+  check(stall_threshold_ns(0ULL)         == 50000000ULL, "stall: 0 RTT -> 50ms (RTO/4)");
+  check(stall_threshold_ns(200000000ULL) == 50000000ULL, "stall: 200ms RTT -> 50ms (RTO/4)");
+  // base jitter is BELOW the threshold; a retransmit (>= ~1 RTT, or >= RTO on a fast link) is
+  // ABOVE it — so the late-fraction reads real stalls, not jitter, in both regimes.
+  check(15000000ULL  < stall_threshold_ns(300000000ULL), "stall: 15ms jitter below 300ms-RTT thr");
+  check(300000000ULL > stall_threshold_ns(300000000ULL), "stall: retransmit above 300ms-RTT thr");
+  check(200000000ULL > stall_threshold_ns(20000000ULL),  "stall: 200ms RTO above fast-link thr");
+  check(40000000ULL  < stall_threshold_ns(20000000ULL),  "stall: 40ms jitter below fast-link thr (50ms)");
+}
+
+// ── carrier target = load × loss (gated R·W/tau) ─────────────────────────────
+void test_carrier_target() {
+  const double tau = 1.5, gate = 0.01;
+  // CLEAN link (stall fraction below the gate) -> floor, regardless of throughput. This is
+  // the key property: a fast flood with no loss is not over-provisioned.
+  check(carrier_target_for_load(4000.0, 20000000ULL, tau, 0.0, gate, 5, 50) == 5,
+        "load: clean 4000pps @20ms -> floor (no over-provision)");
+  check(carrier_target_for_load(4000.0, 20000000ULL, tau, 0.005, gate, 5, 50) == 5,
+        "load: near-clean high rate -> floor");
+  // LOSSY flood -> grow, capping per-carrier load at tau (4000*0.02/1.5 = 53 -> cap 50).
+  check(carrier_target_for_load(4000.0, 20000000ULL, tau, 0.05, gate, 5, 50) == 50,
+        "load: lossy 4000pps @20ms -> cap");
+  // LOSSY but LOW-RATE (interactive) -> floor: carriers aren't overloaded, redundancy covers
+  // the loss (20pps * 0.3s / 1.5 = 4 -> floor 8).
+  check(carrier_target_for_load(20.0, 300000000ULL, tau, 0.05, gate, 8, 60) == 8,
+        "load: lossy 20pps @300ms -> floor (not overloaded)");
+  // LOSSY bulk @ high RTT -> scales up (290 * 0.3 / 1.5 = 58).
+  check(carrier_target_for_load(290.0, 300000000ULL, tau, 0.05, gate, 8, 60) == 58,
+        "load: lossy 290pps @300ms -> 58");
+  // Idle -> floor.
+  check(carrier_target_for_load(0.0, 300000000ULL, tau, 0.05, gate, 8, 60) == 8,
+        "load: idle -> floor");
+}
+
 }  // namespace
 
 int main() {
@@ -311,6 +352,8 @@ int main() {
   test_reap_no_churn_while_link_up();
   test_reap_send_only_zombie();
   test_stall_bound_model();
+  test_stall_threshold();
+  test_carrier_target();
   if (g_failures) {
     std::fprintf(stderr, "carrier_adapt tests: %d failure(s)\n", g_failures);
     return 1;

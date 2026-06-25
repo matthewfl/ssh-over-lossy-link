@@ -210,6 +210,30 @@ run_test "random-100ms-base-2000ms-spike-5pct" \
     --test-min-packets        600
 
 # ============================================================================
+# 5b. Fast link + RTO-floor stalls — the case the retransmit-scale stall model is
+#     built for. A 10 ms link where 1% of chunks stall 200 ms (Linux TCP RTO_min):
+#     on a fast link a lost packet costs ~200 ms (NOT the RTT), and the harness's
+#     sequential relay makes that stall HoL-block a burst, exactly like a real RTO.
+#     The point of the test: redundancy + carrier-spread must BUY OUT the 200 ms
+#     stall so the inner stream's typical latency stays at the ~12 ms base rather
+#     than seeing 200 ms blips. Observed: p50 ~11 ms, p99 ~41 ms, only an ε-rare
+#     tail near 180 ms. The loose after-warmup bound (≪ 200 ms) is the design
+#     guarantee — if redundancy did NOT buy out the stall the average would be far
+#     higher — so it stays green regardless of the exact stall-threshold tuning.
+# ============================================================================
+run_test "fast-link-1pct-rto-stall" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 60 \
+    --latency-random \
+    --latency-random-low-ms   10  \
+    --latency-random-high-ms 200  \
+    --latency-random-pct       1  \
+    --test-max-latency        350 \
+    --test-max-average-latency 120 \
+    --test-max-average-latency-after-warmup 80 \
+    --test-min-packets        400
+
+# ============================================================================
 # 6. Rare connection death — 0.2 % per-packet probability.
 #    RS + retransmit should recover within a few seconds.
 #    50 ms base latency so the connection isn't trivially fast.
@@ -353,6 +377,34 @@ run_test "high-latency-low-backlog-stability" \
     --test-max-latency        60000 \
     --test-max-average-latency 5000 \
     --test-max-average-latency-after-warmup 3000 \
+    --test-min-packets           12
+
+# ============================================================================
+# 8e. Real-link profile (user-reported): ~300 ms RTT (150 ms one-way base),
+#     high ~15 ms inter-chunk jitter, and ~2% loss-induced stalls (+300 ms).
+#     This is the case that pinned the OLD control loop at the max
+#     (carriers=120, rs=2.0, copies=14) because the 15 ms jitter exceeded the
+#     fixed 10 ms latency budget so q saturated. With the stall-probability
+#     model the redundancy now tracks the real ~2% stall rate (rs≈0.2,
+#     copies≈3) and the load-driven carrier count stays near the floor under
+#     interactive (small-packet) traffic. We assert the carrier count does NOT
+#     run toward the cap and that the link is stable (no churn-removes).
+# ============================================================================
+run_test "real-link-jitter-highlat" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 120 \
+    --continuous-min-size 32 \
+    --continuous-max-size 128 \
+    --latency-random \
+    --latency-random-low-ms  150 \
+    --latency-random-high-ms 450 \
+    --latency-random-pct     2   \
+    --latency-jitter-ms      15  \
+    --assert-max-carrier-count    25 \
+    --assert-max-carrier-removes   4 \
+    --test-max-latency        60000 \
+    --test-max-average-latency 6000 \
+    --test-max-average-latency-after-warmup 3500 \
     --test-min-packets           12
 
 # ============================================================================
