@@ -152,6 +152,11 @@ model every ~300 ms:
   probability `q`, that's `P(Binomial(n,q) > m)`. Pick the smallest `m` (smallest
   redundancy `r = m/k`) holding `P(stall) ≤ ε` (ε = 0.01 %), then add a `+0.05` margin;
   clamp to **[0.1, 2.0]**. `m` uses the *current* carrier count, so r falls as carriers grow.
+- **Asymmetric apply — fast UP, slow DOWN.** The model's value is the *target*; if it's
+  above the current rs/copies it's applied immediately (restore protection), but DECREASES
+  are rate-limited (`rs` ≤ ~0.1/s via `kRsDecreasePerSec`; copies ≤ 1 per ~2 s via
+  `kCopiesDecreaseIntervalNs`). Stops a single quiet window from crashing redundancy and
+  oscillating. Exempt: the "copies ≤ live carrier count" hard cap drops immediately.
 - **"late" = a retransmit-scale STALL threshold** — *not* the old fixed
   `--max-added-latency-ms` budget (that saturated `q→0.5` on any link whose median
   inter-shard jitter exceeded 10 ms, pinning everything at max). A stall = waiting for a TCP

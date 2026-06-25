@@ -189,6 +189,7 @@ int run_server(const Args& args) {
   // server launch command so this matches what the user set.
   float runtime_rs_redundancy = std::max(0.1f, args.config.rs_redundancy);
   unsigned runtime_small_packet_redundancy = std::max(2u, args.config.small_packet_redundancy);
+  uint64_t last_copies_decrease_ns = 0;   // rate-limit small-packet copy DECREASES (fast up, slow down)
   bool runtime_auto_adapt = false;  // set from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
   uint32_t runtime_reconnect_timeout_sec = (uint32_t)args.config.reconnect_timeout_sec;
   // --max-delay (client-provided via SET_CONFIG): hold a backend→client sub-block remainder
@@ -1173,8 +1174,16 @@ int run_server(const Args& args) {
     // When auto_adapt, server manages its own redundancy and informs the client.
     if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns
         && c2s_shard_spread_ns.size() >= carrier_adapt::kMinSamplesForAdapt) {
+      const uint64_t adapt_dt = now_ns_val - last_adapt_ns;  // elapsed since last adapt (rate-limiting)
       last_adapt_ns = now_ns_val;
       const uint64_t s2c_stale_ns = 2 * metrics_interval_ns;
+      // Asymmetric adaptation — fast UP, slow DOWN. Redundancy rises immediately to restore
+      // protection the moment the link degrades, but only falls at a bounded rate: a single
+      // quiet measurement window must not crash redundancy and trigger the oscillation
+      // (rs 1.5->0.5, copies 10->6 then climbing right back) seen in the logs. We shed
+      // protection only when the link stays good for a while.
+      static constexpr double kRsDecreasePerSec = 0.10;            // rs units/sec downward cap
+      static constexpr uint64_t kCopiesDecreaseIntervalNs = 2000000000ULL;  // >=2s per -1 copy
 
       // Probability-bounded redundancy model (see REDUNDANCY_MODEL.md): estimate the
       // per-shard loss q from this window, then set redundancy to the minimum that holds
@@ -1204,7 +1213,13 @@ int run_server(const Args& args) {
       const unsigned n_now = static_cast<unsigned>(carriers.size());
       float r_model = carrier_adapt::redundancy_for_stall_bound(n_now, q_used, kTargetStallProb)
                       + kRedundancyMargin;
-      runtime_rs_redundancy = std::min(2.0f, std::max(0.1f, r_model));
+      float rs_target = std::min(2.0f, std::max(0.1f, r_model));
+      if (rs_target >= runtime_rs_redundancy) {
+        runtime_rs_redundancy = rs_target;                 // up: immediate
+      } else {                                             // down: bounded rate
+        float max_drop = static_cast<float>(kRsDecreasePerSec * (static_cast<double>(adapt_dt) / 1e9));
+        runtime_rs_redundancy = std::max(rs_target, runtime_rs_redundancy - max_drop);
+      }
 
       // Small-packet copies are sized for interactive SMOOTHNESS, not the retransmit bound. A
       // small (sub-block, interactive) packet is delivered at the MIN over its copies, so we
@@ -1225,8 +1240,17 @@ int run_server(const Args& args) {
       double q_jitter = (jit_total >= 30) ? static_cast<double>(jit_late) / static_cast<double>(jit_total)
                                           : q_used;
       unsigned copies = carrier_adapt::small_copies_for_loss(q_jitter, carrier_adapt::kInteractiveEps);
+      unsigned copies_target = std::min(std::max(2u, n_now), std::max(2u, copies));
+      if (copies_target >= runtime_small_packet_redundancy) {
+        runtime_small_packet_redundancy = copies_target;  // up: immediate
+      } else if (now_ns_val - last_copies_decrease_ns >= kCopiesDecreaseIntervalNs) {
+        runtime_small_packet_redundancy -= 1;              // down: at most one copy per interval
+        last_copies_decrease_ns = now_ns_val;
+      }
+      // Hard cap: a copy needs a distinct carrier, so never exceed the live carrier count
+      // (this can force an immediate drop when carriers die — protection, not relaxation).
       runtime_small_packet_redundancy =
-          std::min(std::max(2u, n_now), std::max(2u, copies));
+          std::min(runtime_small_packet_redundancy, std::max(2u, n_now));
       if (dbg) {
         // Shard-gap percentiles (ms) so the latency budget B can be tuned: set B above the
         // "normal" spread (around p50-p90) but below a retransmit-scale delay (the tail).
