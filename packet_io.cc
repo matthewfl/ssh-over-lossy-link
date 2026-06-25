@@ -1,5 +1,6 @@
 #include "packet_io.h"
 #include "reed_solomon.h"
+#include "carrier_adapt.h"
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -306,14 +307,24 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
   out.insert(out.end(), data, data + len);
 }
 
-RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks) {
+RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks,
+                              double interactive_q, double interactive_eps) {
   RsGroupParams p;
   unsigned n_carriers = static_cast<unsigned>(std::min(live_carriers, static_cast<size_t>(255)));
   unsigned k = std::max(1u, static_cast<unsigned>(static_cast<float>(n_carriers) / (1.0f + rs_frac)));
   k = static_cast<unsigned>(std::min(static_cast<size_t>(k), available_blocks));
   p.k = k;
   if (k == 0) return p;  // nothing buffered yet; caller stops
+  // Bulk: parity as a fraction of k (throughput-oriented, tolerates the retransmit-scale tail).
   unsigned m = std::max(1u, static_cast<unsigned>(k * rs_frac + 0.5f));
+  // Interactive (small backlog, interactive_q>0): raise parity to the SMOOTHNESS bound so a
+  // small low-k group is as robust as a duplicated small packet — any k shards within the
+  // jitter budget decode it. This fixes the fragility where a 2-packet burst became k=2,m=1
+  // (only 1 stall tolerated) while a small packet got many copies.
+  if (interactive_q > 0.0) {
+    unsigned mi = carrier_adapt::parity_for_blocks(k, interactive_q, interactive_eps);
+    if (mi > m) m = mi;
+  }
   unsigned n = std::min(k + m, n_carriers);  // cap so each shard lands on a distinct carrier
   p.n = n;
   p.m = n - k;

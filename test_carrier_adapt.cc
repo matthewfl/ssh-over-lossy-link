@@ -300,6 +300,25 @@ void test_stall_bound_model() {
   check(small_copies_for_loss(0.0,  eps) == 1, "model: q=0 -> 1 copy");
 }
 
+// ── interactive parity for k data blocks (per-group P(stall) <= eps) ──────────
+void test_parity_for_blocks() {
+  // k=1 is the duplicate-small-packet case: parity_for_blocks(1,q,eps) == copies - 1.
+  for (double q : {0.05, 0.1, 0.18, 0.3}) {
+    unsigned copies = small_copies_for_loss(q, 1e-4);
+    check(parity_for_blocks(1, q, 1e-4) + 1 == copies, "parity: k=1 == copies-1 (eps 1e-4)");
+  }
+  // Needing k arrivals (not 1) costs extra parity: a 2-block burst needs MORE than 1 extra
+  // parity over the 1-block case, because both data shards must arrive.
+  // q=0.18, eps=1e-5: 1 packet -> 7 copies (m=6); 2 blocks -> "2 of 9" (m=7), not "2 of 8".
+  check(parity_for_blocks(1, 0.18, 1e-5) == 6, "parity: k=1 q18% -> m=6 (copies=7)");
+  check(parity_for_blocks(2, 0.18, 1e-5) == 7, "parity: k=2 q18% -> m=7 (2 of 9, not 2 of 8)");
+  // q=0.1, eps=1e-4: k=1 -> m=3 (q^4=1e-4); k=2 -> m=4 (2 of 6).
+  check(parity_for_blocks(1, 0.1, 1e-4) == 3, "parity: k=1 q10% -> m=3");
+  check(parity_for_blocks(2, 0.1, 1e-4) == 4, "parity: k=2 q10% -> m=4 (2 of 6)");
+  // No loss -> no parity.
+  check(parity_for_blocks(5, 0.0, 1e-4) == 0, "parity: q=0 -> m=0");
+}
+
 // ── retransmit-scale stall threshold ─────────────────────────────────────────
 void test_stall_threshold() {
   // A quarter of the retransmit cost = max(RTT, RTO_min~200ms)/4. High-RTT -> RTT/4; low-RTT
@@ -352,6 +371,7 @@ int main() {
   test_reap_no_churn_while_link_up();
   test_reap_send_only_zombie();
   test_stall_bound_model();
+  test_parity_for_blocks();
   test_stall_threshold();
   test_carrier_target();
   if (g_failures) {

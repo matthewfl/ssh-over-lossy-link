@@ -263,6 +263,28 @@ void test_rs_group_params() {
     auto p = rs_group_params(10, 1.0f, 100);
     check(p.k == 5 && p.m == 5 && p.n == 10, "group_params: 10 carriers @1.0 -> k5 m5 n10");
   }
+  // Interactive sizing: a small 2-block burst on a jittery link gets smoothness-grade parity
+  // (any k within the budget decode it), not the bulk fraction. interactive_q=0.18, eps=1e-5
+  // -> parity_for_blocks(2)=7 -> k2 m7 n9 ("2 of 9"), spread over 9 of the 24 carriers.
+  {
+    auto p = rs_group_params(24, 0.5f, 2, /*interactive_q=*/0.18, /*eps=*/1e-5);
+    check(p.k == 2 && p.m == 7 && p.n == 9, "group_params: interactive k2 -> m7 n9 (2 of 9)");
+  }
+  // Same burst WITHOUT interactive sizing falls back to the bulk fraction (k2 @0.5 -> m1 n3).
+  {
+    auto p = rs_group_params(24, 0.5f, 2);
+    check(p.k == 2 && p.m == 1 && p.n == 3, "group_params: bulk k2 @0.5 -> m1 n3");
+  }
+  // Interactive parity is capped by the live carrier count (can't exceed n_carriers).
+  {
+    auto p = rs_group_params(5, 0.5f, 2, 0.18, 1e-5);
+    check(p.k == 2 && p.n == 5 && p.m == 3, "group_params: interactive capped at carriers (n5)");
+  }
+  // Bulk (large k) already exceeds the interactive floor, so interactive_q doesn't change it.
+  {
+    auto p = rs_group_params(24, 0.5f, 100, 0.18, 1e-5);  // k=floor(24/1.5)=16, m=round(8)=8
+    check(p.k == 16 && p.m == 8 && p.n == 24, "group_params: bulk k16 unaffected by interactive");
+  }
 }
 
 }  // namespace

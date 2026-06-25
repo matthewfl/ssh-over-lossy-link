@@ -143,6 +143,17 @@ std::string launch_server(const Args& args) {
     snprintf(mal_buf, sizeof mal_buf, "%u", args.config.max_added_latency_ms);
     argv_vec.push_back("--max-added-latency-ms");
     argv_vec.push_back(mal_buf);
+    // Propagate the configured initial redundancy so the server cold-starts the
+    // server->client direction at the user's --rs-redundancy / --small-packet-redundancy
+    // (the "initial" values) before its probability model has enough samples to adapt.
+    char rs_buf[32];
+    snprintf(rs_buf, sizeof rs_buf, "%.4f", (double)args.config.rs_redundancy);
+    argv_vec.push_back("--rs-redundancy");
+    argv_vec.push_back(rs_buf);
+    char sp_buf[32];
+    snprintf(sp_buf, sizeof sp_buf, "%u", args.config.small_packet_redundancy);
+    argv_vec.push_back("--small-packet-redundancy");
+    argv_vec.push_back(sp_buf);
     argv_vec.push_back(args.remote_hostname.c_str());
     argv_vec.push_back(port_str.c_str());
     argv_vec.push_back(nullptr);
@@ -342,8 +353,13 @@ int run_client(const Args& args) {
 
   // Effective config: when auto_adapt and we have SERVER_CONFIG, use server's; else use local.
   bool has_server_config = false;
-  float effective_rs_redundancy = args.config.auto_adapt ? std::max(args.config.rs_redundancy, 0.6f) : args.config.rs_redundancy;
-  unsigned effective_small_packet_redundancy = args.config.auto_adapt ? std::max(args.config.small_packet_redundancy, 6u) : std::max(args.config.small_packet_redundancy, 2u);
+  // Cold-start at the user's CONFIGURED redundancy (with only the system minimums), in both
+  // modes. In auto mode this is the "initial" value; the server's model then takes over via
+  // SERVER_CONFIG. (Previously auto mode forced 0.6/6 here, ignoring the configured values
+  // until the model kicked in — which is what made the initial --rs-redundancy /
+  // --small-packet-redundancy look unrespected.)
+  float effective_rs_redundancy = std::max(0.1f, args.config.rs_redundancy);
+  unsigned effective_small_packet_redundancy = std::max(2u, args.config.small_packet_redundancy);
   std::deque<uint64_t> recent_rtt_ns;
   const size_t max_recent_rtt = 100;
   const uint64_t adapt_interval_ns = 300 * 1000000ULL;   // 300ms
@@ -864,8 +880,19 @@ int run_client(const Args& args) {
     while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
       const size_t block_size = effective_max_packet;
       float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
+      // Interactive (small backlog) groups get smoothness-grade parity so a small low-k burst
+      // is as robust as a duplicated small packet. We recover the per-carrier jitter q from the
+      // copy count (copies = ceil(ln eps / ln q), so q ≈ eps^(1/copies)) the server pushes —
+      // no extra wire field. Bulk groups (heavy unacked backlog) pass 0 → parity-as-fraction.
+      double iq = 0.0;
+      if (args.config.auto_adapt &&
+          !carrier_adapt::is_heavy_backlog(0, unacked_sends.size())) {
+        unsigned c = std::max(2u, effective_small_packet_redundancy);
+        iq = std::pow(carrier_adapt::kInteractiveEps, 1.0 / static_cast<double>(c));
+      }
       // One shard per carrier so any k of them suffice to decode (see rs_group_params).
-      auto gp = packet_io::rs_group_params(carriers.size(), rs_frac, stdin_buf.size() / block_size);
+      auto gp = packet_io::rs_group_params(carriers.size(), rs_frac, stdin_buf.size() / block_size,
+                                           iq, carrier_adapt::kInteractiveEps);
       unsigned k = gp.k;
       if (k == 0) break;
       unsigned m = gp.m;
@@ -1391,10 +1418,23 @@ int run_client(const Args& args) {
             last_carrier_diag_ns = now_p;
             size_t connecting_n = 0;
             for (auto& [cfd, cs] : carriers) if (cs.connecting) connecting_n++;
-            fprintf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u desired=%u rate_pps=%.0f pending_reap=%zu "
-                         "dead_idle=%zu reap=%zu rtt_outlier=%d]\n",
+            // Control-decision inputs, all on one line: carrier-count bounds (floor..max),
+            // the load-driven target `desired` and what drives it (s2c stall fraction `s2c_q`
+            // and the fleet packet `rate_pps`), the current redundancy the server pushed
+            // (`rs`/`copies`), and the RTT + derived stall threshold the late-measurement uses.
+            size_t diag_backlog = 0;
+            for (const auto& [_, ui] : unacked_sends) diag_backlog += ui.data.size();
+            uint64_t diag_rtt = get_effective_rtt_ns();
+            fprintf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u max=%u desired=%u "
+                         "rate_pps=%.0f s2c_q=%.3f rs=%.2f copies=%u rtt_ms=%llu stall_ms=%llu "
+                         "unacked=%zu backlog_b=%zu pending_reap=%zu dead_idle=%zu reap=%zu rtt_outlier=%d]\n",
                     (unsigned long long)(now_p/1000000ULL), carriers.size(), connecting_n,
-                    target_carriers, desired_carriers_dyn, measured_pkt_rate, pending_reap.size(),
+                    target_carriers, max_connections, desired_carriers_dyn,
+                    measured_pkt_rate, (double)s2c_loss_q,
+                    (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy,
+                    (unsigned long long)(diag_rtt/1000000ULL),
+                    (unsigned long long)(carrier_adapt::stall_threshold_ns(diag_rtt)/1000000ULL),
+                    unacked_sends.size(), diag_backlog, pending_reap.size(),
                     quality.dead_idle_fds.size(), quality.reap_fds.size(), quality.rtt_outlier_fd);
             for (auto& [cfd, cs] : carriers) {
               bool in_reap = std::find(pending_reap.begin(), pending_reap.end(), cfd) != pending_reap.end();
@@ -1744,7 +1784,13 @@ int run_client(const Args& args) {
         //   6. Link stall: pending data + prolonged receive-silence → bypass dead carriers.
         // Redundancy is the server's Lever 2 and is decoupled from carrier count, so a lossy
         // link raises parity (bounded) without dragging the carrier count to max_connections.
-        bool load_pressure = (carriers.size() < desired_carriers_dyn);
+        // load_pressure only grows ABOVE the floor — below the floor is the dedicated
+        // floor-maintenance block's job, which BURSTS multiple carriers per interval. Both
+        // paths share last_add_carrier_ns, and this (earlier) block runs first; if
+        // load_pressure fired below the floor it would add a single carrier and starve the
+        // burst, slowing the initial ramp to --connections from ~5/100ms to ~1/100ms.
+        bool load_pressure = (carriers.size() >= target_carriers)
+                             && (carriers.size() < desired_carriers_dyn);
         bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;
         bool need_more = load_pressure
                          || (total_write > backpressure_write_threshold)

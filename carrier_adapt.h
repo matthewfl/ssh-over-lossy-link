@@ -123,6 +123,21 @@ float redundancy_for_stall_bound(unsigned n, double q, double eps);
 // Smallest number of duplicate copies c for a SMALL packet so P(all lost)=q^c <= eps.
 unsigned small_copies_for_loss(double q, double eps);
 
+// Target per-group "miss" probability for INTERACTIVE (small/latency-sensitive) data, used by
+// both small-packet copies and small RS-group parity. Far tighter than the bulk RS stall bound
+// because every interactive packet's tail is felt by the user: a per-packet 0.01% still hiccups
+// every few seconds at interactive rates. Interactive data is tiny, so the extra shards/copies
+// it buys cost almost no bandwidth.
+constexpr double kInteractiveEps = 1e-5;
+
+// Smallest parity m for a group of k data blocks (n=k+m shards, any k decode) so the per-group
+// stall probability P(Binomial(k+m,q) > m) <= eps. This is the per-k generalization of
+// small_copies_for_loss (which is the k=1 case, copies=m+1): it gives a SMALL multi-block burst
+// the same near-min-RTT robustness as a duplicated small packet, instead of the bulk
+// parity-as-a-fraction (which leaves a low-k group with too little parity). caller clamps n to
+// the live carrier count.
+unsigned parity_for_blocks(unsigned k, double q, double eps);
+
 // Retransmit-scale "stall" threshold. A received shard arriving more than this after its
 // group's FIRST shard indicates its carrier stalled — a per-carrier TCP retransmit, which
 // takes >= ~1 RTT — as opposed to normal inter-carrier jitter (a small fraction of RTT on a

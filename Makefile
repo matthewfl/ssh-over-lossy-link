@@ -41,8 +41,8 @@ reed_solomon.o: reed_solomon.cc reed_solomon.h
 test_reed_solomon: test_reed_solomon.cc $(REED_SOLOMON_OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ test_reed_solomon.cc $(REED_SOLOMON_OBJ) $(LDFLAGS_STATIC)
 
-test_packet_io: test_packet_io.cc packet_io.o $(REED_SOLOMON_OBJ) packet_io.h ssholl.h
-	$(CXX) $(CXXFLAGS) -o $@ test_packet_io.cc packet_io.o $(REED_SOLOMON_OBJ) $(EPOLL_LDFLAGS) $(LDFLAGS_STATIC)
+test_packet_io: test_packet_io.cc packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ) packet_io.h ssholl.h
+	$(CXX) $(CXXFLAGS) -o $@ test_packet_io.cc packet_io.o carrier_adapt.o $(REED_SOLOMON_OBJ) $(EPOLL_LDFLAGS) $(LDFLAGS_STATIC)
 
 test_carrier_adapt: test_carrier_adapt.cc carrier_adapt.o carrier_adapt.h
 	$(CXX) $(CXXFLAGS) -o $@ test_carrier_adapt.cc carrier_adapt.o $(LDFLAGS_STATIC)

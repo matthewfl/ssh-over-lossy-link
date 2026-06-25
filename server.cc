@@ -183,8 +183,11 @@ int run_server(const Args& args) {
   // Cold-start redundancy until the probability model has enough samples to take over.
   // In auto mode the client's SET_CONFIG no longer seeds these (the server owns them), so
   // start moderately protected rather than at the bare 0.1 floor.
-  float runtime_rs_redundancy = args.config.auto_adapt
-      ? std::max(args.config.rs_redundancy, 0.5f) : args.config.rs_redundancy;
+  // Cold-start at the configured redundancy (with only the system minimum). In auto mode this
+  // is the "initial" value the link runs at until the probability model has enough samples to
+  // take over; the client propagates --rs-redundancy / --small-packet-redundancy on the
+  // server launch command so this matches what the user set.
+  float runtime_rs_redundancy = std::max(0.1f, args.config.rs_redundancy);
   unsigned runtime_small_packet_redundancy = std::max(2u, args.config.small_packet_redundancy);
   bool runtime_auto_adapt = false;  // set from SET_CONFIG; when true, server adapts and sends SERVER_CONFIG
   uint32_t runtime_reconnect_timeout_sec = (uint32_t)args.config.reconnect_timeout_sec;
@@ -1202,7 +1205,26 @@ int run_server(const Args& args) {
       float r_model = carrier_adapt::redundancy_for_stall_bound(n_now, q_used, kTargetStallProb)
                       + kRedundancyMargin;
       runtime_rs_redundancy = std::min(2.0f, std::max(0.1f, r_model));
-      unsigned copies = carrier_adapt::small_copies_for_loss(q_used, kTargetStallProb);
+
+      // Small-packet copies are sized for interactive SMOOTHNESS, not the retransmit bound. A
+      // small (sub-block, interactive) packet is delivered at the MIN over its copies, so we
+      // want at least one copy to land within a TIGHT interactive budget of the fastest carrier
+      // — i.e. near the min RTT, not merely "before a retransmit". So we measure q_jitter = the
+      // fraction of recent shard/copy arrival gaps that exceed B_interactive (a tight,
+      // RTT-relative budget, far below the retransmit-scale stall threshold the RS model uses),
+      // and pick the smallest copy count holding P(ALL copies miss the budget) = q_jitter^c <=
+      // kInteractiveEps. That eps is much tighter than the RS stall bound because EVERY interactive
+      // packet's tail is felt by the user: a per-packet 0.01% still hiccups every few seconds at
+      // interactive rates, so we target a far rarer per-packet miss. Small packets are tiny, so
+      // the extra copies cost almost no bandwidth. q_jitter draws on BOTH the RS shard gaps and
+      // the small-packet copy gaps so it has samples whether traffic is bulk or interactive.
+      const uint64_t b_interactive = std::max<uint64_t>(20000000ULL, get_effective_rtt_ns() / 8);
+      size_t jit_total = 0, jit_late = 0;
+      for (uint64_t g : qest_recent_gaps) { jit_total++; if (g > b_interactive) jit_late++; }
+      for (uint64_t g : c2s_small_extra_copy_gap_ns) { jit_total++; if (g > b_interactive) jit_late++; }
+      double q_jitter = (jit_total >= 30) ? static_cast<double>(jit_late) / static_cast<double>(jit_total)
+                                          : q_used;
+      unsigned copies = carrier_adapt::small_copies_for_loss(q_jitter, carrier_adapt::kInteractiveEps);
       runtime_small_packet_redundancy =
           std::min(std::max(2u, n_now), std::max(2u, copies));
       if (dbg) {
@@ -1217,11 +1239,12 @@ int run_server(const Args& args) {
           g99 = g[std::min(g.size() - 1, g.size() * 99 / 100)];
         }
         fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u "
-                     "stall_ms=%llu gap_ms_p50=%.1f p90=%.1f p99=%.1f]\n",
+                     "stall_ms=%llu q_jit=%.3f int_ms=%llu gap_ms_p50=%.1f p90=%.1f p99=%.1f]\n",
                 (unsigned long long)(now_ns_val/1000000ULL), q_used,
                 est_loss_q, (double)s2c_loss_q, n_now,
                 (double)runtime_rs_redundancy, copies,
                 (unsigned long long)(carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())/1000000ULL),
+                q_jitter, (unsigned long long)(b_interactive/1000000ULL),
                 g50/1e6, g90/1e6, g99/1e6);
       }
 
@@ -1268,10 +1291,23 @@ int run_server(const Args& args) {
       // per group; the RS guarantee means any k of n shards suffice to reconstruct.
       // Loop so that large buffers produce multiple correctly-sized groups rather than one
       // oversized group that demands too many shards from each carrier.
+      // Interactive (small backlog) s2c groups get smoothness-grade parity so a small low-k
+      // burst (e.g. a short command's output) is as robust as a duplicated small packet —
+      // any k shards within the jitter budget decode it — instead of the bulk
+      // parity-as-fraction that would leave a 2-block burst with only 1 parity. We recover the
+      // per-carrier jitter q from the copy count (q ≈ eps^(1/copies)). Bulk (heavy unacked
+      // backlog) passes 0 → parity-as-fraction (throughput-oriented).
+      double s_iq = 0.0;
+      if (runtime_auto_adapt &&
+          !carrier_adapt::is_heavy_backlog(0, unacked_data.size())) {
+        unsigned c = std::max(2u, runtime_small_packet_redundancy);
+        s_iq = std::pow(carrier_adapt::kInteractiveEps, 1.0 / static_cast<double>(c));
+      }
       while (backend_read_buf.size() >= block_size && !carriers.empty()) {
         // One shard per carrier so any k of them suffice to decode (see rs_group_params).
         auto gp = packet_io::rs_group_params(carriers.size(), runtime_rs_redundancy,
-                                             backend_read_buf.size() / block_size);
+                                             backend_read_buf.size() / block_size,
+                                             s_iq, carrier_adapt::kInteractiveEps);
         unsigned k = gp.k;
         if (k < 1) break;
         unsigned m = gp.m;

@@ -164,7 +164,20 @@ model every ~300 ms:
 - **`q` estimate**: fraction of received shards whose gap-from-first exceeds the stall
   threshold, sliding window. Server measures c2s; client measures s2c and reports it
   (repurposed `fraction_struggling` field in `CLIENT_METRICS`); server uses `max(c2s, s2c)`.
-- **Small-packet copies**: `ceil(ln ε / ln q)`, clamped `[2, n]`.
+- **Interactive data (small packets + low-`k` RS groups) is sized for SMOOTHNESS, not the
+  retransmit bound.** It's delivered at the *earliest* copy/shard, so it's sized against the
+  per-carrier **jitter** `q_jitter` (fraction of shard/copy gaps `> ~RTT/8`, much tighter than
+  the retransmit-scale stall threshold) with a tight target `kInteractiveEps = 1e-5`:
+  - **small packets**: `copies = small_copies_for_loss(q_jitter, ε_int)`, clamped `[2, n]`.
+  - **small RS groups**: parity `m = carrier_adapt::parity_for_blocks(k, q_jitter, ε_int)`
+    (smallest `m` with `P(Binom(k+m, q_jitter) > m) ≤ ε_int`), `n = k+m` (clamped to carriers).
+    `parity_for_blocks(1,…)` == `copies−1`, so a 1-block burst matches a small packet; higher
+    `k` adds a bit more (needing `k` arrivals, not 1, is harder — so a `k=2` burst is "2 of 9",
+    not "2 of 8"). `rs_group_params(…, interactive_q, interactive_eps)` applies this when the
+    caller passes `interactive_q>0` (small backlog); **bulk** groups pass 0 → `m=round(k·rs)`.
+    The client recovers `q_jitter` from the pushed copy count (`q ≈ ε_int^(1/copies)`) — no extra
+    wire field. This fixes the fragility where a 2-packet burst became `k=2,m=1` (one stall
+    stalls the whole group) while a small packet got many copies.
 
 ### Adaptation: carrier count (client.cc) — LOAD×LOSS-driven, not redundancy-driven
 - **Floor** `max(2, --connections)` always maintained; grow up to `--max-connections`.
@@ -235,11 +248,17 @@ model every ~300 ms:
   the RTT-relative threshold it's measured against, and the gap percentiles show the actual
   arrival spread. A high `q` here is real loss/overload (not jitter), so high redundancy is
   warranted; it should no longer pin at 2.0 on a merely-jittery link.
-- Client `--debug` has a periodic `[carriers-diag … n=… desired=… rate_pps=… …]` line
-  (`desired` = load-driven target, `rate_pps` = measured fleet packet rate) plus per-carrier
-  recv/send-ago/dead flags, and `[carrier-add … reason=…]` / `[carrier-remove … reason=…]`
-  lines (reasons incl. `load_pressure`, `link_stall`, `excess_release`) — use these for
-  carrier count / churn / recovery questions.
+- Client `--debug` has a periodic `[carriers-diag …]` line carrying the full carrier-decision
+  input set: `n`/`connecting`, the bounds `floor`(=`--connections`)`..max`(=`--max-connections`),
+  the load-driven `desired`, and what drives it — `s2c_q` (s2c stall fraction), `rate_pps`
+  (fleet packet rate), `rs`/`copies` (current redundancy), `rtt_ms` + derived `stall_ms` (the
+  late threshold), and `unacked`/`backlog_b` (backpressure). Plus per-carrier recv/send-ago/dead
+  flags and `[carrier-add … reason=…]` / `[carrier-remove … reason=…]` lines (reasons incl.
+  `load_pressure`, `link_stall`, `excess_release`, `below_floor`) — use these for carrier
+  count / churn / recovery questions. The initial ramp to `floor` is a burst (≈5/100 ms) from
+  the floor-maintenance path; `load_pressure` only grows *above* the floor (so it can't starve
+  that burst). Configured `--rs-redundancy`/`--small-packet-redundancy` are the cold-start
+  values both ends start at (propagated on the server launch command); the model then adapts.
 - When touching timeouts or carrier add/reap/adapt, run the high-latency, wifi-blackout,
   and the stability-asserted (`--assert-max-carrier-removes`) scenarios specifically.
 

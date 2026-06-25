@@ -380,6 +380,33 @@ run_test "high-latency-low-backlog-stability" \
     --test-min-packets           12
 
 # ============================================================================
+# 8d2. Interactive smoothness / latency-tail bound. ~300 ms RTT with HIGH jitter
+#      (±100 ms) and 2% loss-stalls, sending medium ~1 KB chunks that become small
+#      (k=2-3) RS groups — the case where a stalled shard can stall the whole group.
+#      Interactive (small-backlog) groups must get smoothness-grade parity (any k
+#      shards within the jitter budget decode it), like duplicated small packets, so
+#      the round-trip TAIL stays near the min RTT instead of spiking to a stalled
+#      shard's ~retransmit time. This is the assertion the looser latency-bound tests
+#      miss: we cap the MAX round-trip tightly. (Pre-fix this scenario hit ~470 ms
+#      max from k=2,m=1 groups stalling; with interactive parity the max stays ~250.)
+# ============================================================================
+run_test "interactive-smoothness-jitter" \
+    --init-latency-override 0.05 \
+    --connections 16 \
+    --continuous --continuous-duration 70 \
+    --continuous-min-size  900 \
+    --continuous-max-size 1100 \
+    --latency-random \
+    --latency-random-low-ms  150 \
+    --latency-random-high-ms 450 \
+    --latency-random-pct     2   \
+    --latency-jitter-ms      100 \
+    --test-max-latency        400 \
+    --test-max-average-latency 320 \
+    --test-max-average-latency-after-warmup 280 \
+    --test-min-packets         80
+
+# ============================================================================
 # 8e. Real-link profile (user-reported): ~300 ms RTT (150 ms one-way base),
 #     high ~15 ms inter-chunk jitter, and ~2% loss-induced stalls (+300 ms).
 #     This is the case that pinned the OLD control loop at the max

@@ -26,6 +26,32 @@ unsigned min_parity_for_stall_bound(unsigned n, double q, double eps) {
   return n;
 }
 
+unsigned parity_for_blocks(unsigned k, double q, double eps) {
+  if (k == 0) return 0;
+  if (q <= 0.0) return 0;            // no loss -> no parity needed
+  if (eps <= 0.0) eps = 1e-12;
+  if (q >= 1.0) return k * 64u;      // hopeless; caller clamps to the carrier count
+  // Smallest parity m such that a group of n=k+m shards (any k of which decode) has
+  // P(stall) = P(Binomial(n,q) > m) <= eps. Unlike sizing parity as a FRACTION of k, this
+  // bounds the per-group stall probability at eps for EVERY k: it returns copies-1 for k=1
+  // (matching small_copies_for_loss), and a little more per extra data block, because needing
+  // k shards to arrive (not 1) is harder the larger k is. The loop is short (m stays small for
+  // realistic q); the cap is a safety bound.
+  const double need = 1.0 - eps;
+  for (unsigned m = 0; m < k * 64u + 64u; ++m) {
+    const unsigned n = k + m;
+    double pmf = std::pow(1.0 - q, static_cast<double>(n));  // P(X=0)
+    double cdf = pmf;
+    const double ratio = q / (1.0 - q);
+    for (unsigned i = 1; i <= m; ++i) {
+      pmf *= (static_cast<double>(n - i + 1) / static_cast<double>(i)) * ratio;
+      cdf += pmf;
+    }
+    if (cdf >= need) return m;        // P(X>m) <= eps
+  }
+  return k * 64u;
+}
+
 float redundancy_for_stall_bound(unsigned n, double q, double eps) {
   if (n < 2) return 2.0f;          // RS needs >=2 carriers
   unsigned m = min_parity_for_stall_bound(n, q, eps);

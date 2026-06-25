@@ -140,7 +140,11 @@ std::vector<std::vector<uint8_t>> rs_reencode_shards(const UnackedItem& ui);
 //      lands on a distinct carrier. m = n - k parity shards.
 //   m == 0 means RS isn't possible (single carrier): the caller sends the block as SMALL.
 struct RsGroupParams { unsigned n = 0; unsigned k = 0; unsigned m = 0; };
-RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks);
+// interactive_q>0 raises parity to the smoothness bound (parity_for_blocks) for small/
+// interactive groups so a low-k burst is as robust as a duplicated small packet; pass 0 for
+// bulk groups (parity stays the rs_frac fraction).
+RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks,
+                              double interactive_q = 0.0, double interactive_eps = 1e-5);
 
 void append_config(std::vector<uint8_t>& out, uint16_t packet_size, uint16_t small_packet_redundancy,
                   float max_delay_ms, float reed_solomon_redundancy, uint8_t auto_adapt,
