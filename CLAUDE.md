@@ -139,6 +139,16 @@ client's `SET_CONFIG` fully controls redundancy and the server doesn't adapt.
   measures the c2s RTT from those ACKs.
 - Client sends `ACK` when it has written server→client data to stdout; server measures
   s2c RTT.
+- **ACKs are cumulative and coalesced.** They already meant "all ids ≤ `acked_id`
+  delivered" (`on_ack` erases every unacked ≤ that id); each side now also *sends* just
+  one ACK per carrier-write flush — it stashes the highest delivered id + completing fd in
+  `pending_ack_*` (in `on_deliver` on the client, in `flush_backend_pending` on the server)
+  and `flush_pending_ack()` emits a single ACK. The flush is in the same epoll iteration as
+  delivery, so RTT stays accurate; a bulk transfer's return-path ACK stream drops from
+  one-per-group to one-per-flush. Server flush point: end of `flush_backend_pending`
+  (so it only ACKs after the backend write lands). Client flush point: loop tail before
+  `flush_carrier_writes`. The reconnect catch-up ACKs (`append_ack(next_deliver_id-1)`) are
+  separate and unchanged.
 - Each side keeps recent RTT samples; **all major timeouts are RTT-scaled**
   (`scaled_ns(mult, min, max)`), so the system self-tunes from low-latency LANs to
   multi-second-RTT links. `--rtt-ms` hints the cold-start RTT before any ACK arrives

@@ -256,6 +256,11 @@ struct __attribute__((__packed__)) packet_carrier_status : packet_header {
 // Server sends ACK when it has written to the backend (client measures client→server RTT).
 // Client sends ACK when it has written to stdout (server measures server→client RTT).
 // Both sides use received ACKs for latency monitoring.
+// ACKs are CUMULATIVE and COALESCED: each side tracks only the highest id it has delivered
+// and emits a single ACK per carrier-write flush (i.e. per epoll iteration in which anything
+// was delivered) rather than one ACK per group. This collapses the return-path ACK stream on a
+// bulk transfer from one-per-group to one-per-flush. Because the flush is in the same iteration
+// as delivery, no latency is added and the RTT sample (taken for the acked id) stays accurate.
 
 // PACKET_SERVER_METRICS: server -> client. struct { packet_header; uint64_t max_rtt_ns; }
 // Server sends periodically so the client can use max(client RTT, server RTT) when adding carriers.

@@ -595,18 +595,25 @@ int run_client(const Args& args) {
     }
   };
 
+  // Coalesced (cumulative) ACK. An ACK means "every id <= acked_id delivered", so instead of
+  // emitting one ACK per delivered group we track only the HIGHEST delivered id (and the carrier
+  // that completed it, for per-carrier RTT) and emit a single cumulative ACK per flush. Flushes
+  // happen within the same epoll iteration as delivery — no added latency, RTT stays accurate —
+  // so on a bulk s2c transfer this collapses the return-path ACK stream to one-per-flush.
+  uint64_t pending_ack_id = 0;
+  int pending_ack_fd = -1;
+  bool have_pending_ack = false;
+
   packet_io::ReceiveCallbacks recv_cb;
   recv_cb.on_deliver = [&](int cfd, uint64_t id, const uint8_t* data, size_t len) {
     stdout_buf.insert(stdout_buf.end(), data, data + len);
     last_deliver_advance_ns = now_ns();
-    // ACK on the completing carrier so the server gets per-carrier RTT measurements.
-    // Fall back to any carrier if completing_fd was already closed.
-    if (carriers.empty()) return;
-    if (!carriers.count(cfd)) cfd = carriers.begin()->first;
-    packet_io::append_ack(carriers[cfd].write_buf, id);
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = cfd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+    // Record the highest delivered id (+completing carrier); one coalesced ACK is emitted per
+    // flush at the loop tail. The completing carrier is preferred so the server gets an accurate
+    // per-carrier RTT sample; flush_pending_ack falls back to any carrier if it has since closed.
+    pending_ack_id = id;
+    pending_ack_fd = cfd;
+    have_pending_ack = true;
   };
   recv_cb.on_rs_decode = [&](unsigned /*shards_received*/, unsigned /*n*/,
                               uint64_t spread_ns, uint64_t gap_final_ns) {
@@ -794,6 +801,18 @@ int run_client(const Args& args) {
       if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
                        (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size());
     }
+  };
+
+  // Emit the single coalesced cumulative ACK for the highest id delivered since the last flush.
+  auto flush_pending_ack = [&]() {
+    if (!have_pending_ack || carriers.empty()) return;
+    int cfd = pending_ack_fd;
+    if (!carriers.count(cfd)) cfd = carriers.begin()->first;
+    packet_io::append_ack(carriers[cfd].write_buf, pending_ack_id);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = cfd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+    have_pending_ack = false;
   };
 
   // fd_to_ssh_index is declared and populated above in the initial connect loop.
@@ -1219,6 +1238,7 @@ int run_client(const Args& args) {
     if (!stdin_eof && stdin_partial_since_ns != 0 && !carriers.empty())
       pump_stdin_send();
 
+    flush_pending_ack();  // one coalesced cumulative ACK for everything delivered this iteration
     flush_carrier_writes();
     flush_stdout();
 

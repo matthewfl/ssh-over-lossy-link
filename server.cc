@@ -390,6 +390,26 @@ int run_server(const Args& args) {
     packet_io::append_ack(it->second.write_buf, acked_id);
   };
 
+  // Coalesced (cumulative) ACK. An ACK means "every id <= acked_id delivered", so rather than
+  // emitting one ACK per delivered group we track only the HIGHEST id written to the backend
+  // (and the carrier that completed it, for per-carrier RTT) and emit a single cumulative ACK
+  // per flush. Flushes happen within the same epoll iteration as delivery, so no extra latency
+  // is added and RTT sampling stays accurate; on a bulk c2s transfer this collapses the
+  // return-path ACK stream from one-per-group to one-per-flush.
+  uint64_t pending_ack_id = 0;
+  int pending_ack_fd = -1;
+  bool have_pending_ack = false;
+  auto flush_pending_ack = [&]() {
+    if (!have_pending_ack || carriers.empty()) return;
+    int cfd = pending_ack_fd;
+    if (!carriers.count(cfd)) cfd = carriers.begin()->first;
+    queue_ack_to_carrier(cfd, pending_ack_id);
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = cfd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+    have_pending_ack = false;
+  };
+
   auto queue_server_metrics_to_carrier = [&](int fd, uint64_t max_rtt_ns) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
@@ -461,24 +481,21 @@ int run_server(const Args& args) {
         epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
         return;
       }
-      uint64_t acked_id = front.id;
-      int cfd = front.completing_fd;
+      // Record the highest id written to the backend for a single coalesced cumulative ACK
+      // (emitted below / at the loop tail). completing_fd is where the ACK rides so the client
+      // still gets an accurate per-carrier RTT sample, with no extra packets.
+      pending_ack_id = front.id;
+      pending_ack_fd = front.completing_fd;
+      have_pending_ack = true;
       backend_pending.pop_front();
-      // ACK on the completing carrier: gives the client accurate per-carrier RTT with no extra packets.
-      // Fall back to any available carrier if completing_fd was already closed.
-      if (!carriers.empty()) {
-        if (!carriers.count(cfd)) cfd = carriers.begin()->first;
-        queue_ack_to_carrier(cfd, acked_id);
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-      }
     }
     if (backend_fd >= 0 && backend_pending.empty()) {
       ev.events = EPOLLIN;
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
     }
+    // Emit the one coalesced ACK covering everything just written to the backend.
+    flush_pending_ack();
   };
 
   packet_io::ReceiveCallbacks recv_cb;
@@ -1419,6 +1436,8 @@ int run_server(const Args& args) {
       }
     }
     flush_backend_pending();
+    flush_pending_ack();  // belt-and-suspenders: emit the coalesced ACK even if a backend
+                          // early-return above skipped flush_backend_pending's own flush
     flush_carrier_writes();
     // If the backend write failed and was closed, stop running — there's nowhere to
     // deliver client data and no way to send sshd's responses to the client.
