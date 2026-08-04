@@ -173,7 +173,11 @@ model every ~300 ms:
   retransmit bound.** It's delivered at the *earliest* copy/shard, so it's sized against the
   per-carrier **jitter** `q_jitter` (fraction of shard/copy gaps `> ~RTT/8`, much tighter than
   the retransmit-scale stall threshold) with a tight target `kInteractiveEps = 1e-5`:
-  - **small packets**: `copies = small_copies_for_loss(q_jitter, ε_int)`, clamped `[2, n]`.
+  - **small packets**: `copies = small_copies_for_loss(q_jitter, ε_int)`, clamped `[2, min(n,
+    kMaxSmallCopies=16)]`. The **16 cap is load-safety**: copies only help vs *independent*
+    per-carrier slowness; when `q_jitter` saturates→1 (aggregate congestion on a busy link) no
+    carrier is fast, so extra copies can't help and only add load — without the cap it ran away
+    to ~carrier-count (observed 120/120). Guarded by `small-copies-cap-busy-jitter` in test_all.
   - **small RS groups**: parity `m = carrier_adapt::parity_for_blocks(k, q_jitter, ε_int)`
     (smallest `m` with `P(Binom(k+m, q_jitter) > m) ≤ ε_int`), `n = k+m` (clamped to carriers).
     `parity_for_blocks(1,…)` == `copies−1`, so a 1-block burst matches a small packet; higher

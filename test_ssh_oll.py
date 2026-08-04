@@ -1317,6 +1317,34 @@ def check_carrier_count(client_pid, max_count, warmup_s=15.0):
     return 0 if ok else 1
 
 
+def check_max_small_copies(client_pid, max_copies, warmup_s=15.0):
+    """Fail if the client's small-packet copy count exceeded max_copies after the startup
+    warmup — catches the interactive-copies runaway (copies climbing toward the carrier count
+    when q_jitter saturates on a busy/congested link). Reads the carriers-diag `copies=` field
+    (the applied small_packet_redundancy). Returns 0/1."""
+    log = f"/tmp/ssh-oll-client-{client_pid}.log"
+    if not os.path.exists(log):
+        print(f"small-copies: client debug log {log} not found (need client debug)",
+              file=sys.stderr, flush=True)
+        return 1
+    txt = open(log, errors="replace").read()
+    ts = re.findall(r"\bt=(\d+)", txt)
+    if not ts:
+        print("small-copies: no timestamps in client log; skipping", flush=True)
+        return 0
+    warmup_end = int(ts[0]) + int(warmup_s * 1000)
+    peak = 0
+    for m in re.finditer(r"carriers-diag t=(\d+).*? copies=(\d+)", txt):
+        t, c = int(m.group(1)), int(m.group(2))
+        if t < warmup_end:
+            continue
+        peak = max(peak, c)
+    ok = peak <= max_copies
+    print(f"small-copies: peak {peak} copies after {warmup_s:.0f}s warmup "
+          f"(limit {max_copies}) -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Test ssh-oll: proxy socket, TCP backend, latency measurements."
@@ -1607,6 +1635,14 @@ def main():
              "Detects the redundancy-pressure runaway (carriers climbing to the cap). Implies "
              "client debug.",
     )
+    parser.add_argument(
+        "--assert-max-small-copies",
+        type=int,
+        default=None,
+        help="After the run, fail if the client's small-packet copy count ever exceeded N after "
+             "startup. Detects the interactive-copies runaway (copies climbing toward the carrier "
+             "count when q_jitter saturates on a busy link). Implies client debug.",
+    )
     args = parser.parse_args()
 
     # Build delay spec: constant seconds or callable() -> seconds for randomize mode
@@ -1760,7 +1796,8 @@ def main():
     # 4. Start client with --unix-socket-connection
     _client_debug = getattr(args, "client_debug", False) or \
         getattr(args, "assert_max_carrier_removes", None) is not None or \
-        getattr(args, "assert_max_carrier_count", None) is not None
+        getattr(args, "assert_max_carrier_count", None) is not None or \
+        getattr(args, "assert_max_small_copies", None) is not None
     client_cmd = [
         args.ssh_oll_path,
         "--unix-socket-connection",
@@ -1856,6 +1893,8 @@ def main():
             rc = (rc or 0) | check_carrier_stability(client_proc.pid, args.assert_max_carrier_removes)
         if getattr(args, "assert_max_carrier_count", None) is not None:
             rc = (rc or 0) | check_carrier_count(client_proc.pid, args.assert_max_carrier_count)
+        if getattr(args, "assert_max_small_copies", None) is not None:
+            rc = (rc or 0) | check_max_small_copies(client_proc.pid, args.assert_max_small_copies)
         return rc
 
     if getattr(args, "scenario_wifi_heavy", False):

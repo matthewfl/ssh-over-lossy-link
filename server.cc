@@ -1239,7 +1239,12 @@ int run_server(const Args& args) {
       for (uint64_t g : c2s_small_extra_copy_gap_ns) { jit_total++; if (g > b_interactive) jit_late++; }
       double q_jitter = (jit_total >= 30) ? static_cast<double>(jit_late) / static_cast<double>(jit_total)
                                           : q_used;
-      unsigned copies = carrier_adapt::small_copies_for_loss(q_jitter, carrier_adapt::kInteractiveEps);
+      // Cap at kMaxSmallCopies: beyond it q_jitter reflects aggregate congestion (all carriers
+      // backed up), which copies can't fix and only worsen — see kMaxSmallCopies. This is what
+      // stops the runaway to ~carrier-count on a busy link. (The carrier-count cap below still
+      // applies when there are fewer than kMaxSmallCopies carriers.)
+      unsigned copies = std::min(carrier_adapt::small_copies_for_loss(q_jitter, carrier_adapt::kInteractiveEps),
+                                 carrier_adapt::kMaxSmallCopies);
       unsigned copies_target = std::min(std::max(2u, n_now), std::max(2u, copies));
       if (copies_target >= runtime_small_packet_redundancy) {
         runtime_small_packet_redundancy = copies_target;  // up: immediate

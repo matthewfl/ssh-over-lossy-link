@@ -130,6 +130,17 @@ unsigned small_copies_for_loss(double q, double eps);
 // it buys cost almost no bandwidth.
 constexpr double kInteractiveEps = 1e-5;
 
+// Absolute cap on small-packet copies / interactive parity. Duplicating a small packet helps
+// only against INDEPENDENT per-carrier slowness: it is delivered at the min over its copies, so
+// one copy landing on a currently-fast carrier wins. That works while, say, up to ~half the
+// carriers are momentarily slow — `ceil(ln kInteractiveEps / ln 0.5) ≈ 16` copies already meet
+// the target then. If MORE than half of all arrivals are late, that is AGGREGATE CONGESTION
+// (the whole link is backed up), not per-carrier jitter — no carrier is fast, so extra copies
+// cannot lower the min and only ADD load, a positive-feedback runaway. Without this cap the
+// count was bounded only by the carrier count, so on a busy 100+-carrier link copies ran away to
+// ~100 (q_jitter saturating toward 1). Cap it here; congestion is redundancy's job, not copies'.
+constexpr unsigned kMaxSmallCopies = 16;
+
 // Smallest parity m for a group of k data blocks (n=k+m shards, any k decode) so the per-group
 // stall probability P(Binomial(k+m,q) > m) <= eps. This is the per-k generalization of
 // small_copies_for_loss (which is the k=1 case, copies=m+1): it gives a SMALL multi-block burst

@@ -407,6 +407,30 @@ run_test "interactive-smoothness-jitter" \
     --test-min-packets         80
 
 # ============================================================================
+# 8d3. Small-packet copies cap on a busy/high-jitter link. On a link whose per-carrier
+#      arrival jitter is far larger than the interactive budget (~RTT/8), the measured
+#      q_jitter saturates toward 1, so small_copies_for_loss(q_jitter, 1e-5) explodes —
+#      previously bounded only by the carrier count, so on a many-carrier link the copy
+#      count ran away to ~carrier-count (observed 120/120 on a real busy link). That is
+#      aggregate congestion, not per-carrier jitter, so extra copies can't help and only
+#      add load. kMaxSmallCopies caps it. Many carriers (up to 60) + big jitter so the
+#      OLD code would climb well past the cap; assert it stays bounded.
+# ============================================================================
+run_test "small-copies-cap-busy-jitter" \
+    --init-latency-override 0.05 \
+    --connections 20 \
+    --continuous --continuous-duration 60 \
+    --continuous-min-size  900 \
+    --continuous-max-size 1100 \
+    --latency-random \
+    --latency-random-low-ms  150 \
+    --latency-random-high-ms 450 \
+    --latency-random-pct     3   \
+    --latency-jitter-ms      300 \
+    --assert-max-small-copies  24 \
+    --extra-client-args --max-connections 60
+
+# ============================================================================
 # 8e. Real-link profile (user-reported): ~300 ms RTT (150 ms one-way base),
 #     high ~15 ms inter-chunk jitter, and ~2% loss-induced stalls (+300 ms).
 #     This is the case that pinned the OLD control loop at the max
