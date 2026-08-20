@@ -233,6 +233,7 @@ int run_server(const Args& args) {
   std::deque<uint64_t> qest_recent_gaps;  // recent shard gaps (for percentile diagnostics / B tuning)
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
   float s2c_loss_q = 0.0f;   // client-reported s2c per-shard late fraction (latency-budget method)
+  bool client_c2s_window_saturated = false;  // client-reported (CLIENT_METRICS) c2s send-window sat
   uint64_t s2c_last_received_ns = 0;
   // Shared map for tracking when RS groups decoded so extra shards can be timed.
   std::map<uint64_t, uint64_t> recently_decoded_ns;
@@ -243,6 +244,14 @@ int run_server(const Args& args) {
   // existing ones die.
   std::map<uint64_t, UnackedItem> unacked_data;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
+  // ACK-clocked send window for the s2c direction: caps outstanding (sent-but-unACKed)
+  // data bytes — see RateWindow in net_util.h. When closed we stop encoding new RS groups
+  // AND stop reading the backend, so the producer (sshd) gets real backpressure instead
+  // of an ever-deepening queue.
+  RateWindow s2c_window;
+  bool backend_read_wanted = true;   // recomputed each loop pass from the window; gates EPOLLIN
+  uint32_t backend_events_state = 0xFFFFFFFF;  // last epoll MOD for backend (for arm_backend dedup)
+  uint64_t unacked_bytes_cache = 0;  // outstanding bytes for the current event-loop pass
   std::set<int> pending_peer_suggest_close;
   uint64_t next_carrier_id_global = 1;
   // When the carrier set last went from empty -> non-empty (recovery from total loss).
@@ -270,8 +279,43 @@ int run_server(const Args& args) {
       return p90_ns(server_recent_rtt_ns);
     return rtt_hint_ns ? rtt_hint_ns : 5000000000ULL;  // hint, else 5 s conservative
   };
+  // Base RTT = the MINIMUM of recent samples: the path RTT without standing-queue delay.
+  // Used for thresholds that must NOT move with load (the per-shard stall/jitter cutoffs),
+  // where the usual p90 would chase the queue depth our own window maintains.
+  auto get_base_rtt_ns = [&]() -> uint64_t {
+    if (!server_recent_rtt_ns.empty())
+      return *std::min_element(server_recent_rtt_ns.begin(), server_recent_rtt_ns.end());
+    return rtt_hint_ns ? rtt_hint_ns : 5000000000ULL;
+  };
+  // Session-minimum RTT, for the send-window budget (net_util.h): queueing can only raise
+  // an RTT sample, so a monotone session min cannot ratchet the window cap upward.
+  uint64_t base_rtt_min_session_ns = 0;  // 0 = no sample yet
+  auto get_window_base_rtt_ns = [&]() -> uint64_t {
+    return base_rtt_min_session_ns ? base_rtt_min_session_ns : get_base_rtt_ns();
+  };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
     return ssholl::scaled_ns(mult, min_ns, max_ns, get_effective_rtt_ns());
+  };
+
+  // Delivered data is queued here; we write to backend and ACK when a chunk is fully written.
+  // completing_fd is the carrier that triggered delivery — ACK goes back there for per-carrier RTT measurement.
+  struct BackendItem { uint64_t id; std::vector<uint8_t> data; int completing_fd; };
+  std::deque<BackendItem> backend_pending;
+
+  // Single place that computes the backend fd's epoll interest: EPOLLOUT while there is
+  // backend_pending to write, EPOLLIN only while the send window allows more reading. When
+  // the window is closed the fd is left armed for nothing (events=0) so a perpetually-ready
+  // readable backend cannot busy-spin the loop. Sites that used to set EPOLLIN unconditionally
+  // call this; the periodic pump block re-arms every pass as the window opens/closes.
+  auto arm_backend = [&]() {
+    if (backend_fd < 0 || !backend_connected) return;
+    uint32_t want = (backend_read_wanted ? (uint32_t)EPOLLIN : 0u) |
+                    (!backend_pending.empty() ? (uint32_t)EPOLLOUT : 0u);
+    if (want == backend_events_state) return;
+    backend_events_state = want;
+    ev.events = want;
+    ev.data.fd = backend_fd;
+    epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
   };
 
   auto connect_backend = [&]() {
@@ -296,6 +340,7 @@ int run_server(const Args& args) {
       ev.events = EPOLLIN;  // EPOLLOUT only when we have backend_pending data to write
       ev.data.fd = backend_fd;
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+      backend_events_state = EPOLLIN;
     } else if (err != EINPROGRESS && err != 0) {
       if (dbg) fprintf(dbg, "[backend-connect-failed t=%llu errno=%d]\n",
                        (unsigned long long)(now_ns()/1000000ULL), err);
@@ -418,10 +463,16 @@ int run_server(const Args& args) {
       uint64_t sum = 0; for (uint64_t v : d) sum += v;
       return sum / d.size();
     };
+    // Report whether the s2c send window is saturated (link at capacity, window
+    // deliberately closed) so the client suppresses load-pressure carrier growth in
+    // that state — extra carriers cannot raise bounded-throughput, only spread it.
+    const uint32_t mflags = (unacked_bytes_cache != 0
+                             && unacked_bytes_cache >= rate_window_cap(s2c_window, get_window_base_rtt_ns()))
+                                ? SSHOLL_SERVER_METRICS_FLAG_S2C_WINDOW_SATURATED : 0u;
     packet_io::append_server_metrics(it->second.write_buf, max_rtt_ns,
                                      deque_avg(c2s_shard_spread_ns),
                                      deque_avg(c2s_extra_shard_gap_ns),
-                                     static_cast<uint32_t>(rs_pending.size()));
+                                     static_cast<uint32_t>(rs_pending.size()), mflags);
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -439,11 +490,6 @@ int run_server(const Args& args) {
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
   };
-
-  // Delivered data is queued here; we write to backend and ACK when a chunk is fully written.
-  // completing_fd is the carrier that triggered delivery — ACK goes back there for per-carrier RTT measurement.
-  struct BackendItem { uint64_t id; std::vector<uint8_t> data; int completing_fd; };
-  std::deque<BackendItem> backend_pending;
 
   auto flush_backend_pending = [&]() {
     // Drain as many items as possible in one call. This matters when many RS groups
@@ -521,7 +567,7 @@ int run_server(const Args& args) {
   // jitter. The late fraction is rho-bar, which drives redundancy (see stall_threshold_ns).
   recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
     qest_total_gaps += 1;
-    if (gap_ns > carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())) qest_late_gaps += 1;
+    if (gap_ns > carrier_adapt::stall_threshold_ns(get_base_rtt_ns())) qest_late_gaps += 1;
     qest_recent_gaps.push_back(gap_ns);
     if (qest_recent_gaps.size() > 2000) qest_recent_gaps.pop_front();
   };
@@ -566,6 +612,8 @@ int run_server(const Args& args) {
                   (unsigned long long)(rtt/1000000ULL));
         server_recent_rtt_ns.push_back(rtt);
         while (server_recent_rtt_ns.size() > max_server_recent_rtt) server_recent_rtt_ns.pop_front();
+        if (base_rtt_min_session_ns == 0 || rtt < base_rtt_min_session_ns)
+          base_rtt_min_session_ns = rtt;
         auto cs = carriers.find(fd);
         if (cs != carriers.end()) cs->second.last_rtt_ns = rtt;
       }
@@ -574,15 +622,23 @@ int run_server(const Args& args) {
       if (it_m->first <= acked_id) it_m = ack_send_time_ns.erase(it_m);
       else ++it_m;
     // Data confirmed received: remove from retransmit buffer.
-    for (auto it_u = unacked_data.begin(); it_u != unacked_data.end() && it_u->first <= acked_id; )
+    uint64_t acked_bytes = 0;
+    for (auto it_u = unacked_data.begin(); it_u != unacked_data.end() && it_u->first <= acked_id; ) {
+      acked_bytes += it_u->second.data.size();
       it_u = unacked_data.erase(it_u);
+    }
+    // ACK-clocked rate estimate for the s2c send window (this also has a nice property: when
+    // the window has closed the pump and deliveries pause at the cap, so there is nothing new
+    // to ACK and the rate simply holds — it cannot spiral down to zero).
+    rate_window_on_ack(s2c_window, acked_bytes, now_ns());
   };
   recv_cb.on_pong = [&](int fd, uint64_t) {
     outstanding_ping_ns.erase(fd);
   };
   recv_cb.on_client_metrics = [&](uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
                                   float fraction_struggling, uint32_t rs_pending_count,
-                                  bool can_decrease_rs, bool can_decrease_small) {
+                                  bool can_decrease_rs, bool can_decrease_small,
+                                  bool client_c2s_window_saturated_arg) {
     (void)avg_shard_spread_ns;
     (void)avg_extra_shard_gap_ns;
     (void)rs_pending_count;
@@ -591,6 +647,7 @@ int run_server(const Args& args) {
     // fraction_struggling now carries the client's latency-budget s2c loss estimate q.
     s2c_loss_q = fraction_struggling;
     s2c_last_received_ns = now_ns();
+    client_c2s_window_saturated = client_c2s_window_saturated_arg;
   };
   recv_cb.on_set_config = [&](const PacketConfig& pc) {
     runtime_auto_adapt = (pc.auto_adapt != 0);
@@ -751,6 +808,13 @@ int run_server(const Args& args) {
       if (fd == backend_fd) {
         ensure_backend_connected();
         if (!backend_connected) continue;
+        if ((e & EPOLLIN) && !backend_read_wanted) {
+          // Send window is saturated: do NOT read more. Converting the epoll interest now
+          // stops a perpetually-ready readable backend from busy-spinning the event loop;
+          // the producer gets real TCP backpressure instead (the whole point of the window).
+          arm_backend();
+          e &= ~(uint32_t)EPOLLIN;
+        }
         if (e & EPOLLIN) {
           uint8_t buf[READ_BUF_SIZE];
           ssize_t nr = read(backend_fd, buf, sizeof buf);
@@ -854,17 +918,23 @@ int run_server(const Args& args) {
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_data) unacked_bytes += ui.data.size();
         if (rs_pending.empty()) {
-          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
                   carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(),
                   (unsigned long long)next_deliver_id, backend_read_buf.size(),
-                  (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy);
+                  (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
+                  rate_window_cap(s2c_window, get_window_base_rtt_ns())/1024,
+                  s2c_window.rate_bps/1024.0,
+                  (unsigned long long)(get_window_base_rtt_ns()/1000000ULL));
         } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
                   carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
                   (unsigned long long)next_deliver_id, backend_read_buf.size(),
                   (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
-                  (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
+                  (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n,
+                  rate_window_cap(s2c_window, get_window_base_rtt_ns())/1024,
+                  s2c_window.rate_bps/1024.0,
+                  (unsigned long long)(get_window_base_rtt_ns()/1000000ULL));
         }
         fflush(dbg);
       }
@@ -1230,7 +1300,18 @@ int run_server(const Args& args) {
       const unsigned n_now = static_cast<unsigned>(carriers.size());
       float r_model = carrier_adapt::redundancy_for_stall_bound(n_now, q_used, kTargetStallProb)
                       + kRedundancyMargin;
-      float rs_target = std::min(2.0f, std::max(0.1f, r_model));
+      // Saturation clamp: when EITHER direction's send window is saturated (deliberately
+      // full — the producer out-runs the link), shard lateness is queueing on the shared
+      // bottleneck, not independent loss: extra parity only re-shares the same fixed
+      // bytes from data onto overhead (observed: rs pinned at 2.0 → k=2-of-8 at n=8,
+      // ~4× wire amplification, ~21 KB/s delivered where the bucket allows 256 KB/s).
+      // Cap at 0.5; genuine loss then rides the retransmit path.
+      const bool send_saturated =
+          (unacked_bytes_cache != 0
+           && unacked_bytes_cache >= rate_window_cap(s2c_window, get_window_base_rtt_ns()))
+          || client_c2s_window_saturated;
+      const float rs_hi = send_saturated ? 0.5f : 2.0f;
+      float rs_target = std::min(rs_hi, std::max(0.1f, r_model));
       if (rs_target >= runtime_rs_redundancy) {
         runtime_rs_redundancy = rs_target;                 // up: immediate
       } else {                                             // down: bounded rate
@@ -1250,7 +1331,7 @@ int run_server(const Args& args) {
       // interactive rates, so we target a far rarer per-packet miss. Small packets are tiny, so
       // the extra copies cost almost no bandwidth. q_jitter draws on BOTH the RS shard gaps and
       // the small-packet copy gaps so it has samples whether traffic is bulk or interactive.
-      const uint64_t b_interactive = std::max<uint64_t>(20000000ULL, get_effective_rtt_ns() / 8);
+      const uint64_t b_interactive = std::max<uint64_t>(20000000ULL, get_base_rtt_ns() / 8);
       size_t jit_total = 0, jit_late = 0;
       for (uint64_t g : qest_recent_gaps) { jit_total++; if (g > b_interactive) jit_late++; }
       for (uint64_t g : c2s_small_extra_copy_gap_ns) { jit_total++; if (g > b_interactive) jit_late++; }
@@ -1289,7 +1370,7 @@ int run_server(const Args& args) {
                 (unsigned long long)(now_ns_val/1000000ULL), q_used,
                 est_loss_q, (double)s2c_loss_q, n_now,
                 (double)runtime_rs_redundancy, copies,
-                (unsigned long long)(carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())/1000000ULL),
+                (unsigned long long)(carrier_adapt::stall_threshold_ns(get_base_rtt_ns())/1000000ULL),
                 q_jitter, (unsigned long long)(b_interactive/1000000ULL),
                 g50/1e6, g90/1e6, g99/1e6);
       }
@@ -1306,8 +1387,9 @@ int run_server(const Args& args) {
     // Report observed link quality (from ACKs received from client) so client can adapt carriers.
     if (!carriers.empty() && !server_recent_rtt_ns.empty() && now_ns_val - last_metrics_ns >= metrics_interval_ns) {
       last_metrics_ns = now_ns_val;
-      uint64_t max_rtt = 0;
-      for (uint64_t r : server_recent_rtt_ns) if (r > max_rtt) max_rtt = r;
+      // Report p90, not the max: a single queue-delayed outlier sample must not poison the
+      // client's effective-RTT for the whole window.
+      uint64_t p90_rtt = p90_ns(server_recent_rtt_ns);
       // Spread periodic control traffic over the carrier we've sent on least recently
       // (every carrier is an equal TCP connection; concentrating control on one just makes
       // that one more likely to HoL-block on a lost control packet).
@@ -1316,7 +1398,7 @@ int run_server(const Args& args) {
         uint64_t age = now_ns_val - cs.last_send_ns;
         if (fd < 0 || age > oldest) { fd = cfd; oldest = age; }
       }
-      if (fd >= 0) queue_server_metrics_to_carrier(fd, max_rtt);
+      if (fd >= 0) queue_server_metrics_to_carrier(fd, p90_rtt);
     }
 
     ensure_backend_connected();
@@ -1330,6 +1412,23 @@ int run_server(const Args& args) {
         fflush(dbg);
       }
     }
+    // Refresh the send-window state once per loop pass: outstanding = queued-but-unACKed
+    // data; the window caps it (see RateWindow in net_util.h). Reading the backend is wanted
+    // only while the window is open AND the pre-encode buffer isn't already holding a full
+    // window's worth — otherwise the bytes just queue one buffer earlier.
+    {
+      uint64_t ob = 0;
+      for (const auto& [uid, ui] : unacked_data) ob += ui.data.size();
+      unacked_bytes_cache = ob;
+    }
+    // The pre-encode read buffer is only a pipe for the encoder — bound it to a fraction of the
+    // window so the s2c pipeline's head is the window itself, not a hidden second queue in front
+    // of it (measured: with the buf allowed to grow to the window cap it added ~1.5 s of standing
+    // pipeline lag on top of the window).
+    backend_read_wanted = rate_window_open(unacked_bytes_cache, s2c_window, get_window_base_rtt_ns()) &&
+                          backend_read_buf.size() < static_cast<size_t>(std::max<uint64_t>(
+                              rate_window_cap(s2c_window, get_window_base_rtt_ns()) / 4, 64 * 1024));
+    arm_backend();  // re-arm/disarm EPOLLIN as the window opened/closed this pass
     if (backend_connected && backend_fd >= 0 && !backend_read_buf.empty() && !carriers.empty()) {
       const size_t block_size = max_packet;
       // Each RS group uses exactly n_carriers shards (one per carrier) so that a slow or
@@ -1349,7 +1448,12 @@ int run_server(const Args& args) {
         unsigned c = std::max(2u, runtime_small_packet_redundancy);
         s_iq = std::pow(carrier_adapt::kInteractiveEps, 1.0 / static_cast<double>(c));
       }
-      while (backend_read_buf.size() >= block_size && !carriers.empty()) {
+      // The SEND WINDOW gates only bulk RS groups: encoding stops once outstanding data
+      // reaches the ACK-clocked cap, which is what actually bounds the queue a late shard
+      // can sit in. The while-loop always allows a first group (window opens when empty),
+      // so a single group bigger than the cap can never deadlock the stream.
+      while (backend_read_buf.size() >= block_size && !carriers.empty() &&
+             rate_window_open(unacked_bytes_cache, s2c_window, get_window_base_rtt_ns())) {
         // One shard per carrier so any k of them suffice to decode (see rs_group_params).
         auto gp = packet_io::rs_group_params(carriers.size(), runtime_rs_redundancy,
                                              backend_read_buf.size() / block_size,
@@ -1372,6 +1476,7 @@ int run_server(const Args& args) {
             ui.send_ns = now_ns();
             unacked_data[next_send_id] = std::move(ui);
           }
+          unacked_bytes_cache += chunk;
           queue_small_to_carriers(backend_read_buf.data(), chunk);
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
           continue;
@@ -1413,6 +1518,7 @@ int run_server(const Args& args) {
           unacked_data[next_send_id] = std::move(ui);
         }
         next_send_id++;
+        unacked_bytes_cache += k * block_size;  // the window gate re-checks against this
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
       }
       // Any sub-block remainder: send as SMALL (no RS needed for < block_size).

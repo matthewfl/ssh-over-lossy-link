@@ -7,3 +7,4 @@ test_carrier_adapt
 proxy.log
 client_err.txt
 .test-proxy-socket
+__pycache__/

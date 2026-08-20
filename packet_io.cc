@@ -119,7 +119,8 @@ bool process_carrier_read(
       if (callbacks.on_client_metrics)
         callbacks.on_client_metrics(cm.avg_shard_spread_ns, cm.avg_extra_shard_gap_ns,
                                    cm.fraction_struggling, cm.rs_pending_count,
-                                   cm.can_decrease_rs != 0, cm.can_decrease_small != 0);
+                                   cm.can_decrease_rs != 0, cm.can_decrease_small != 0,
+                                   cm.c2s_window_saturated != 0);
       continue;
     }
     if (h->packet_kind == PacketKind::CARRIER_STATUS) {
@@ -160,7 +161,7 @@ bool process_carrier_read(
       s.read_buf.erase(s.read_buf.begin(), s.read_buf.begin() + sizeof(PacketServerMetrics));
       if (callbacks.on_server_metrics)
         callbacks.on_server_metrics(pm.max_rtt_ns, pm.avg_shard_spread_ns,
-                                    pm.avg_extra_shard_gap_ns, pm.rs_pending_count);
+                                    pm.avg_extra_shard_gap_ns, pm.rs_pending_count, pm.flags);
       continue;
     }
     if (h->packet_kind == PacketKind::SERVER_CONFIG) {
@@ -470,7 +471,7 @@ void append_suggest_close(std::vector<uint8_t>& out) {
 
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
                            uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
-                           uint32_t rs_pending_count) {
+                           uint32_t rs_pending_count, uint32_t flags) {
   PacketServerMetrics pm{};
   pm.header.id = 0;
   pm.header.packet_kind = PacketKind::SERVER_METRICS;
@@ -478,13 +479,15 @@ void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
   pm.avg_shard_spread_ns = avg_shard_spread_ns;
   pm.avg_extra_shard_gap_ns = avg_extra_shard_gap_ns;
   pm.rs_pending_count = rs_pending_count;
+  pm.flags = flags;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&pm);
   out.insert(out.end(), p, p + sizeof pm);
 }
 
 void append_client_metrics(std::vector<uint8_t>& out, uint64_t avg_shard_spread_ns,
                            uint64_t avg_extra_shard_gap_ns, float fraction_struggling,
-                           uint32_t rs_pending_count, bool can_decrease_rs, bool can_decrease_small) {
+                           uint32_t rs_pending_count, bool can_decrease_rs, bool can_decrease_small,
+                           bool c2s_window_saturated) {
   PacketClientMetrics cm{};
   cm.header.id = 0;
   cm.header.packet_kind = PacketKind::CLIENT_METRICS;
@@ -494,6 +497,7 @@ void append_client_metrics(std::vector<uint8_t>& out, uint64_t avg_shard_spread_
   cm.rs_pending_count = rs_pending_count;
   cm.can_decrease_rs = can_decrease_rs ? 1 : 0;
   cm.can_decrease_small = can_decrease_small ? 1 : 0;
+  cm.c2s_window_saturated = c2s_window_saturated ? 1 : 0;
   const uint8_t* p = reinterpret_cast<const uint8_t*>(&cm);
   out.insert(out.end(), p, p + sizeof cm);
 }

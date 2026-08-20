@@ -264,6 +264,22 @@ struct __attribute__((__packed__)) packet_carrier_status : packet_header {
 
 // PACKET_SERVER_METRICS: server -> client. struct { packet_header; uint64_t max_rtt_ns; }
 // Server sends periodically so the client can use max(client RTT, server RTT) when adding carriers.
+// The struct also carries server-side state hints: avg c2s shard spread/extra gap, the
+// c2s rs_pending count, and a flags word. Flag bit 0 (S2C_WINDOW_SATURATED) is set while
+// the server's server->client send window is deliberately full (see "Send window" below);
+// the client suppresses load-pressure carrier growth while either direction's window is
+// saturated, since extra carriers cannot raise throughput bounded by the window.
+
+// SEND WINDOW (both directions): bulk RS-group encoding is gated by an ACK-clocked byte
+// window (RateWindow in net_util.h): encoding stops once sent-but-unACKed data reaches
+// cap = 1.25 x (base_rtt + 1 s) of the ACK-clocked delivered rate (clamped to
+// [128 KB scaled by base RTT, 4 MB], always open when empty; the 1.25 headroom
+// probe keeps the window at link capacity instead of stalling at ~half). When the
+// window is closed the sender also stops reading its data source
+// (client stdin / server backend socket) so backpressure propagates to the producing
+// application instead of queueing unboundedly in ssh-oll. Small/interactive packets are
+// never gated. The window exists to cap the queueing an interactive packet can wait
+// behind during a bulk transfer on a constrained link.
 
 // PACKET_SERVER_CONFIG: server -> client. Same payload as packet_config (no auto_adapt).
 // When auto_adapt is on, server adapts redundancy and sends this so the client stays in sync.

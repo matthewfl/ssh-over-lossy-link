@@ -36,6 +36,8 @@ import string
 import subprocess
 import sys
 import threading
+import glob
+import heapq
 import time
 
 
@@ -63,9 +65,10 @@ def unix_listen(path):
 
 def _relay_reader(sock_from, queue, stop_event, debug_label=None):
     """Read from sock_from and put chunks in queue. Runs until EOF or stop_event."""
+    max_read = 65536
     try:
         while not stop_event.is_set():
-            data = sock_from.recv(65536)
+            data = sock_from.recv(max_read)
             if not data:
                 break
             ts = time.perf_counter()
@@ -86,6 +89,7 @@ def _relay_sender(sock_to, q, delay_spec, stop_event, death_probability=0.0, kil
     Delay is applied relative to each chunk's arrival time (read_ts), not relative to when it is
     dequeued. This prevents head-of-line blocking: a tiny ACK packet that arrives just before a
     large RS-shard burst will not cause the shards to wait an extra full delay period.
+
     """
     _last_diag = [0.0]
     try:
@@ -174,16 +178,111 @@ def _relay_zero_latency(sock_from, sock_to, death_probability=0.0, kill_callback
             pass
 
 
-def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, kill_callback=None, debug_label=None):
+class _BucketScheduler:
+    """One per direction: models the simulated bottleneck link as ONE ordered FIFO queue
+    (a real bottleneck router's queue is FIFO by packet arrival; token-turn contention
+    between per-carrier senders has no arrival order, so it manufactured seconds of
+    artificial same-group shard spread that ssh-oll's redundancy model mistook for loss).
+
+    Every carrier conn's reader pushes its chunks here. Each chunk's send time is
+      ETA = max(arrival_ts + propagation_delay, prev_eta + size/rate)
+    i.e. the chunk waits its FIFO position behind everything older at the bottleneck,
+    then a single thread sends each chunk at its ETA. Rate and propagation delay are
+    independent: a queued chunk pays queue wait + delay, exactly like a congested hop.
+    """
+    def __init__(self, rate_bytes_per_sec, delay_spec, stop_event):
+        self.rate = float(rate_bytes_per_sec)
+        self.delay_spec = delay_spec
+        self.stop_event = stop_event
+        self.cv = threading.Condition()
+        self.heap = []               # (eta, seq, conn_id, chunk)
+        self.seq = 0
+        self.conns = {}              # conn_id -> outgoing socket
+        self.prev_eta = time.perf_counter()
+        self.queue_bytes = 0
+        self.bytes_passed = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def attach(self, conn_id, out_sock):
+        with self.cv:
+            self.conns[conn_id] = out_sock
+
+    def detach(self, conn_id):
+        with self.cv:
+            self.conns.pop(conn_id, None)
+
+    def push(self, conn_id, data, arrival_ts):
+        with self.cv:
+            delay = self.delay_spec() if callable(self.delay_spec) else self.delay_spec
+            self.prev_eta = max(arrival_ts + delay, self.prev_eta + len(data) / self.rate)
+            heapq.heappush(self.heap, (self.prev_eta, self.seq, conn_id, data))
+            self.seq += 1
+            self.queue_bytes += len(data)
+            self.cv.notify()
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            with self.cv:
+                while not self.heap and not self.stop_event.is_set():
+                    self.cv.wait(timeout=0.5)
+                if not self.heap:
+                    continue
+                eta, _, conn_id, data = heapq.heappop(self.heap)
+                self.queue_bytes -= len(data)
+                sock = self.conns.get(conn_id)
+            wait = eta - time.perf_counter()
+            if wait > 0.0:
+                # Sleep in slices so stop_event remains responsive.
+                while wait > 0.0 and not self.stop_event.is_set():
+                    step = min(wait, 0.05)
+                    time.sleep(step)
+                    wait = eta - time.perf_counter()
+            if sock is None:
+                continue
+            try:
+                sock.sendall(data)
+                self.bytes_passed += len(data)
+            except OSError:
+                with self.cv:
+                    self.conns.pop(conn_id, None)
+
+
+def _relay_scheduled(sock_from, sock_to, delay_spec, scheduler, debug_label=None):
+    """Bucket-scheduled relay: readers forward to the shared FIFO scheduler
+    (no per-conn sender thread). Returns when the reader side ends."""
+    max_read = 4096  # reader chunk: small slices so same-time arrivals interleave per-conn
+    conn_id = id(sock_to)
+    scheduler.attach(conn_id, sock_to)
+    stop = threading.Event()
+    def reader():
+        try:
+            while not stop.is_set() and not scheduler.stop_event.is_set():
+                try:
+                    data = sock_from.recv(max_read)
+                except (ConnectionResetError, OSError):
+                    break
+                if not data:
+                    break
+                scheduler.push(conn_id, data, time.perf_counter())
+        finally:
+            stop.set()
+    r = threading.Thread(target=reader, daemon=True)
+    r.start()
+    r.join()
+
+
+def relay_with_latency(sock_from, sock_to, delay_spec, death_probability=0.0, kill_callback=None, debug_label=None, scheduler=None):
     """Read from sock_from, optionally delay, write to sock_to. Stops on EOF/error.
 
-    When delay_spec is 0 (constant), uses a direct relay. Otherwise uses a queue and
-    sender thread so we keep reading while delaying (avoids blocking the peer).
-    delay_spec: float (constant seconds) or callable() -> float per chunk (randomize mode).
-    death_probability: per-chunk probability of killing the connection (0 = disabled).
-    kill_callback: called when connection is killed (should close both sockets).
+    delay_spec: float (constant seconds) or callable() -> float per chunk.
+    scheduler: optional shared _BucketScheduler for this direction — queues this conn's
+        chunks into the single FIFO bottleneck (bw shaping); per-conn order preserved.
     """
-    # Zero latency: direct relay, no queue (fast path that matches original working behavior)
+    if scheduler is not None:
+        _relay_scheduled(sock_from, sock_to, delay_spec, scheduler, debug_label)
+        return
+    # No scheduler: direct relay (no queue) when zero latency.
     if not callable(delay_spec) and delay_spec == 0:
         _relay_zero_latency(sock_from, sock_to, death_probability, kill_callback)
         return
@@ -356,7 +455,7 @@ def _blackout_hold_relay(client_conn, stop_event):
 
 def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
                      initial_connection_latency_sec=0.0, connection_death_probability=0.0,
-                     scenario_cfg=None):
+                     scenario_cfg=None, buckets=None):
     """Connect to server socket and relay client_conn <-> server in both directions with optional latency.
 
     When scenario_cfg is provided with mode 'stop_recover', use the special stop-then-recover
@@ -463,13 +562,13 @@ def proxy_connection(client_conn, server_socket_path, delay_spec, on_close=None,
             t1 = threading.Thread(
                 target=relay_with_latency,
                 args=(client_conn, server_conn, delay_spec),
-                kwargs=relay_kw,
+                kwargs={**relay_kw, "scheduler": buckets.get("c2s") if buckets else None},
                 daemon=True,
             )
             t2 = threading.Thread(
                 target=relay_with_latency,
                 args=(server_conn, client_conn, delay_spec),
-                kwargs=relay_kw,
+                kwargs={**relay_kw, "scheduler": buckets.get("s2c") if buckets else None},
                 daemon=True,
             )
             t1.start()
@@ -907,6 +1006,225 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
 
 # ---------------------------------------------------------------------------
+# Bulk-transfer (bufferbloat) latency scenario
+# ---------------------------------------------------------------------------
+
+def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
+    """Sustained-oversubscription scenario (the 'lag spikes to ~4 s on a 500 ms link' bug).
+
+    BOTH directions carry a producer-faster-than-link bulk flood with small
+    interactive-size 'ping' packets interleaved at a fixed cadence.  The pings'
+    completion latency is the user-visible interactive lag behind bulk; flood
+    chunk completions measure delivered goodput.
+
+    Byte-stream framing is a strict flood,ping alternation per direction, so no
+    in-band framing is needed: readers know the sizes a priori.  Flooding c2s as
+    well as s2c is needed for fidelity: it gives the server's c2s decode path RS
+    groups to measure (its redundancy model needs those samples) — a download-only
+    test would skip that code path.
+
+    Buggy behaviour: the flood's queueing delay grows unboundedly (the tunnel
+    pumps whatever the backend produces onto the carriers), the redundancy model
+    then sheds protection against the inflated RTT estimate, groups need shards
+    from nearly every carrier, each carrier's queue takes tens of seconds to
+    drain, and the stream folds into a retransmit storm (observed: 22.7 MB
+    unacked, ~13 KB/s goodput on a 256 KB/s simulated link).
+
+    Fixed: an ACK-clocked outstanding-data window caps the outstanding bytes at
+    rate x kQueueBudgetSec (a CONSTANT time budget — deliberately not derived
+    from the RTT estimate, so the controller never measures a delay it itself
+    maintains and cannot ratchet upward), so the added latency stabilizes at
+    about the budget rather than growing without bound.
+    """
+    duration = getattr(args, "continuous_duration", None) or 60.0
+    flood_size = max(1024, int(getattr(args, "bw_flood_chunk_kb", 64)) * 1024)
+    ping_size = 64
+    link_bps = max(1.0, float(getattr(args, "link_bandwidth_kbps", 0)) * 1024.0)
+    flood_rate = link_bps * max(1.0, float(getattr(args, "bw_flood_rate_x", 2.0)))
+    pair_bytes = flood_size + ping_size
+    pair_period_s = pair_bytes / flood_rate  # producer rate per direction
+
+    stop = threading.Event()
+    exp_s2c = queue.Queue()  # (kind, payload, t0) FIFO per direction
+    exp_c2s = queue.Queue()
+
+    ping_lats = {"s2c": [], "c2s": []}
+    flood_lats = {"s2c": [], "c2s": []}
+    timed_lat = []      # (ts, ms) ping samples for warmup-filtered criteria
+    errors = []         # validation errors
+    stall_events = []
+    lock = threading.Lock()
+    t_start = time.perf_counter()
+
+    STALL_S = 3.0
+
+    def writer(send_all, expected):
+        # Latency is measured from wire-entry, not from scheduling intent: send_all() can
+        # legitimately BLOCK for long stretches (the send window's whole point is to push
+        # backpressure into the producing app), and under a sustained >1x offered load that
+        # block grows linearly — counting it would report the writer's own queue, not the
+        # tunnel's. flood t0 = before send (its first bytes enter first); ping t0 = after
+        # send_all returns (its bytes are the last of the pair, so they enter the pipe then).
+        next_pair = time.perf_counter()
+        while not stop.is_set():
+            flood = os.urandom(flood_size)
+            ping = os.urandom(ping_size)
+            flood_t0 = time.perf_counter()
+            try:
+                send_all(flood + ping)
+            except (BrokenPipeError, OSError):
+                break
+            ping_t0 = time.perf_counter()
+            expected.put(("flood", flood, flood_t0))
+            expected.put(("ping", ping, ping_t0))
+            next_pair += pair_period_s
+            sleep_t = next_pair - time.perf_counter()
+            if sleep_t < -pair_period_s:
+                next_pair = time.perf_counter()  # don't try to catch up after hiccups
+                sleep_t = 0.0
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+    def s2c_writer():
+        writer(tcp_conn.sendall, exp_s2c)
+
+    def c2s_writer():
+        def send_all(data):
+            client_proc.stdin.write(data)
+            client_proc.stdin.flush()
+        writer(send_all, exp_c2s)
+
+    def reader(name, stream, expected):
+        buf = b""
+        while not stop.is_set():
+            try:
+                kind, payload, t0 = expected.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            need = len(payload)
+            while len(buf) < need and not stop.is_set():
+                try:
+                    r, _, _ = select.select([stream], [], [], 0.5)
+                    if not r:
+                        continue
+                    if hasattr(stream, "recv"):
+                        chunk = stream.recv(65536)
+                    else:
+                        chunk = stream.read(65536)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break  # EOF
+                buf += chunk
+            got, buf = buf[:need], buf[need:]
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            if got != payload:
+                if len(got) < need and stop.is_set():
+                    continue  # cut off mid-stream at shutdown: in flight, not corruption
+                with lock:
+                    errors.append((f"{name} {kind}", need,
+                                   "length mismatch" if len(got) != need else "content mismatch"))
+                continue
+            with lock:
+                if kind == "ping":
+                    ping_lats[name].append(lat_ms)
+                    timed_lat.append((time.perf_counter(), lat_ms))
+                else:
+                    flood_lats[name].append(lat_ms)
+            if kind == "ping" and lat_ms > STALL_S * 1000.0:
+                with lock:
+                    stall_events.append((f"{name} ping", lat_ms / 1000.0))
+
+    tcp_conn.settimeout(1.0)
+    threads = [
+        threading.Thread(target=s2c_writer, daemon=True),
+        threading.Thread(target=reader, args=("s2c", client_proc.stdout.raw, exp_s2c), daemon=True),
+        threading.Thread(target=c2s_writer, daemon=True),
+        threading.Thread(target=reader, args=("c2s", tcp_conn, exp_c2s), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    buckets = getattr(args, "_buckets", None)
+    passed_prev = {"s2c": 0, "c2s": 0}
+    try:
+        # Progress line every ~10 s so long runs show the queue collapse evolving.
+        t_prev = t_start
+        while time.perf_counter() - t_start < duration:
+            time.sleep(min(10.0, max(0.1, duration - (time.perf_counter() - t_start))))
+            now = time.perf_counter()
+            if now - t_prev >= 9.9:
+                with lock:
+                    s2c_done = len(ping_lats["s2c"]) + len(flood_lats["s2c"])
+                    c2s_done = len(ping_lats["c2s"]) + len(flood_lats["c2s"])
+                    errs = len(errors)
+                line = f"[bw-flood t={now-t_start:.0f}s] pairs completed s2c={s2c_done} c2s={c2s_done} errors={errs}"
+                if buckets:
+                    dt = now - t_prev
+                    for d in ("s2c", "c2s"):
+                        b = buckets[d]
+                        line += (f" {d}_wire={((b.bytes_passed - passed_prev[d]) / max(dt, 1e-9)) / 1024:.0f}KB/s"
+                                 f"(q={b.queue_bytes / 1024:.0f}KB)")
+                        passed_prev[d] = b.bytes_passed
+                t_prev = now
+                print(line, flush=True)
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    for t in threads:
+        t.join(timeout=5.0)
+    # Close the client so its debug log is complete for post-run checks.
+    try:
+        client_proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+    with lock:
+        ping_snap = {k: list(v) for k, v in ping_lats.items()}
+        flood_snap = {k: list(v) for k, v in flood_lats.items()}
+        timed_snap = list(timed_lat)
+        err_snap = list(errors)
+        stall_snap = list(stall_events)
+
+    def _stats(name, L):
+        if not L:
+            print(f"  {name}: no samples")
+            return
+        s = sorted(L)
+        p50 = s[len(s) // 2]
+        p95 = s[min(len(s) - 1, int(len(s) * 0.95))]
+        print(f"  {name}: n={len(L)} min={min(L):.0f} avg={sum(L) / len(L):.0f} "
+              f"p50={p50:.0f} p95={p95:.0f} max={max(L):.0f} ms")
+
+    print("\nBulk-flood scenario summary:")
+    for d in ("s2c", "c2s"):
+        _stats(f"{d} ping (interactive behind bulk)", ping_snap[d])
+    for d in ("s2c", "c2s"):
+        _stats(f"{d} flood chunk completion", flood_snap[d])
+    print(f"  flood producer: {pair_bytes / 1024:.0f} KB every {pair_period_s * 1000:.0f} ms/direction "
+          f"(~{flood_rate / 1024:.0f} KB/s into a ~{link_bps / 1024:.0f} KB/s link, each way)")
+
+    if err_snap:
+        print(f"\nPayload validation: {len(err_snap)} mismatch(es)", file=sys.stderr)
+        for direction, size, kind in err_snap[:20]:
+            print(f"  {direction} size={size}: {kind}", file=sys.stderr)
+    else:
+        print("\nPayload validation: all transmitted data received correctly.")
+
+    interactive = ping_snap["s2c"] + ping_snap["c2s"]
+    failures = _evaluate_test_criteria(args, interactive, stall_snap,
+                                       timed_latencies_ms=timed_snap,
+                                       test_start_time=t_start)
+    if failures:
+        print("\nTEST FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  FAIL: {f}", file=sys.stderr)
+    else:
+        print("\nTEST PASSED: all criteria met.")
+    return 1 if (err_snap or failures) else 0
+
+
+# ---------------------------------------------------------------------------
 # Heavy Wi-Fi-stop-then-recover test
 # ---------------------------------------------------------------------------
 
@@ -1215,7 +1533,7 @@ def _run_wifi_heavy(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     return 1 if fail else 0
 
 
-def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0, scenario_cfg=None):
+def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, connection_callback=None, initial_connection_latency_sec=0.0, connection_death_probability=0.0, scenario_cfg=None, buckets=None):
     """Accept on proxy_path, for each connection relay to server_socket_path with latency.
 
     If connection_callback is not None, it is called with "opened" when a new connection
@@ -1249,6 +1567,7 @@ def proxy_accept_loop(proxy_path, server_socket_path, delay_spec, stop_event, co
                     connection_death_probability,
                     scenario_cfg,
                 ),
+                kwargs={"buckets": buckets},
                 daemon=True,
             )
             t.start()
@@ -1287,6 +1606,58 @@ def check_carrier_stability(client_pid, max_removes, warmup_s=15.0):
     detail = ", ".join(f"{r}={c}" for r, c in sorted(reasons.items())) or "none"
     print(f"carrier-stability: {churn} churn-removes after {warmup_s:.0f}s warmup "
           f"(limit {max_removes}) [{detail}] -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
+def check_server_stall_ms(max_stall_ms, warmup_s=15.0):
+    """Parse the newest server --debug log and fail if the adapt-model's stall_ms — the
+    RTT-derived per-shard stall threshold — exceeds max_stall_ms after warmup. On a link
+    whose path RTT is known this directly catches RTT-estimator inflation under load
+    (queueing delay being mistaken for path latency). Returns 0 (pass) or 1 (fail)."""
+    import glob
+    logs = glob.glob("/tmp/ssh-oll-server-*.log")
+    if not logs:
+        print("stall-ms: no server debug log found (need server --debug)", file=sys.stderr, flush=True)
+        return 1
+    log = max(logs, key=os.path.getmtime)
+    txt = open(log, errors="replace").read()
+    ts = re.findall(r"\bt=(\d+)", txt)
+    if not ts:
+        print("stall-ms: no timestamps in server log; skipping", flush=True)
+        return 0
+    warmup_end = int(ts[0]) + int(warmup_s * 1000)
+    worst = 0
+    for m in re.finditer(r"adapt-model t=(\d+)[^\n]*stall_ms=(\d+)", txt):
+        t, stall = int(m.group(1)), int(m.group(2))
+        if t < warmup_end:
+            continue
+        worst = max(worst, stall)
+    ok = worst <= max_stall_ms
+    print(f"stall-ms: max stall_ms after {warmup_s:.0f}s warmup = {worst} ms "
+          f"(limit {max_stall_ms} ms) -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
+def check_server_unacked(max_bytes):
+    """Fail if any server [srv] status line reports unacked_bytes above max_bytes.
+    Guards the ACK-clocked send window: the unwindowed build grows the server's queued
+    bulk bytes to tens of MB on an overloaded link; the windowed build keeps it ~<= the
+    window cap (a few hundred KB). [srv] lines carry no timestamps, so this is a simple
+    peak check over the run. Returns 0/1."""
+    logs = sorted(glob.glob("/tmp/ssh-oll-server-*.log"),
+                  key=lambda p: os.path.getmtime(p), reverse=True)
+    if not logs:
+        print("server-unacked: no server debug log found", file=sys.stderr, flush=True)
+        return 1
+    txt = open(logs[0], errors="replace").read()
+    vals = [int(m.group(1)) for m in re.finditer(r"\[srv\] [^\n]*?unacked_bytes=(\d+)", txt)]
+    if not vals:
+        print("server-unacked: no [srv] lines in the newest server log; skipping", flush=True)
+        return 0
+    peak = max(vals)
+    ok = peak <= max_bytes
+    print(f"server-unacked: peak unacked_bytes {peak} (limit {max_bytes}) -> {'PASS' if ok else 'FAIL'}",
+          flush=True)
     return 0 if ok else 1
 
 
@@ -1512,6 +1883,46 @@ def main():
              "(>=60 KB each) through a 30s blackout; validates all bytes are delivered after recovery.",
     )
     parser.add_argument(
+        "--scenario-bw-flood",
+        action="store_true",
+        default=False,
+        help="Bulk-transfer latency scenario: sustained s2c flood at --bw-flood-rate-x times the "
+             "--link-bandwidth-kbps capacity, with interleaved interactive-size pings timed in both "
+             "directions. Reproduces the bufferbloat lag spikes seen on constrained high-latency links.",
+    )
+    parser.add_argument(
+        "--link-bandwidth-kbps",
+        type=float,
+        default=0.0,
+        metavar="KB_S",
+        help="Shared bottleneck capacity per direction in KB/s (1024 B/s units), enforced by a token "
+             "bucket shared across ALL carrier connections in the proxy (store-and-forward queueing "
+             "before the latency injection). 0 = unlimited. Default 0.",
+    )
+    parser.add_argument(
+        "--bw-flood-chunk-kb",
+        type=int,
+        default=64,
+        metavar="KB",
+        help="In --scenario-bw-flood: bytes per bulk flood chunk (alternated with 64-byte pings). Default 64.",
+    )
+    parser.add_argument(
+        "--bw-flood-rate-x",
+        type=float,
+        default=2.0,
+        metavar="X",
+        help="In --scenario-bw-flood: producer rate as a multiple of --link-bandwidth-kbps. Must be > 1 "
+             "to build a queue (sustained oversubscription, like a download peer faster than the link). Default 2.0.",
+    )
+    parser.add_argument(
+        "--assert-max-stall-ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="Fail if the server --debug log's adapt-model stall_ms (the RTT-derived stall threshold) "
+             "ever exceeds MS after warmup. Detects RTT-estimator inflation under load. Implies server debug.",
+    )
+    parser.add_argument(
         "--wifi-heavy-min-bytes",
         type=int,
         default=60 * 1024,
@@ -1636,6 +2047,14 @@ def main():
              "client debug.",
     )
     parser.add_argument(
+        "--assert-server-unacked-max",
+        type=int,
+        default=None,
+        help="After the run, fail if the server's unacked_bytes ever exceeded N bytes. "
+             "Detects the unbounded server-side bulk queue (fixed by the ACK-clocked send "
+             "window). Implies server debug.",
+    )
+    parser.add_argument(
         "--assert-max-small-copies",
         type=int,
         default=None,
@@ -1701,6 +2120,7 @@ def main():
         blackout_windows.sort(key=lambda x: x[0])
         _mode = "partial_route_loss" if getattr(args, "scenario_partial_blackout", False) else "stop_recover"
         scenario_cfg = {
+
             "mode": _mode,
             "test_start": time.perf_counter(),
             "base_latency_sec": base_latency_sec,
@@ -1725,7 +2145,9 @@ def main():
     tcp_thread.start()
 
     # 2. Start ssh-oll --server; it prints socket path then daemonizes
-    _server_debug = getattr(args, "server_debug", False)
+    _server_debug = getattr(args, "server_debug", False) or \
+        getattr(args, "assert_max_stall_ms", None) is not None or \
+        getattr(args, "assert_server_unacked_max", None) is not None
     _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
     if _server_debug:
         _server_cmd += ["--debug"]
@@ -1747,7 +2169,19 @@ def main():
         return 1
 
     # 3. Start proxy (client -> proxy -> server) with optional latency
+    # Shared per-direction token buckets model the bottleneck link capacity: every
+    # carrier competes for the same bytes/s, so oversubscription turns into real
+    # queueing delay at the proxy (store-and-forward before latency injection).
+    buckets = None
+    if getattr(args, "link_bandwidth_kbps", 0.0) > 0:
+        rate_bps = args.link_bandwidth_kbps * 1024.0
+        buckets = {}  # created after stop_proxy below
     stop_proxy = threading.Event()
+    if getattr(args, "link_bandwidth_kbps", 0.0) > 0:
+        rate_bps = args.link_bandwidth_kbps * 1024.0
+        buckets = {"c2s": _BucketScheduler(rate_bps, delay_spec, stop_proxy),
+                   "s2c": _BucketScheduler(rate_bps, delay_spec, stop_proxy)}
+    args._buckets = buckets
     # When stop_proxy fires, also wake any _blackout_hold_relay threads.
     _orig_stop_proxy_set = stop_proxy.set
     def _stop_proxy_set_and_wake():
@@ -1756,7 +2190,7 @@ def main():
     stop_proxy.set = _stop_proxy_set_and_wake  # type: ignore[method-assign]
 
     connection_callback = None
-    if args.continuous or getattr(args, "scenario_wifi_heavy", False):
+    if args.continuous or getattr(args, "scenario_wifi_heavy", False) or getattr(args, "scenario_bw_flood", False):
         connection_count = [0]
         connection_lock = threading.Lock()
 
@@ -1789,6 +2223,7 @@ def main():
             death_prob,
             scenario_cfg,
         ),
+        kwargs={"buckets": buckets},
         daemon=True,
     )
     proxy_thread.start()
@@ -1891,11 +2326,24 @@ def main():
         # client, so its --debug log holds the whole run. Combine its verdict into the rc.
         if getattr(args, "assert_max_carrier_removes", None) is not None:
             rc = (rc or 0) | check_carrier_stability(client_proc.pid, args.assert_max_carrier_removes)
+        if getattr(args, "assert_server_unacked_max", None) is not None:
+            rc = (rc or 0) | check_server_unacked(args.assert_server_unacked_max)
         if getattr(args, "assert_max_carrier_count", None) is not None:
             rc = (rc or 0) | check_carrier_count(client_proc.pid, args.assert_max_carrier_count)
         if getattr(args, "assert_max_small_copies", None) is not None:
             rc = (rc or 0) | check_max_small_copies(client_proc.pid, args.assert_max_small_copies)
+        if getattr(args, "assert_max_stall_ms", None) is not None:
+            rc = (rc or 0) | check_server_stall_ms(args.assert_max_stall_ms)
         return rc
+
+    if getattr(args, "scenario_bw_flood", False):
+        return _finalize(_run_bw_flood(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+        ))
 
     if getattr(args, "scenario_wifi_heavy", False):
         # Attach the scenario config so the test can use timing info.
@@ -2023,4 +2471,9 @@ def main():
 if __name__ == "__main__":
     # Use os._exit() to avoid Python finalizer races with daemon threads
     # (daemon threads writing to stdout can trigger SIGABRT during sys.exit cleanup).
-    os._exit(main())
+    # Flush explicitly: with output redirected (not a tty) prints are block-buffered
+    # and os._exit() would otherwise drop unflushed summary lines.
+    _rc = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_rc)

@@ -87,7 +87,15 @@ struct PacketServerMetrics {
   uint64_t avg_shard_spread_ns;     // avg spread (1st→k-th shard) for c2s RS groups
   uint64_t avg_extra_shard_gap_ns;  // avg gap (k-th→(k+1)-th shard) for c2s RS groups
   uint32_t rs_pending_count;        // c2s RS groups server is waiting to decode; client may add carriers
+  uint32_t flags;                   // SSHOLL_SERVER_METRICS_FLAG_* status bits
 };
+
+// SERVER_METRICS flags bit 0: the server's server→client send window is saturated — the
+// link is at capacity and the ACK-clocked RateWindow deliberately forbids more bytes in
+// flight. The client must not grow carriers on load pressure in that state: spreading the
+// same bounded bytes across more carriers cannot raise throughput, yet the stall fraction
+// stays high on a capacity-limited queue and would otherwise drive the count to the max.
+static constexpr uint32_t SSHOLL_SERVER_METRICS_FLAG_S2C_WINDOW_SATURATED = 1u << 0;
 
 // Server -> client: server's current redundancy config (when auto_adapt; client stays in sync).
 struct PacketServerConfig {
@@ -107,6 +115,11 @@ struct PacketClientMetrics {
   uint32_t rs_pending_count;
   uint8_t can_decrease_rs;    // p90 extra-shard gap < 0.5ms on s2c
   uint8_t can_decrease_small; // p90 first→median gap < 1.5ms on s2c
+  uint8_t c2s_window_saturated; // client's client→server send window deliberately full
+  // (link at capacity). The server then clamps rs redundancy: under provable saturation
+  // shard lateness is queueing, so extra parity would only re-share the same bytes from
+  // data onto overhead (observed: rs pinned at the 2.0 ceiling → 4× goodput collapse on
+  // a capacity-limited but lossless simulated link).
 };
 
 // Either direction: the shared_carrier_ids the sender currently believes are dead (its

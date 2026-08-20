@@ -374,6 +374,7 @@ int run_client(const Args& args) {
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t server_reported_max_rtt_ns = 0;  // server→client path RTT from SERVER_METRICS
   uint32_t server_rs_pending_count = 0;     // c2s RS groups server is waiting to decode (from SERVER_METRICS)
+  bool server_s2c_window_saturated = false; // server's s2c send window deliberately full (link at capacity)
   // s2c metrics (measured locally on decoded RS groups from server).
   std::deque<uint64_t> s2c_shard_spread_ns;
   std::deque<uint64_t> s2c_gap_final_ns;
@@ -434,8 +435,23 @@ int run_client(const Args& args) {
     // otherwise a conservative 5 s default until RTT is measured.
     return hint_ns ? hint_ns : 5000000000ULL;
   };
+  // Base RTT = the MINIMUM of recent c2s samples: the closest thing we have to the queue-free
+  // path RTT. Used for thresholds that must NOT move with load (the s2c per-shard stall
+  // cutoff), where the usual p90 would chase the queue depth the window itself grants.
+  auto get_base_rtt_ns = [&]() -> uint64_t {
+    if (!recent_rtt_ns.empty())
+      return *std::min_element(recent_rtt_ns.begin(), recent_rtt_ns.end());
+    uint64_t hint_ns = static_cast<uint64_t>(args.config.rtt_hint_ms) * 1000000ULL;
+    return hint_ns ? hint_ns : 5000000000ULL;
+  };
   auto scaled_ns = [&](unsigned mult, uint64_t min_ns, uint64_t max_ns) -> uint64_t {
     return ssholl::scaled_ns(mult, min_ns, max_ns, get_effective_rtt_ns());
+  };
+  // Session-minimum RTT, for the send-window budget (net_util.h): queueing can only raise
+  // an RTT sample, so a monotone session min cannot ratchet the window cap upward.
+  uint64_t client_rtt_min_session_ns = 0;  // 0 = no sample yet
+  auto get_window_base_rtt_ns = [&]() -> uint64_t {
+    return client_rtt_min_session_ns ? client_rtt_min_session_ns : get_base_rtt_ns();
   };
 
   // Unacked-send retransmit buffer (shared UnackedItem from net_util.h): holds the
@@ -443,6 +459,12 @@ int run_client(const Args& args) {
   // resent on a new carrier when all existing carriers die.
   std::map<uint64_t, UnackedItem> unacked_sends;
   bool retransmit_needed = false;  // set when last carrier dies with unacked data
+  // ACK-clocked send window for the c2s direction: caps outstanding (sent-but-unACKed)
+  // data bytes — see RateWindow in net_util.h. When closed, bulk RS-group encoding stops
+  // and stdin backpressure (STDIN_THROTTLE_BYTES) catches up, so a bulk producer faster
+  // than the link builds only a bounded queue instead of an ever-deepening one. Interactive
+  // SMALL packets are counted but never gated.
+  RateWindow c2s_window;
 
   // Track outstanding PINGs so we can debug long RTTs / missing PONGs.
   // Keyed by (fd, ping_id) -> send_time_ns.
@@ -550,11 +572,16 @@ int run_client(const Args& args) {
       s2c_loss_q = 0.5f * s2c_loss_q + 0.5f * q;
       s2c_qest_total_gaps = s2c_qest_late_gaps = 0;
     }
-    packet_io::append_client_metrics(it->second.write_buf,
-                                    m.avg_shard_spread_ns, m.avg_extra_shard_gap_ns,
-                                    s2c_loss_q,
-                                    static_cast<uint32_t>(rs_pending.size()),
-                                    m.can_decrease_rs, m.can_decrease_small);
+    {
+      uint64_t mq_outstanding = 0;
+      for (const auto& [uid, ui] : unacked_sends) mq_outstanding += ui.data.size();
+      bool mq_c2s_sat = mq_outstanding >= rate_window_cap(c2s_window, get_window_base_rtt_ns());
+      packet_io::append_client_metrics(it->second.write_buf,
+                                      m.avg_shard_spread_ns, m.avg_extra_shard_gap_ns,
+                                      s2c_loss_q,
+                                      static_cast<uint32_t>(rs_pending.size()),
+                                      m.can_decrease_rs, m.can_decrease_small, mq_c2s_sat);
+    }
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = fd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
@@ -640,7 +667,7 @@ int run_client(const Args& args) {
   // beyond the retransmit-scale threshold (~RTT/2) means its carrier stalled, not jittered.
   recv_cb.on_rs_shard_gap = [&](uint64_t gap_ns) {
     s2c_qest_total_gaps += 1;
-    if (gap_ns > carrier_adapt::stall_threshold_ns(get_effective_rtt_ns())) s2c_qest_late_gaps += 1;
+    if (gap_ns > carrier_adapt::stall_threshold_ns(get_base_rtt_ns())) s2c_qest_late_gaps += 1;
     s2c_shards_recv_window += 1;
   };
   recv_cb.on_small_extra_copy = [&](uint64_t gap_ns) {
@@ -648,12 +675,14 @@ int run_client(const Args& args) {
     while (s2c_small_extra_copy_gap_ns.size() > kMaxSpreadSamples) s2c_small_extra_copy_gap_ns.pop_front();
   };
   recv_cb.on_server_metrics = [&](uint64_t max_rtt_ns, uint64_t avg_spread_ns,
-                                   uint64_t avg_extra_gap_ns, uint32_t rs_pending_count) {
+                                   uint64_t avg_extra_gap_ns, uint32_t rs_pending_count,
+                                   uint32_t flags) {
     if (max_rtt_ns < 10000000000ULL)
       server_reported_max_rtt_ns = max_rtt_ns;
     c2s_avg_shard_spread_ns   = avg_spread_ns;
     c2s_avg_extra_shard_gap_ns = avg_extra_gap_ns;
     server_rs_pending_count   = rs_pending_count;
+    server_s2c_window_saturated = (flags & SSHOLL_SERVER_METRICS_FLAG_S2C_WINDOW_SATURATED) != 0;
   };
   recv_cb.on_server_config = [&](const PacketServerConfig& psc) {
     has_server_config = true;
@@ -744,10 +773,19 @@ int run_client(const Args& args) {
       // scales from measured RTT.
       recent_rtt_ns.push_back(rtt_ns);
       while (recent_rtt_ns.size() > max_recent_rtt) recent_rtt_ns.pop_front();
+      if (client_rtt_min_session_ns == 0 || rtt_ns < client_rtt_min_session_ns)
+        client_rtt_min_session_ns = rtt_ns;
     }
     // Data confirmed delivered: no longer need to retransmit.
-    for (auto it_u = unacked_sends.begin(); it_u != unacked_sends.end() && it_u->first <= acked_id; )
+    uint64_t acked_bytes = 0;
+    for (auto it_u = unacked_sends.begin(); it_u != unacked_sends.end() && it_u->first <= acked_id; ) {
+      acked_bytes += it_u->second.data.size();
       it_u = unacked_sends.erase(it_u);
+    }
+    // ACK-clocked delivered-rate estimate for the c2s send window (see RateWindow in
+    // net_util.h): when the window has closed the pump there is nothing new to ACK, so the
+    // rate holds rather than spiralling down.
+    rate_window_on_ack(c2s_window, acked_bytes, recv_time);
   };
 
   auto process_carrier_read = [&](int fd, CarrierState& s) {
@@ -896,7 +934,15 @@ int run_client(const Args& args) {
   // RS block first. Called both when stdin produces data and periodically (so a held
   // remainder still flushes once its window elapses). Caller flushes carrier writes.
   auto pump_stdin_send = [&]() {
-    while (stdin_buf.size() >= effective_max_packet && !carriers.empty()) {
+    // SEND WINDOW (see RateWindow in net_util.h): bulk RS-group encoding stops once the
+    // outstanding sent-but-unACKed data reaches the ACK-clocked cap — that is what bounds
+    // the queue a late shard/interactive packet can sit behind. SMALL/interactive packets
+    // are never gated. The window always opens when empty, so one oversized group can't
+    // deadlock the stream.
+    uint64_t c2s_outstanding = 0;
+    for (const auto& [uid, ui] : unacked_sends) c2s_outstanding += ui.data.size();
+    while (stdin_buf.size() >= effective_max_packet && !carriers.empty() &&
+           rate_window_open(c2s_outstanding, c2s_window, get_window_base_rtt_ns())) {
       const size_t block_size = effective_max_packet;
       float rs_frac = args.config.auto_adapt ? effective_rs_redundancy : args.config.rs_redundancy;
       // Interactive (small backlog) groups get smoothness-grade parity so a small low-k burst
@@ -928,6 +974,7 @@ int run_client(const Args& args) {
         ui.small_sent_on.insert(it->second.carrier_id);
         queue_to_carrier(cfd, stdin_buf.data(), chunk, false);  // increments next_send_id
         c2s_packets_sent_window += 1;
+        c2s_outstanding += chunk;
         ev.events = EPOLLIN | EPOLLOUT;
         ev.data.fd = cfd;
         epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -966,6 +1013,12 @@ int run_client(const Args& args) {
           ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
       }
       next_send_id++;
+      c2s_outstanding += k * block_size;  // the window gate re-checks against this
+      if (dbg && unacked_sends.size() > 500 && next_send_id % 100 == 0)
+        fprintf(dbg, "[pump-grow t=%llu unacked=%zu next_send_id=%llu k=%u block=%zu outstanding_kb=%zu cap_kb=%zu rate_kbps=%.0f]\n",
+                (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(),
+                (unsigned long long)next_send_id, k, block_size, c2s_outstanding/1024,
+                rate_window_cap(c2s_window, get_window_base_rtt_ns())/1024, c2s_window.rate_bps/1024.0);
       c2s_packets_sent_window += num_shards;
       if (!carriers.empty())
         next_rr = (next_rr + static_cast<unsigned>(num_shards)) % static_cast<unsigned>(carriers.size());
@@ -1069,11 +1122,12 @@ int run_client(const Args& args) {
           }
           stdin_buf.insert(stdin_buf.end(), buf, buf + nr);
         }
-        // If stdin_buf has grown large and there are no carriers to send to,
-        // temporarily remove STDIN from epoll so we don't spin while waiting for
-        // carriers to reconnect.  It is re-armed below whenever conditions improve.
-        if (!stdin_eof && carriers.empty() && stdin_buf.size() >= STDIN_THROTTLE_BYTES
-            && stdin_in_epoll) {
+        // If stdin_buf has grown large, remove STDIN from epoll so we don't keep
+        // queueing data we cannot push out yet. This applies with carriers up too:
+        // the RateWindow pump gate can legitimately stop draining stdin_buf (link at
+        // capacity), and without this throttle the queue would just move from the
+        // carrier write buffers into stdin_buf, unbounded.
+        if (!stdin_eof && stdin_buf.size() >= STDIN_THROTTLE_BYTES && stdin_in_epoll) {
           epoll_ctl(epfd, EPOLL_CTL_DEL, STDIN_FILENO, nullptr);
           stdin_in_epoll = false;
         }
@@ -1232,10 +1286,12 @@ int run_client(const Args& args) {
       }
     }
 
-    // Flush a sub-block remainder that has been held for coalescing once its --max-delay
-    // window elapses (no new stdin event is needed to push it out). EOF is handled by the
-    // drain path above, so only run this while stdin is still open.
-    if (!stdin_eof && stdin_partial_since_ns != 0 && !carriers.empty())
+    // Run the sender pump periodically even when STDIN is throttled out of epoll: an
+    // arriving ACK can re-open the send window while stdin_buf is full, and only the
+    // pump drains the buffer through the window — without this the window opens but no
+    // new group is encoded and the link wedges. (Also flushes a held sub-block
+    // remainder once its --max-delay elapses; the pump enforces that timing itself.)
+    if (!stdin_eof && !stdin_buf.empty() && !carriers.empty())
       pump_stdin_send();
 
     flush_pending_ack();  // one coalesced cumulative ACK for everything delivered this iteration
@@ -1809,7 +1865,20 @@ int run_client(const Args& args) {
         // paths share last_add_carrier_ns, and this (earlier) block runs first; if
         // load_pressure fired below the floor it would add a single carrier and starve the
         // burst, slowing the initial ramp to --connections from ~5/100ms to ~1/100ms.
-        bool load_pressure = (carriers.size() >= target_carriers)
+        // Saturated send window => the link is already at capacity and the ACK-clocked
+        // window deliberately forbids more bytes in flight: spreading the SAME bounded
+        // bytes across more carriers cannot raise throughput, yet the stall fraction
+        // stays high on a capacity-limited queue and would otherwise grow the fleet to
+        // max_connections (observed: steady growth 8->120 while unacked stayed at the
+        // ~5-group window cap). Gate load presses on window headroom: growth under load
+        // is only meaningful while the window is open (real packet loss with spare
+        // capacity), which is exactly when the flood-latency sim pins the cap closed.
+        uint64_t c2s_outstanding_for_gate = 0;
+        for (const auto& [uid, ui] : unacked_sends) c2s_outstanding_for_gate += ui.data.size();
+        const bool window_saturated = server_s2c_window_saturated
+            || (c2s_outstanding_for_gate >= rate_window_cap(c2s_window, get_window_base_rtt_ns()) * 3 / 4);
+        bool load_pressure = !window_saturated
+                             && (carriers.size() >= target_carriers)
                              && (carriers.size() < desired_carriers_dyn);
         bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;
         bool need_more = load_pressure
@@ -2055,6 +2124,7 @@ int run_client(const Args& args) {
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(),
                   (unsigned long long)next_deliver_id, stdout_buf.size(),
                   (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count);
+          fprintf(dbg, "[cli-e2] next_send_id=%llu\n", (unsigned long long)next_send_id);
         } else {
           auto it = rs_pending.begin();
           fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
@@ -2227,10 +2297,10 @@ int run_client(const Args& args) {
     }
 
     // ── Re-arm stdin if it was throttled ────────────────────────────────────
-    // Re-register STDIN with epoll once we have carriers again (can send data)
-    // or when stdin_buf drains below the throttle threshold (need more data).
-    if (!stdin_in_epoll && !stdin_eof &&
-        (!carriers.empty() || stdin_buf.size() < STDIN_THROTTLE_BYTES)) {
+    // Re-register STDIN with epoll once stdin_buf has drained below the throttle
+    // threshold (purely buffer-driven: with the send-window gate there may be
+    // carriers up yet no room to push more data right now).
+    if (!stdin_in_epoll && !stdin_eof && stdin_buf.size() < STDIN_THROTTLE_BYTES) {
       ev.events = EPOLLIN;
       ev.data.fd = STDIN_FILENO;
       if (epoll_ctl(epfd, EPOLL_CTL_ADD, STDIN_FILENO, &ev) == 0)

@@ -82,7 +82,8 @@ struct ReceiveCallbacks {
   std::function<void(uint64_t gap_ns)> on_rs_extra_shard;
   // Server -> client SERVER_METRICS; client uses for adapt.
   std::function<void(uint64_t max_rtt_ns, uint64_t avg_shard_spread_ns,
-                     uint64_t avg_extra_shard_gap_ns, uint32_t rs_pending_count)> on_server_metrics;
+                     uint64_t avg_extra_shard_gap_ns, uint32_t rs_pending_count,
+                     uint32_t flags)> on_server_metrics;
   // Server -> client SERVER_CONFIG; server's current redundancy (client uses when auto_adapt).
   std::function<void(const PacketServerConfig&)> on_server_config;
   // Server -> client SUGGEST_CLOSE; client should close this carrier (server thinks it's dead or slow).
@@ -90,7 +91,8 @@ struct ReceiveCallbacks {
   // Client -> server CLIENT_METRICS; server uses s2c path quality for dual-direction adapt.
   std::function<void(uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
                      float fraction_struggling, uint32_t rs_pending_count,
-                     bool can_decrease_rs, bool can_decrease_small)> on_client_metrics;
+                     bool can_decrease_rs, bool can_decrease_small,
+                     bool c2s_window_saturated)> on_client_metrics;
   // Fired for EVERY shard of an RS group as it arrives, with the gap between this shard
   // and the group's FIRST shard (the first shard reports gap 0). Used to estimate the
   // per-shard "late" probability q against an absolute latency budget B: a shard with
@@ -162,10 +164,11 @@ void append_carrier_status(std::vector<uint8_t>& out, const std::vector<uint64_t
 void append_suggest_close(std::vector<uint8_t>& out);
 void append_server_metrics(std::vector<uint8_t>& out, uint64_t max_rtt_ns,
                            uint64_t avg_shard_spread_ns, uint64_t avg_extra_shard_gap_ns,
-                           uint32_t rs_pending_count);
+                           uint32_t rs_pending_count, uint32_t flags);
 void append_client_metrics(std::vector<uint8_t>& out, uint64_t avg_shard_spread_ns,
                            uint64_t avg_extra_shard_gap_ns, float fraction_struggling,
-                           uint32_t rs_pending_count, bool can_decrease_rs, bool can_decrease_small);
+                           uint32_t rs_pending_count, bool can_decrease_rs, bool can_decrease_small,
+                           bool c2s_window_saturated);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).

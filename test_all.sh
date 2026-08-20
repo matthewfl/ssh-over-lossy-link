@@ -616,6 +616,28 @@ run_test "sanity-integrity" \
     --continuous --continuous-duration 15 \
     --latency-ms 5
 
+# ============================================================================
+# 13 bw-flood — bulk transfer >= 2x link capacity through a bandwidth-shaped
+#     proxy on a 500 ms RTT path. Asserts the ACK-clocked send window keeps the
+#     server's queued bulk bytes, the carrier count, and interactive ping
+#     latency behind the flood all bounded (pre-window build: unacked ~19 MB,
+#     carriers at the 120 cap, ping tail ~const 30 s).
+# ============================================================================
+run_test "bw-flood-window-backpressure" \
+    --init-latency-override 0.05 \
+    --scenario-bw-flood \
+    --latency-ms 250 \
+    --link-bandwidth-kbps 256 \
+    --bw-flood-rate-x 2.0 \
+    --connections 8 \
+    --packet-size 800 --payload-size 800 \
+    --continuous-duration 40 \
+    --client-debug --server-debug \
+    --test-max-latency 25000 \
+    --assert-server-unacked-max 2000000 \
+    --assert-max-carrier-count 64 \
+    --extra-client-args --max-connections 120
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"
