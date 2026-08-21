@@ -2123,16 +2123,15 @@ int run_client(const Args& args) {
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) unacked_bytes += ui.data.size();
         if (rs_pending.empty()) {
-          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
+          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(),
-                  (unsigned long long)next_deliver_id, stdout_buf.size(),
+                  (unsigned long long)next_deliver_id, (unsigned long long)next_send_id, stdout_buf.size(),
                   (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count);
-          fprintf(dbg, "[cli-e2] next_send_id=%llu\n", (unsigned long long)next_send_id);
         } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
+          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
-                  (unsigned long long)next_deliver_id, stdout_buf.size(),
+                  (unsigned long long)next_deliver_id, (unsigned long long)next_send_id, stdout_buf.size(),
                   (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count,
                   (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
         }
