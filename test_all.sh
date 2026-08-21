@@ -638,6 +638,20 @@ run_test "bw-flood-window-backpressure" \
     --assert-max-carrier-count 64 \
     --extra-client-args --max-connections 120
 
+# ============================================================================
+# 14 adapt-download-only-s2c — audit AUD-1: a session with near-zero c2s RS
+#     traffic (download-only shape) must still run the server's redundancy
+#     adaptation for its own s2c direction: the gate previously required c2s
+#     RS-decode samples and left the s2c side frozen at the startup redundancy.
+# ============================================================================
+run_test "adapt-download-only-s2c" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 50 \
+    --continuous-tcp-to-client-only \
+    --packet-size 100 --payload-size 100 \
+    --latency-random \
+    --assert-server-adapts
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"

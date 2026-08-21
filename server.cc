@@ -1260,12 +1260,18 @@ int run_server(const Args& args) {
       }
     }
 
-    // When auto_adapt, server manages its own redundancy and informs the client.
+    // When auto_adapt, server manages its own redundancy and informs the client. Run the model
+    // when EITHER self-measured c2s spread samples are available OR the client reports a fresh
+    // s2c loss estimate: a download-only session (client sends only SMALL pings) never feeds
+    // c2s_shard_spread_ns, and without this the redundancy stayed frozen at the startup value
+    // for the whole session even as the s2c direction lost shards (AUD-1).
+    const uint64_t s2c_stale_ns = 2 * metrics_interval_ns;
+    const bool s2c_fresh_for_adapt = (s2c_last_received_ns != 0) &&
+        (now_ns_val - s2c_last_received_ns < s2c_stale_ns);
     if (runtime_auto_adapt && !carriers.empty() && now_ns_val - last_adapt_ns >= adapt_interval_ns
-        && c2s_shard_spread_ns.size() >= carrier_adapt::kMinSamplesForAdapt) {
+        && (c2s_shard_spread_ns.size() >= carrier_adapt::kMinSamplesForAdapt || s2c_fresh_for_adapt)) {
       const uint64_t adapt_dt = now_ns_val - last_adapt_ns;  // elapsed since last adapt (rate-limiting)
       last_adapt_ns = now_ns_val;
-      const uint64_t s2c_stale_ns = 2 * metrics_interval_ns;
       // Asymmetric adaptation — fast UP, slow DOWN. Redundancy rises immediately to restore
       // protection the moment the link degrades, but only falls at a bounded rate: a single
       // quiet measurement window must not crash redundancy and trigger the oscillation

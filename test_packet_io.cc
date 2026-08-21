@@ -285,6 +285,16 @@ void test_rs_group_params() {
     auto p = rs_group_params(24, 0.5f, 100, 0.18, 1e-5);  // k=floor(24/1.5)=16, m=round(8)=8
     check(p.k == 16 && p.m == 8 && p.n == 24, "group_params: bulk k16 unaffected by interactive");
   }
+  // Extreme redundancy with few carriers must never produce k==0 or n>carriers: the RS
+  // encode loop would stall on k=0 while data waits, or fan a shard per carrier absent.
+  {
+    auto p = rs_group_params(2, 2.0f, 5);
+    check(p.k >= 1 && p.n >= p.k && p.n <= 2, "group_params: 2 carriers @2.0 -> k>=1, n<=2");
+  }
+  {
+    auto p = rs_group_params(3, 2.0f, 5);
+    check(p.k == 1 && p.n <= 3 && p.n > p.k, "group_params: 3 carriers @2.0 -> k1, n<=3, has parity");
+  }
 }
 
 }  // namespace

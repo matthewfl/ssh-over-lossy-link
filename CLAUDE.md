@@ -31,6 +31,27 @@ make install                # installs to /usr/local/bin (DESTDIR-aware)
 make clean
 ```
 
+**Workflow rules (learned the hard way):**
+
+- Run `./test_all.sh` (the full suite) before EVERY commit — `make check` (fast unit
+  tests) is a smoke check, not the gate.
+- While the suite (or any long background run) is in flight: NEVER touch
+  `/tmp/ssh-oll-{client,server}-*.log`, never rebuild the `ssh-oll` binary the suite
+  is using, and never edit `test_ssh_oll.py`/`test_all.sh` — shells re-read them and
+  the suite measures the mid-edit mutation. (The fixed-10ms -> FAIL case of 2026-08-21:
+  a parallel `rm -f /tmp/ssh-oll-client-*.log` deleted that test's client debug log
+  before its `--assert-max-carrier-removes` check.)
+- Persist the PID of every long-lived background job to a pidfile next to its log; do
+  all later liveness/teardown against that stored PID (process-exists check on the
+  specific PID), never against a name pattern. Reserve pgrep-style pattern scans for
+  discovering orphans of earlier runs, with the pattern written so it cannot match its
+  own literal text (e.g. `pgrep -f "test_all[.]sh"`), and exclude the issuing shell's
+  own PID before killing anything.
+- When a test is flaky, add `--debug` logging and measure at the REPLAY of the failing
+  scenario; do not hand-build synthetic one-off "/tmp/*audit*.py" measurement harnesses
+  that bypass the suite runner — they drift from the suite's gate and led me past a
+  whole day's worth of suspect-but-fine measurements during the audit.
+
 - **Linux**: native `epoll`. **macOS**: needs `epoll-shim` (`brew install epoll-shim`);
   the Makefile auto-detects via `uname` and adds the include/lib flags.
 - Both client and server are **single-threaded, epoll-driven**. No threads, no locks.

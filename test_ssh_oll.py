@@ -1638,6 +1638,32 @@ def check_server_stall_ms(max_stall_ms, warmup_s=15.0):
     return 0 if ok else 1
 
 
+def check_server_adapts(min_lines=25, warmup_s=20.0):
+    """Fail if the server never adapted: count [adapt-model] lines after warmup. In a
+    download-only session (little/no client->server RS traffic) the adapt path used to
+    stay forever silent because its gate required c2s RS-decode samples — the s2c
+    direction then kept the startup redundancy regardless of loss (AUD-1). The fixed
+    gate runs the model at adapt cadence whenever EITHER c2s samples exist OR the
+    client reported a fresh s2c loss estimate. Returns 0 (pass) or 1 (fail)."""
+    import glob
+    logs = glob.glob("/tmp/ssh-oll-server-*.log")
+    if not logs:
+        print("server-adapts: no server debug log found (need server --debug)", file=sys.stderr, flush=True)
+        return 1
+    log = max(logs, key=os.path.getmtime)
+    txt = open(log, errors="replace").read()
+    ts = re.findall(r"\bt=(\d+)", txt)
+    if not ts:
+        print("server-adapts: no timestamps in server log; skipping", flush=True)
+        return 0
+    warmup_end = int(ts[0]) + int(warmup_s * 1000)
+    n = sum(1 for m in re.finditer(r"adapt-model t=(\d+)", txt) if int(m.group(1)) >= warmup_end)
+    ok = n >= min_lines
+    print(f"server-adapts: {n} adapt-model lines after {warmup_s:.0f}s warmup "
+          f"(expected >= {min_lines}) -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
 def check_server_unacked(max_bytes):
     """Fail if any server [srv] status line reports unacked_bytes above max_bytes.
     Guards the ACK-clocked send window: the unwindowed build grows the server's queued
@@ -2055,6 +2081,14 @@ def main():
              "window). Implies server debug.",
     )
     parser.add_argument(
+        "--assert-server-adapts",
+        action="store_true",
+        help="After the run, fail if the server logged fewer than 25 [adapt-model] lines after "
+             "a 20s warmup — detects the download-only adaptation lock (AUD-1: the adapt gate "
+             "required c2s RS-decode samples, so a session with no client RS upload never ran "
+             "the redundancy model at all). Implies server debug.",
+    )
+    parser.add_argument(
         "--assert-max-small-copies",
         type=int,
         default=None,
@@ -2147,6 +2181,7 @@ def main():
     # 2. Start ssh-oll --server; it prints socket path then daemonizes
     _server_debug = getattr(args, "server_debug", False) or \
         getattr(args, "assert_max_stall_ms", None) is not None or \
+        getattr(args, "assert_server_adapts", False) or \
         getattr(args, "assert_server_unacked_max", None) is not None
     _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
     if _server_debug:
@@ -2328,6 +2363,8 @@ def main():
             rc = (rc or 0) | check_carrier_stability(client_proc.pid, args.assert_max_carrier_removes)
         if getattr(args, "assert_server_unacked_max", None) is not None:
             rc = (rc or 0) | check_server_unacked(args.assert_server_unacked_max)
+        if getattr(args, "assert_server_adapts", False):
+            rc = (rc or 0) | check_server_adapts()
         if getattr(args, "assert_max_carrier_count", None) is not None:
             rc = (rc or 0) | check_carrier_count(client_proc.pid, args.assert_max_carrier_count)
         if getattr(args, "assert_max_small_copies", None) is not None:
