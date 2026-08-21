@@ -785,7 +785,10 @@ int run_client(const Args& args) {
     // ACK-clocked delivered-rate estimate for the c2s send window (see RateWindow in
     // net_util.h): when the window has closed the pump there is nothing new to ACK, so the
     // rate holds rather than spiralling down.
-    rate_window_on_ack(c2s_window, acked_bytes, recv_time);
+    uint64_t outstanding_after = 0;
+    for (const auto& [uid2, ui2] : unacked_sends) outstanding_after += ui2.data.size();
+    rate_window_on_ack(c2s_window, acked_bytes, recv_time, outstanding_after,
+                       get_window_base_rtt_ns());
   };
 
   auto process_carrier_read = [&](int fd, CarrierState& s) {

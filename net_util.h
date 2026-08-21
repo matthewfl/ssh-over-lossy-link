@@ -87,37 +87,20 @@ struct UnackedItem {
 // Interactive SMALL packets are counted in the outstanding bytes but never gated —
 // they are tiny, and jumping the (now-bounded) queue is exactly what keeps typing
 // responsive behind a bulk transfer.
-//   • the estimator must measure CAPACITY, not throughput: delivered bytes divided by
-//     the fold interval confounds the window's own throttling (a window closed mid-fold
-//     reports its own clamp, shrinking the cap into a low fixpoint — observed ~35% of a
-//     256 KB/s link on a 500 ms pipe), while first→last ACK burst spacing explodes upward
-//     with coalesced cumulative ACKs (packing a whole fold's bytes into ~ms "active" time
-//     blew the cap to the 4 MB ceiling and admitted 845 groups at once — observed). So
-//     track the fold's time with the window OPEN: while open AND full, deliveries run at
-//     bottleneck speed; rate = fold_bytes / open-time.
 struct RateWindow {
-  double rate_bps = 0.0;        // EWMA of capacity (open-time delivered rate), bytes/s
+  double rate_bps = 0.0;        // EWMA of the ACK-clocked delivered rate, bytes/s
+  double prev_fold_rate = 0.0;  // previous fold's instantaneous delivered rate, bytes/s
   uint64_t fold_bytes = 0;      // ACKed bytes accumulated in the current fold interval
   uint64_t last_fold_ns = 0;    // start of the current fold interval
 
   static constexpr uint64_t kFoldIntervalNs = 500 * 1000000ULL;   // 500 ms
   static constexpr double kBudgetSec = 1.0;                       // queue budget on top of base-RTT
   static constexpr double kHeadroomMult = 1.25;                   // probe shift: lifts the stall point toward capacity
+  static constexpr double kProbeMult = 1.6;                         // supply-limited growth probe per fold
+  static constexpr double kProbeResponseMult = 1.15;                // grow again only if the rate RESPONDED
   static constexpr uint64_t kFloorBytes = 128 * 1024;             // cold-start / min cap (scales with base_s)
   static constexpr uint64_t kCeilBytes = 4 * 1024 * 1024;         // sanity ceiling
 };
-
-inline void rate_window_on_ack(RateWindow& w, uint64_t acked_bytes, uint64_t now_ns) {
-  w.fold_bytes += acked_bytes;
-  if (w.last_fold_ns == 0) w.last_fold_ns = now_ns;
-  uint64_t dt = now_ns - w.last_fold_ns;
-  if (dt >= RateWindow::kFoldIntervalNs) {
-    double inst = static_cast<double>(w.fold_bytes) / (static_cast<double>(dt) / 1e9);
-    w.rate_bps = (w.rate_bps > 0.0) ? (0.5 * w.rate_bps + 0.5 * inst) : inst;
-    w.fold_bytes = 0;
-    w.last_fold_ns = now_ns;
-  }
-}
 
 inline uint64_t rate_window_cap(const RateWindow& w, uint64_t base_rtt_ns) {
   // Budget = base-RTT PLUS the queue budget: the cap must cover the bandwidth×delay
@@ -138,6 +121,43 @@ inline bool rate_window_open(uint64_t outstanding_bytes, const RateWindow& w,
                              uint64_t base_rtt_ns) {
   return outstanding_bytes == 0 || outstanding_bytes < rate_window_cap(w, base_rtt_ns);
 }
+inline void rate_window_on_ack(RateWindow& w, uint64_t acked_bytes, uint64_t now_ns,
+                               uint64_t outstanding_after, uint64_t base_rtt_ns) {
+  w.fold_bytes += acked_bytes;
+  if (w.last_fold_ns == 0) w.last_fold_ns = now_ns;
+  uint64_t dt = now_ns - w.last_fold_ns;
+  if (dt >= RateWindow::kFoldIntervalNs) {
+    double inst = static_cast<double>(w.fold_bytes) / (static_cast<double>(dt) / 1e9);
+    // Supply-limited probe: the plain EWMA locks in at ANY self-confirming equilibrium
+    // (measured: ~1/3 of link capacity on ~30% of runs) because the fold-clock is window-driven:
+    // few ACKs come while the window is closed, so the measured delivered rate reports its own
+    // clamp. If the fold ends with the window still full the link's capacity may exceed what we
+    // offered, so probe-grow multiplicatively like a TCP window — but ONLY while each growth
+    // actually LIFTS the delivered rate (rate_response): when the bottleneck is the link, growth
+    // stops lifting inst and the probe stops. (The bare supply_limited condition is a tautology
+    // on an overloaded link — it was always true, and the estimate ran away to the 4 MB ceiling.)
+    bool supply_limited = (outstanding_after + w.fold_bytes) >= rate_window_cap(w, base_rtt_ns);
+    // The probe via rate-response alone NEVER converges to a saturated-link stop: when the
+    // backlog sits in the proxy/kernel and delivery runs at the wire rate, an oversized window
+    // still delivers "fold-bytes" at that rate — rate-responsive keeps growing because bytes
+    // keep moving, while the QUEUE grows. A saturate-stop: once the backlog is the full queue
+    // budget of the rate MEASURED while delivery was running FAST (inst, not the EWMA), the
+    // probe freezes and the link's queueing settles at the budget.
+    uint64_t budget_cap = static_cast<uint64_t>(
+        inst * (static_cast<double>(base_rtt_ns) / 1e9 + RateWindow::kBudgetSec) * RateWindow::kHeadroomMult);
+    bool queue_saturated = outstanding_after >= budget_cap;
+    bool rate_responsive = w.prev_fold_rate == 0.0 ||
+                           inst >= w.prev_fold_rate * RateWindow::kProbeResponseMult;
+    w.prev_fold_rate = inst;
+    if (supply_limited && rate_responsive && !queue_saturated && w.rate_bps > 0.0)
+      inst = std::max(inst, w.rate_bps * RateWindow::kProbeMult);
+    w.rate_bps = (w.rate_bps > 0.0) ? (0.5 * w.rate_bps + 0.5 * inst) : inst;
+    w.fold_bytes = 0;
+    w.last_fold_ns = now_ns;
+  }
+}
+
+
 
 }  // namespace ssholl
 

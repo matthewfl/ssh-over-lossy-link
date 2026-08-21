@@ -630,7 +630,9 @@ int run_server(const Args& args) {
     // ACK-clocked rate estimate for the s2c send window (this also has a nice property: when
     // the window has closed the pump and deliveries pause at the cap, so there is nothing new
     // to ACK and the rate simply holds — it cannot spiral down to zero).
-    rate_window_on_ack(s2c_window, acked_bytes, now_ns());
+    uint64_t outstanding_after = 0;
+    for (const auto& [uid2, ui2] : unacked_data) outstanding_after += ui2.data.size();
+    rate_window_on_ack(s2c_window, acked_bytes, now_ns(), outstanding_after, get_window_base_rtt_ns());
   };
   recv_cb.on_pong = [&](int fd, uint64_t) {
     outstanding_ping_ns.erase(fd);
