@@ -1663,6 +1663,37 @@ def check_server_adapts(min_lines=25, warmup_s=20.0):
           f"(expected >= {min_lines}) -> {'PASS' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 
+def check_dead_idle_recovery(client_pid, min_removes):
+    """Fail if the client never reaped dead-idle carriers: count [carrier-remove ... dead_idle]
+    lines. In SSH production mode with a light backlog the conservative 'assume the link is
+    fine' gate used to skip the ENTIRE tick tail (dead-idle reaping plus the global receive
+    timestamp update) — so a permanently blackholed fleet was neither reaped nor escalated:
+    observed in production: 115 carriers dead ~81s, zero churn, only the eventual global
+    idle exit; and with last_global_recv_ns frozen by the same skip even THAT was broken in
+    some build layouts. The fixed gate disengages once the FLEET ITSELF has been silent
+    beyond the dead-idle clearance window. Returns 0 (pass) or 1 (fail)."""
+    log = f"/tmp/ssh-oll-client-{client_pid}.log"
+    if not os.path.exists(log):
+        print(f"recovery-events: client debug log {log} not found (need client debug)", file=sys.stderr, flush=True)
+        return 1
+    txt = open(log, errors="replace").read()
+    removals = re.findall(r"carrier-remove t=\d+ fd=\d+ total=\d+ reason=([a-z_]+)", txt)
+    # Only dead-carrier-class reasons count: read_error/excess_release churn is benign and
+    # occurs on healthy links too. dead_idle itself is the skip-gated path; the others are
+    # the equivalent reclaim actions taken once the silence escalates past the gate.
+    dead_classes = {"dead_idle", "replaced", "silence_reap", "mass_death",
+                    "c2s_dead_server", "s2c_dead_confirmed"}
+    reason_counts = {}
+    n = 0
+    for r in removals:
+        reason_counts[r] = reason_counts.get(r, 0) + 1
+        if r in dead_classes:
+            n += 1
+    ok = n >= min_removes
+    print(f"recovery-events: {n} dead-carrier-class removals {reason_counts} "
+          f"(expected >= {min_removes}) -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
 
 def check_server_unacked(max_bytes):
     """Fail if any server [srv] status line reports unacked_bytes above max_bytes.
@@ -2089,6 +2120,13 @@ def main():
              "the redundancy model at all). Implies server debug.",
     )
     parser.add_argument(
+        "--assert-min-dead-idle-removes",
+        type=int, default=None, metavar="N",
+        help="After the run, fail if the client logged fewer than N dead-carrier removals "
+             "(reason=dead_idle etc.) — detects the SSH-mode-light-backlog carrier-management "
+             "skip that froze a blackholed fleet in production. Implies client debug.",
+    )
+    parser.add_argument(
         "--assert-max-small-copies",
         type=int,
         default=None,
@@ -2267,7 +2305,8 @@ def main():
     _client_debug = getattr(args, "client_debug", False) or \
         getattr(args, "assert_max_carrier_removes", None) is not None or \
         getattr(args, "assert_max_carrier_count", None) is not None or \
-        getattr(args, "assert_max_small_copies", None) is not None
+        getattr(args, "assert_max_small_copies", None) is not None or \
+        getattr(args, "assert_min_dead_idle_removes", None) is not None
     client_cmd = [
         args.ssh_oll_path,
         "--unix-socket-connection",
@@ -2365,6 +2404,8 @@ def main():
             rc = (rc or 0) | check_server_unacked(args.assert_server_unacked_max)
         if getattr(args, "assert_server_adapts", False):
             rc = (rc or 0) | check_server_adapts()
+        if getattr(args, "assert_min_dead_idle_removes", None) is not None:
+            rc = (rc or 0) | check_dead_idle_recovery(client_proc.pid, args.assert_min_dead_idle_removes)
         if getattr(args, "assert_max_carrier_count", None) is not None:
             rc = (rc or 0) | check_carrier_count(client_proc.pid, args.assert_max_carrier_count)
         if getattr(args, "assert_max_small_copies", None) is not None:

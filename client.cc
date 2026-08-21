@@ -1652,6 +1652,29 @@ int run_client(const Args& args) {
           }
         }
 
+        // Fleet receive clock + global idle safety net: computed BEFORE the ssh-light skip
+        // below — in production (SSH mode, typically light backlog) the skip engaged on
+        // every cycle: the clock froze, dead carriers were never reaped, and the global
+        // idle exit could not fire. (2026-08 incident: 115 carriers dead >80 s, zero
+        // recovery activity; the client only ended when the user killed it.)
+        for (auto& [cfd, cs] : carriers)
+          if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
+
+        // Adaptive default is 12×RTT, clamped [60 s, 300 s]. To survive a longer outage
+        // (e.g. a multi-minute VPN/wifi drop) so the logical SSH stream can recover, set
+        // --reconnect-timeout (both ends must outlast the outage or they give up before
+        // the link returns).
+        uint64_t global_idle_ns = (args.config.reconnect_timeout_sec > 0)
+            ? (uint64_t)args.config.reconnect_timeout_sec * 1000000000ULL
+            : scaled_ns(12, 60000000000ULL, 300000000000ULL);
+        if (now_p - last_global_recv_ns > global_idle_ns) {
+          if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu last_recv_ms=%llu threshold_ms=%llu]\n",
+                           (unsigned long long)(now_p/1000000ULL),
+                           (unsigned long long)(last_global_recv_ns/1000000ULL),
+                           (unsigned long long)(global_idle_ns/1000000ULL));
+          running = false;
+        }
+
         size_t dead_reap_added = 0;
         size_t backlog_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) backlog_bytes += ui.data.size();
@@ -1680,10 +1703,14 @@ int run_client(const Args& args) {
           }
         }
 
-        // In SSH mode, false-positive dead-idle classification can trigger
-        // self-inflicted carrier churn. Only run dead-idle reap logic when
-        // backlog pressure is genuinely high.
-        if (args.unix_socket_connection.empty() && !heavy_backlog) {
+        // In SSH mode, false-positive dead-idle classification can trigger self-inflicted
+        // carrier churn in light traffic: stay inert while ANY sign of life remains. But a
+        // fleet-wide receive silence beyond the dead-idle clearance window is hard evidence
+        // of a dead link — disengage there in EVERY mode: dead-but-open sockets (a blackhole
+        // that never produces a socket error) must not freeze the fleet forever.
+        const uint64_t dead_idle_escalation_ns = scaled_ns(4, 8000000000ULL, 30000000000ULL);
+        if ((args.unix_socket_connection.empty() || args.force_ssh_carrier_mode) && !heavy_backlog
+            && (now_p - last_global_recv_ns) < dead_idle_escalation_ns) {
           // Skip this cycle; keep carriers and rely on concrete read errors / peer signals.
           continue;
         }
@@ -1732,23 +1759,6 @@ int run_client(const Args& args) {
           remove_carrier(to_close, "slow_reduction");
         }
 
-        for (auto& [cfd, cs] : carriers)
-          if (cs.last_recv_ns > last_global_recv_ns) last_global_recv_ns = cs.last_recv_ns;
-
-        // Adaptive default is 12×RTT, clamped [60 s, 300 s]. To survive a longer outage
-        // (e.g. a multi-minute VPN/wifi drop) so the logical SSH stream can recover, set
-        // --reconnect-timeout (both ends must outlast the outage or they give up before
-        // the link returns).
-        uint64_t global_idle_ns = (args.config.reconnect_timeout_sec > 0)
-            ? (uint64_t)args.config.reconnect_timeout_sec * 1000000000ULL
-            : scaled_ns(12, 60000000000ULL, 300000000000ULL);
-        if (now_p - last_global_recv_ns > global_idle_ns) {
-          if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu last_recv_ms=%llu threshold_ms=%llu]\n",
-                           (unsigned long long)(now_p/1000000ULL),
-                           (unsigned long long)(last_global_recv_ns/1000000ULL),
-                           (unsigned long long)(global_idle_ns/1000000ULL));
-          running = false;
-        }
       }
     }
 

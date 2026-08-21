@@ -32,6 +32,7 @@ const struct option LONG_OPTS[] = {
   { "reconnect-timeout",    required_argument, nullptr, 'e' },
   { "server",               no_argument,       nullptr, 'S' },
   { "unix-socket-connection", required_argument, nullptr, 'u' },
+  { "force-ssh-carrier-mode", no_argument,      nullptr, 'k' },
   { "debug",                no_argument,       nullptr, 'D' },
   { "help",                 no_argument,       nullptr, 'h' },
   { nullptr, 0, nullptr, 0 },
@@ -110,7 +111,7 @@ void usage(const char* program_name) {
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:L:F:e:Su:Dh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:L:F:e:Su:Dkh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -167,6 +168,9 @@ bool parse_args(int argc, char* argv[], Args& out) {
           break;
         case 'u':
           out.unix_socket_connection = optarg;
+          break;
+        case 'k':
+          out.force_ssh_carrier_mode = true;
           break;
         case 'D':
           out.debug = true;

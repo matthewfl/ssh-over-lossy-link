@@ -652,6 +652,42 @@ run_test "adapt-download-only-s2c" \
     --latency-random \
     --assert-server-adapts
 
+# Blackhole dead-carrier recovery: production-mode (SSH) carrier policy, blackholed
+# (silent but NOT closed) sockets from t=8s onward. Pre-fix the SSH-light-backlog skip
+# kept dead-idle reaping, the fleet receive clock, AND the global-idle exit gated out:
+# a dead fleet froze forever with zero recovery (115 dead carriers >80 s, 2026-08).
+# The fix disengages the skip once the whole fleet is silent past the dead-idle
+# escalation, so dead-carrier removals MUST occur. Pre-fix: 0 -> FAIL; fixed: ~64 -> PASS.
+run_test "blackhole-dead-carrier-recovery" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 55 \
+    --continuous-tcp-to-client-only \
+    --latency-ms 250 \
+    --connections 8 \
+    --packet-size 100 --payload-size 100 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 8 \
+    --scenario-blackout-duration 90 \
+    --server-debug \
+    --assert-min-dead-idle-removes 3 \
+    --extra-client-args --force-ssh-carrier-mode --max-connections 12
+
+# Same scenario under --no-auto (the likely production invocation): with link_stalled
+# disabled, dead-carrier escalated reaping is the ONLY recovery; same gates.
+run_test "blackhole-dead-carrier-recovery-noauto" \
+    --init-latency-override 0.05 \
+    --continuous --continuous-duration 55 \
+    --continuous-tcp-to-client-only \
+    --latency-ms 250 \
+    --connections 8 \
+    --packet-size 100 --payload-size 100 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 8 \
+    --scenario-blackout-duration 90 \
+    --server-debug \
+    --assert-min-dead-idle-removes 3 \
+    --extra-client-args --force-ssh-carrier-mode --max-connections 12 --no-auto
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"

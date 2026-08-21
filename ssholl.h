@@ -173,6 +173,10 @@ struct Args {
   std::string remote_hostname = "localhost";
   uint16_t remote_port = 22;
   std::string unix_socket_connection;  // if non-empty, connect directly to this socket (no SSH -L)
+  // TEST AID: apply the SSH-spawn-mode dead-carrier POLICY (the conservative dead_idle skip)
+  // even though carriers are local sockets. Lets the no-SSH test harness exercise the same
+  // code branches that production (real SSH carriers) runs.
+  bool force_ssh_carrier_mode = false;
   std::string file_lock;              // if non-empty, acquire exclusive lock on this file before client start
 };
 
