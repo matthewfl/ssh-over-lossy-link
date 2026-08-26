@@ -688,6 +688,22 @@ run_test "blackhole-dead-carrier-recovery-noauto" \
     --assert-min-dead-idle-removes 3 \
     --extra-client-args --force-ssh-carrier-mode --max-connections 12 --no-auto
 
+# Debug-log size cap: production grew a ~29 GB server debug log in ~2 h (2026-08-21).
+# Every debug log now has a hard byte cap (--debug-log-cap-kb, default 256 MB, propagated
+# to the spawned server) that stops logging with one [debug-log-capped] marker, and the
+# known every-loop-pass spam sites are rate-gated at 1/s. This scenario generates enough
+# debug output to trip a tiny 16 KB cap and asserts the marker + bounded size.
+run_test "debug-log-cap" \
+    --init-latency-override 0.05 \
+    --latency-ms 250 \
+    --link-bandwidth-kbps 256 \
+    --connections 8 \
+    --packet-size 800 --payload-size 800 \
+    --scenario-bw-flood --bw-flood-rate-x 2.0 \
+    --continuous-duration 45 \
+    --server-debug \
+    --assert-server-log-capped 16
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"

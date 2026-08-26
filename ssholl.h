@@ -159,6 +159,9 @@ struct Config {
                                       // group's first shard, but that saturated on base jitter; the
                                       // stall threshold is now RTT-relative (carrier_adapt::
                                       // stall_threshold_ns). Kept so the flag still parses.
+  unsigned debug_log_cap_kb = 262144; // max size of each --debug log (KB); 0 = unlimited.
+                                      // Anti-29GB-log backstop: at cap logging stops with a
+                                      // single [debug-log-capped] marker. Propagated to the server.
 };
 
 // -----------------------------------------------------------------------------

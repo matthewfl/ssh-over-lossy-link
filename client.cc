@@ -120,6 +120,12 @@ std::string launch_server(const Args& args) {
     argv_vec.push_back("--server");
     if (args.debug)
       argv_vec.push_back("--debug");
+    // Propagate the debug-log size cap so the (daemonized, remote) server applies the
+    // same anti-runaway bound as the client — the 29 GB incident log was server-side.
+    char cap_buf[32];
+    snprintf(cap_buf, sizeof cap_buf, "%u", args.config.debug_log_cap_kb);
+    argv_vec.push_back("--debug-log-cap-kb");
+    argv_vec.push_back(cap_buf);
     // Propagate the cold-start RTT hint so the server scales its timeouts correctly
     // before it has measured RTT (otherwise it falls back to a 5 s default, which is
     // too aggressive on high-latency links — see README "RTT-scaled timeouts").
@@ -485,11 +491,12 @@ int run_client(const Args& args) {
   uint64_t last_global_recv_ns      = now_ns();  // last time any data arrived from any carrier
 
   // Open per-process debug log if --debug was passed.
-  FILE* dbg = nullptr;
+  DebugLog dbg;
   if (args.debug) {
     char dbg_path[128];
     snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-client-%d.log", (int)getpid());
-    dbg = fopen(dbg_path, "w");
+    dbg.f = fopen(dbg_path, "w");
+    dbg.cap_bytes = 1024ull * (uint64_t)args.config.debug_log_cap_kb;
   }
 
   struct epoll_event ev{};
@@ -518,7 +525,7 @@ int run_client(const Args& args) {
       CarrierState& cs = carriers[fd];
       cs.connecting = true;
       if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
-      if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=initial]\n",
+      if (dbg.f) dbglogf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=initial]\n",
                        (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
       if (args.unix_socket_connection.empty())
         fd_to_ssh_index[fd] = i;  // correct slot→fd mapping
@@ -609,7 +616,7 @@ int run_client(const Args& args) {
           return;
         }
         // Unrecoverable write error (e.g. EPIPE): discard buffered output.
-        if (dbg) fprintf(dbg, "[stdout-write-err t=%llu errno=%d discarded=%zu]\n",
+        if (dbg.f) dbglogf(dbg, "[stdout-write-err t=%llu errno=%d discarded=%zu]\n",
                          (unsigned long long)(now_ns()/1000000ULL), errno, stdout_buf.size());
         stdout_buf.clear();
         if (stdout_in_epoll) {
@@ -656,10 +663,10 @@ int run_client(const Args& args) {
   recv_cb.on_carrier_status = [&](const std::vector<uint64_t>& dead_ids) {
     uint64_t now = now_ns();
     for (uint64_t cid : dead_ids) server_reported_dead_ns[cid] = now;
-    if (dbg) {
+    if (dbg.f) {
       std::string s;
       for (uint64_t cid : dead_ids) { s += std::to_string(cid); s += ' '; }
-      fprintf(dbg, "[carrier-status-recv t=%llu server_says_dead=[ %s]]\n",
+      dbglogf(dbg, "[carrier-status-recv t=%llu server_says_dead=[ %s]]\n",
               (unsigned long long)(now/1000000ULL), s.c_str());
     }
   };
@@ -693,7 +700,7 @@ int run_client(const Args& args) {
     if (effective_small_packet_redundancy < 2u) effective_small_packet_redundancy = 2u;
     effective_small_packet_redundancy = std::min(effective_small_packet_redundancy, std::max(2u, static_cast<unsigned>(carriers.size())));
     backpressure_write_threshold = 150 * effective_max_packet;
-    if (dbg) fprintf(dbg, "[server-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u]\n",
+    if (dbg.f) dbglogf(dbg, "[server-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u]\n",
                      (unsigned long long)(now_ns()/1000000ULL), effective_max_packet,
                      (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy);
   };
@@ -721,8 +728,8 @@ int run_client(const Args& args) {
     if (it == outstanding_pings.end()) return;
     uint64_t rtt_ns = now_ns() - it->second;
     outstanding_pings.erase(it);
-    if (dbg && rtt_ns > 5000000000ULL) {  // > 5 s
-      fprintf(dbg, "[ping-rtt-high t=%llu fd=%d id=%llu rtt_ms=%llu]\n",
+    if (dbg.f && rtt_ns > 5000000000ULL) {  // > 5 s
+      dbglogf(dbg, "[ping-rtt-high t=%llu fd=%d id=%llu rtt_ms=%llu]\n",
               (unsigned long long)(now_ns()/1000000ULL),
               fd,
               (unsigned long long)id,
@@ -760,8 +767,8 @@ int run_client(const Args& args) {
       while (!q2.empty() && q2.front().first <= acked_id) q2.pop_front();
     }
     if (rtt_ns != 0) {
-      if (dbg && rtt_ns > 5000000000ULL)
-        fprintf(dbg, "[ack-rtt-high t=%llu fd=%d acked_id=%llu rtt_ms=%llu]\n",
+      if (dbg.f && rtt_ns > 5000000000ULL)
+        dbglogf(dbg, "[ack-rtt-high t=%llu fd=%d acked_id=%llu rtt_ms=%llu]\n",
                 (unsigned long long)(now_ns()/1000000ULL), fd, (unsigned long long)acked_id,
                 (unsigned long long)(rtt_ns/1000000ULL));
       auto it_c = carriers.find(fd);
@@ -804,7 +811,7 @@ int run_client(const Args& args) {
   };
 
   auto do_carrier_cleanup = [&](int fd, const char* reason) {
-    if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
+    if (dbg.f) dbglogf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
                      (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1, reason);
     carrier_pending_acks.erase(fd);
     if (!args.unix_socket_connection.empty()) return;
@@ -822,7 +829,7 @@ int run_client(const Args& args) {
     }
     if (carriers.size() == 1 && !unacked_sends.empty()) {
       retransmit_needed = true;
-      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=last_carrier_dying]\n",
+      if (dbg.f) dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=last_carrier_dying]\n",
                        (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size());
     }
   };
@@ -839,8 +846,11 @@ int run_client(const Args& args) {
       last_add_carrier_ns = 0;
     if (carriers.empty() && !unacked_sends.empty()) {
       retransmit_needed = true;
-      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
-                       (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size());
+      { static uint64_t last_spam_ns = 0;
+        if (dbg.f && dbg_rate_allow(last_spam_ns, now_ns(), 1000000000ull))
+          dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
+                  (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size());
+      }
     }
   };
 
@@ -874,7 +884,7 @@ int run_client(const Args& args) {
     }
     if (carriers.empty() && !unacked_sends.empty()) {
       retransmit_needed = true;
-      if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
+      if (dbg.f) dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
                        (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(), fd);
     }
     // If survivors remain, force the retransmit check to run on the next iteration
@@ -882,7 +892,7 @@ int run_client(const Args& args) {
     // carrier were almost certainly lost; the sooner we retransmit the better.
     if (!carriers.empty() && !unacked_sends.empty()) {
       last_retransmit_check_ns = 0;
-      if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
+      if (dbg.f) dbglogf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
                        (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(), fd, carriers.size());
     }
     // Below floor: reset add throttle so floor maintenance can burst back to target immediately.
@@ -894,7 +904,7 @@ int run_client(const Args& args) {
     if (!carriers.count(fd)) return;
     if (std::find(pending_reap.begin(), pending_reap.end(), fd) != pending_reap.end()) return;
     pending_reap.push_back(fd);
-    if (dbg) fprintf(dbg, "[pending-reap t=%llu fd=%d reason=%s total=%zu]\n",
+    if (dbg.f) dbglogf(dbg, "[pending-reap t=%llu fd=%d reason=%s total=%zu]\n",
                      (unsigned long long)(now_ns()/1000000ULL), fd, reason, pending_reap.size());
   };
 
@@ -1017,8 +1027,8 @@ int run_client(const Args& args) {
       }
       next_send_id++;
       c2s_outstanding += k * block_size;  // the window gate re-checks against this
-      if (dbg && unacked_sends.size() > 500 && next_send_id % 100 == 0)
-        fprintf(dbg, "[pump-grow t=%llu unacked=%zu next_send_id=%llu k=%u block=%zu outstanding_kb=%zu cap_kb=%zu rate_kbps=%.0f]\n",
+      if (dbg.f && unacked_sends.size() > 500 && next_send_id % 100 == 0)
+        dbglogf(dbg, "[pump-grow t=%llu unacked=%zu next_send_id=%llu k=%u block=%zu outstanding_kb=%zu cap_kb=%zu rate_kbps=%.0f]\n",
                 (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(),
                 (unsigned long long)next_send_id, k, block_size, c2s_outstanding/1024,
                 rate_window_cap(c2s_window, get_window_base_rtt_ns())/1024, c2s_window.rate_bps/1024.0);
@@ -1096,7 +1106,7 @@ int run_client(const Args& args) {
         // Signal interrupted the wait; re-check shutdown flag at the top of the loop.
         continue;
       }
-      if (dbg) fprintf(dbg, "[epoll-wait-error t=%llu errno=%d]\n",
+      if (dbg.f) dbglogf(dbg, "[epoll-wait-error t=%llu errno=%d]\n",
                        (unsigned long long)(now_ns()/1000000ULL), errno);
       break;
     }
@@ -1144,7 +1154,7 @@ int run_client(const Args& args) {
       if (fd == STDOUT_FILENO) {
         if (e & (EPOLLERR | EPOLLHUP)) {
           // Write end of stdout pipe broken; discard remaining output.
-          if (dbg) fprintf(dbg, "[stdout-broken t=%llu discarded=%zu reason=epoll_err_hup]\n",
+          if (dbg.f) dbglogf(dbg, "[stdout-broken t=%llu discarded=%zu reason=epoll_err_hup]\n",
                            (unsigned long long)(now_ns()/1000000ULL), stdout_buf.size());
           stdout_buf.clear();
           epoll_ctl(epfd, EPOLL_CTL_DEL, STDOUT_FILENO, nullptr);
@@ -1196,7 +1206,7 @@ int run_client(const Args& args) {
             if (retransmit_needed && !unacked_sends.empty()) {
               retransmit_needed = false;
               const uint64_t retransmit_now = now_ns();
-              if (dbg) fprintf(dbg, "[retransmit-on-reconnect t=%llu fd=%d items=%zu]\n",
+              if (dbg.f) dbglogf(dbg, "[retransmit-on-reconnect t=%llu fd=%d items=%zu]\n",
                                (unsigned long long)(retransmit_now/1000000ULL), fd, unacked_sends.size());
               for (auto& [uid, ui] : unacked_sends) {
                 if (ui.is_small) {
@@ -1343,7 +1353,7 @@ int run_client(const Args& args) {
             ssh_idx_to_pid.erase(pit);
           }
           unlink(it->c_str());
-          if (dbg) fprintf(dbg, "[pending-connect-timeout t=%llu slot=%u waited_ms=%llu]\n",
+          if (dbg.f) dbglogf(dbg, "[pending-connect-timeout t=%llu slot=%u waited_ms=%llu]\n",
                            (unsigned long long)(now_pc/1000000ULL),
                            slot,
                            (unsigned long long)((now_pc - started)/1000000ULL));
@@ -1361,7 +1371,7 @@ int run_client(const Args& args) {
           CarrierState& cs = carriers[fd];
           cs.connecting = true;
           if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
-          if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=ssh_connect]\n",
+          if (dbg.f) dbglogf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=ssh_connect]\n",
                            (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
           // Record SSH index for later recycling.
           if (it->size() > prefix.size())
@@ -1491,7 +1501,7 @@ int run_client(const Args& args) {
 
         // Periodic per-carrier diagnostics (every ~2 s) to debug stuck recovery: shows why
         // carriers are/aren't flagged dead and why the floor/reap cycle does or doesn't run.
-        if (dbg) {
+        if (dbg.f) {
           static uint64_t last_carrier_diag_ns = 0;
           if (now_p - last_carrier_diag_ns >= 2000000000ULL) {
             last_carrier_diag_ns = now_p;
@@ -1504,7 +1514,7 @@ int run_client(const Args& args) {
             size_t diag_backlog = 0;
             for (const auto& [_, ui] : unacked_sends) diag_backlog += ui.data.size();
             uint64_t diag_rtt = get_effective_rtt_ns();
-            fprintf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u max=%u desired=%u "
+            dbglogf(dbg, "[carriers-diag t=%llu n=%zu connecting=%zu floor=%u max=%u desired=%u "
                          "rate_pps=%.0f s2c_q=%.3f rs=%.2f copies=%u rtt_ms=%llu stall_ms=%llu "
                          "unacked=%zu backlog_b=%zu pending_reap=%zu dead_idle=%zu reap=%zu rtt_outlier=%d]\n",
                     (unsigned long long)(now_p/1000000ULL), carriers.size(), connecting_n,
@@ -1521,7 +1531,7 @@ int run_client(const Args& args) {
                   != quality.dead_idle_fds.end();
               long long recv_ago = cs.last_recv_ns ? (long long)((now_p - cs.last_recv_ns)/1000000ULL) : -1;
               long long send_ago = cs.last_send_ns ? (long long)((now_p - cs.last_send_ns)/1000000ULL) : -1;
-              fprintf(dbg, "  fd=%d age_ms=%llu recv_ago_ms=%lld send_ago_ms=%lld wbuf=%zu connecting=%d dead=%d pending=%d\n",
+              dbglogf(dbg, "  fd=%d age_ms=%llu recv_ago_ms=%lld send_ago_ms=%lld wbuf=%zu connecting=%d dead=%d pending=%d\n",
                       cfd, (unsigned long long)((now_p - cs.connect_ns)/1000000ULL),
                       recv_ago, send_ago, cs.write_buf.size(), (int)cs.connecting, (int)is_dead, (int)in_reap);
             }
@@ -1555,8 +1565,8 @@ int run_client(const Args& args) {
                                   (now_p - last_deliver_advance_ns > stall_ns);
           bool mass_death = delivery_stalled &&
                             rx_dead.size() >= std::max<size_t>(2, n_live / 4);
-          if (mass_death && dbg)
-            fprintf(dbg, "[mass-death t=%llu rx_dead=%zu live=%zu stalled_ms=%llu]\n",
+          if (mass_death && dbg.f)
+            dbglogf(dbg, "[mass-death t=%llu rx_dead=%zu live=%zu stalled_ms=%llu]\n",
                     (unsigned long long)(now_p/1000000ULL), rx_dead.size(), n_live,
                     (unsigned long long)((now_p - last_deliver_advance_ns)/1000000ULL));
           std::vector<std::pair<int,const char*>> to_reap;
@@ -1668,7 +1678,7 @@ int run_client(const Args& args) {
             ? (uint64_t)args.config.reconnect_timeout_sec * 1000000000ULL
             : scaled_ns(12, 60000000000ULL, 300000000000ULL);
         if (now_p - last_global_recv_ns > global_idle_ns) {
-          if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu last_recv_ms=%llu threshold_ms=%llu]\n",
+          if (dbg.f) dbglogf(dbg, "[global-idle-timeout t=%llu last_recv_ms=%llu threshold_ms=%llu]\n",
                            (unsigned long long)(now_p/1000000ULL),
                            (unsigned long long)(last_global_recv_ns/1000000ULL),
                            (unsigned long long)(global_idle_ns/1000000ULL));
@@ -1922,7 +1932,7 @@ int run_client(const Args& args) {
                     link_stalled ? "link_stall" :
                     any_rs_pending_pressure ? "rs_pending_pressure" :
                     need_replacement ? "need_replacement" : "need_more";
-                if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
+                if (dbg.f) dbglogf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
                                  (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size(), add_reason);
               } else
                 close(fd);
@@ -1974,7 +1984,7 @@ int run_client(const Args& args) {
                     link_stalled ? "link_stall" :
                     any_rs_pending_pressure ? "rs_pending_pressure" :
                     need_replacement ? "need_replacement" : "need_more";
-                if (dbg) fprintf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",
+                if (dbg.f) dbglogf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",
                                  (unsigned long long)(now_ns()/1000000ULL), path.c_str(), add_reason);
               }
             }
@@ -2067,7 +2077,7 @@ int run_client(const Args& args) {
               }
               if (!candidates.empty()) {
                 unsigned copies = std::min(small_rt_copies, static_cast<unsigned>(candidates.size()));
-                if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
+                if (dbg.f) dbglogf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
                                  (unsigned long long)(now_p/1000000ULL), (unsigned long long)uid,
                                  (unsigned long long)((now_p - ui.send_ns)/1000000ULL), copies);
                 for (unsigned c = 0; c < copies; ++c) {
@@ -2111,7 +2121,7 @@ int run_client(const Args& args) {
                 sent_set.insert(itc->second.carrier_id);
                 touched.insert(cfd);
               }
-              if (dbg && !touched.empty()) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu unique_cfds=%zu]\n",
+              if (dbg.f && !touched.empty()) dbglogf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu unique_cfds=%zu]\n",
                                (unsigned long long)(now_p/1000000ULL), (unsigned long long)uid,
                                (unsigned long long)((now_p - ui.send_ns)/1000000ULL),
                                ui.n, ui.k, rt_carriers.size(), touched.size());
@@ -2129,23 +2139,23 @@ int run_client(const Args& args) {
       }
 
       // ── Debug: periodic state dump ────────────────────────────────────────
-      if (dbg) {
+      if (dbg.f) {
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) unacked_bytes += ui.data.size();
         if (rs_pending.empty()) {
-          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
+          dbglogf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(),
                   (unsigned long long)next_deliver_id, (unsigned long long)next_send_id, stdout_buf.size(),
                   (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count);
         } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
+          dbglogf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
                   (unsigned long long)next_deliver_id, (unsigned long long)next_send_id, stdout_buf.size(),
                   (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count,
                   (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
         }
-        fflush(dbg);
+        dbg_flush(dbg);
       }
 
       // RS stale-group drain: evict incomplete groups from memory after 4×RTT (min 10 s).
@@ -2161,7 +2171,7 @@ int run_client(const Args& args) {
         // the group will decode normally once k shards accumulate.
         for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
           if (it->second.first_recv_ns > 0 && now_p - it->second.first_recv_ns > rs_stale_ns) {
-            if (dbg) fprintf(dbg, "[rs-stale-evict t=%llu id=%llu age_ms=%llu shards_had=%zu k=%u n=%u]\n",
+            if (dbg.f) dbglogf(dbg, "[rs-stale-evict t=%llu id=%llu age_ms=%llu shards_had=%zu k=%u n=%u]\n",
                              (unsigned long long)(now_p/1000000ULL), (unsigned long long)it->first,
                              (unsigned long long)((now_p - it->second.first_recv_ns)/1000000ULL),
                              it->second.shards.size(), it->second.k, it->second.n);
@@ -2187,7 +2197,7 @@ int run_client(const Args& args) {
             if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
             if (next_deliver_id_stuck_since_ns == 0) {
               next_deliver_id_stuck_since_ns = now_p;
-              if (dbg) fprintf(dbg, "[gap-detected t=%llu next_deliver_id=%llu reassembly=%zu rs_pending=%zu]\n",
+              if (dbg.f) dbglogf(dbg, "[gap-detected t=%llu next_deliver_id=%llu reassembly=%zu rs_pending=%zu]\n",
                                (unsigned long long)(now_p/1000000ULL), (unsigned long long)next_deliver_id,
                                reassembly.size(), rs_pending.size());
             }
@@ -2222,8 +2232,8 @@ int run_client(const Args& args) {
         bool can_add = (add_limit > 1) || pending_carrier_paths.empty();
         if (!can_add) { /* skip */ }
         else if (!args.unix_socket_connection.empty()) {
-          if (dbg && carriers.empty())
-            fprintf(dbg, "[carrier-add-attempt t=%llu reason=mass_death connecting_to_socket trying=%u]\n",
+          if (dbg.f && carriers.empty())
+            dbglogf(dbg, "[carrier-add-attempt t=%llu reason=mass_death connecting_to_socket trying=%u]\n",
                     (unsigned long long)(now_ns()/1000000ULL), add_limit);
           for (unsigned j = 0; j < add_limit && carriers.size() < max_connections; ++j) {
             int fd = connect_unix(socket_path);
@@ -2235,15 +2245,15 @@ int run_client(const Args& args) {
                 cs.connecting = true;
                 if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
                 const char* floor_reason = carriers.empty() ? "mass_death" : "below_floor";
-                if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
+                if (dbg.f) dbglogf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
                                  (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size(), floor_reason);
               } else
                 close(fd);
             }
           }
         } else {
-          if (dbg && carriers.empty())
-            fprintf(dbg, "[carrier-add-attempt t=%llu reason=mass_death starting_ssh count=%u waiting_for_connect]\n",
+          if (dbg.f && carriers.empty())
+            dbglogf(dbg, "[carrier-add-attempt t=%llu reason=mass_death starting_ssh count=%u waiting_for_connect]\n",
                     (unsigned long long)(now_ns()/1000000ULL), add_limit);
           for (unsigned j = 0; j < add_limit; ++j) {
             unsigned free_idx = find_free_ssh_index();
@@ -2286,7 +2296,7 @@ int run_client(const Args& args) {
               pending_connect_started_ns[free_idx] = now_ns();
               if (free_idx >= next_carrier_index) next_carrier_index = free_idx + 1;
               const char* floor_reason = carriers.empty() ? "mass_death" : "below_floor";
-              if (dbg) fprintf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",
+              if (dbg.f) dbglogf(dbg, "[carrier-add-initiated t=%llu path=%s reason=%s]\n",
                                (unsigned long long)(now_ns()/1000000ULL), path.c_str(), floor_reason);
             }
           }
@@ -2295,15 +2305,15 @@ int run_client(const Args& args) {
     }
 
     // When recovering from mass death (carriers.empty()), log periodically to debug file.
-    if (dbg && carriers.empty()) {
+    if (dbg.f && carriers.empty()) {
       const uint64_t now_r = now_ns();
       if (now_r - last_recovery_log_ns >= 5000000000ULL) {  // every 5 s
         last_recovery_log_ns = now_r;
         if (!pending_carrier_paths.empty())
-          fprintf(dbg, "[carrier-recovery-wait t=%llu pending=%zu waiting_for_ssh_connect]\n",
+          dbglogf(dbg, "[carrier-recovery-wait t=%llu pending=%zu waiting_for_ssh_connect]\n",
                   (unsigned long long)(now_r/1000000ULL), pending_carrier_paths.size());
         else if (!args.unix_socket_connection.empty())
-          fprintf(dbg, "[carrier-recovery-wait t=%llu retrying_unix_connect]\n",
+          dbglogf(dbg, "[carrier-recovery-wait t=%llu retrying_unix_connect]\n",
                   (unsigned long long)(now_r/1000000ULL));
       }
     }
@@ -2322,7 +2332,7 @@ int run_client(const Args& args) {
     // ── Exit conditions ──────────────────────────────────────────────────────
     // Normal completion: stdin done and nothing left in flight.
     if (stdin_eof && stdin_buf.empty() && reassembly.empty() && stdout_buf.empty() && rs_pending.empty()) {
-      if (dbg) fprintf(dbg, "[client-exit-normal t=%llu stdin_buf=%zu reassembly=%zu rs_pending=%zu]\n",
+      if (dbg.f) dbglogf(dbg, "[client-exit-normal t=%llu stdin_buf=%zu reassembly=%zu rs_pending=%zu]\n",
                        (unsigned long long)(now_ns()/1000000ULL), stdin_buf.size(), reassembly.size(), rs_pending.size());
       running = false;
     }
@@ -2338,7 +2348,7 @@ int run_client(const Args& args) {
         can_reconnect = (find_free_ssh_index() < max_connections);
       }
       if (!can_reconnect) {
-        if (dbg) fprintf(dbg, "[client-exit-no-reconnect t=%llu carriers=%zu]\n",
+        if (dbg.f) dbglogf(dbg, "[client-exit-no-reconnect t=%llu carriers=%zu]\n",
                          (unsigned long long)(now_ns()/1000000ULL), carriers.size());
         running = false;
       }
@@ -2362,7 +2372,7 @@ int run_client(const Args& args) {
       waitpid(p, nullptr, 0);
     remove_client_dir(client_dir);
   }
-  if (dbg) fclose(dbg);
+  if (dbg.f) fclose(dbg.f);
   return 0;
 }
 

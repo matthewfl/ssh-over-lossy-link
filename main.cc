@@ -33,6 +33,7 @@ const struct option LONG_OPTS[] = {
   { "server",               no_argument,       nullptr, 'S' },
   { "unix-socket-connection", required_argument, nullptr, 'u' },
   { "force-ssh-carrier-mode", no_argument,      nullptr, 'k' },
+  { "debug-log-cap-kb",     required_argument, nullptr, 'X' },
   { "debug",                no_argument,       nullptr, 'D' },
   { "help",                 no_argument,       nullptr, 'h' },
   { nullptr, 0, nullptr, 0 },
@@ -101,6 +102,8 @@ void usage(const char* program_name) {
     << c.max_added_latency_ms << "\n"
     << "  --reconnect-timeout N         Global idle timeout (s); 0 = adaptive (12×RTT, min 60 s, max 300 s); else 1–7200. Default: "
     << c.reconnect_timeout_sec << "\n"
+    << "  --debug-log-cap-kb N          Max size of each --debug log in KB; 0 = unlimited. Default: "
+    << c.debug_log_cap_kb << "\n"
     << "  --file-lock PATH              Acquire exclusive lock on PATH before client start (15s timeout)\n"
     << "  --server                      Run server mode (connect to hostname:port)\n"
     << "  --unix-socket-connection PATH Connect directly to Unix socket PATH instead of SSH -L\n"
@@ -111,7 +114,7 @@ void usage(const char* program_name) {
 bool parse_args(int argc, char* argv[], Args& out) {
   out = Args{};
   int opt;
-  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:L:F:e:Su:Dkh", LONG_OPTS, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aAp:c:m:s:r:R:d:t:T:M:L:F:e:Su:DXkh", LONG_OPTS, nullptr)) != -1) {
     try {
       switch (opt) {
         case 'a':
@@ -161,6 +164,15 @@ bool parse_args(int argc, char* argv[], Args& out) {
           if (v > 7200u)
             throw std::runtime_error("--reconnect-timeout must be 0 (adaptive) or 1–7200 seconds");
           out.config.reconnect_timeout_sec = v;
+          break;
+        }
+        case 'X': {
+          unsigned v = parse_unsigned(optarg, "--debug-log-cap-kb");
+          if (v > (1u << 26)) {
+            fprintf(stderr, "ssh-oll: --debug-log-cap-kb out of range (0..67108864)\n");
+            exit(2);
+          }
+          out.config.debug_log_cap_kb = v;
           break;
         }
         case 'S':

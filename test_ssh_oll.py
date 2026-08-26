@@ -1224,6 +1224,231 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     return 1 if (err_snap or failures) else 0
 
 
+
+# ---------------------------------------------------------------------------
+# Small-packet storm test (interactive redraw flood)
+# ---------------------------------------------------------------------------
+
+def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
+    """Small-packet storm scenario (the '60Hz interactive redraw' case).
+
+    Real interactive full-screen programs (editors/TUIs at a high refresh)
+    can emit far more small updates than the link can carry after small-packet
+    duplication: at 30 Hz x 300 B frames x ~9-10 copies that is ~80-90 KB/s
+    of wire traffic into a ~256 KB/s-class link just for redraws, while the
+    real app stream is ~9 KB/s, and SMALL sends bypass the bulk flow-control
+    window entirely.
+
+    This test drives a sustained small-frame producer in BOTH directions
+    (framing: an 8-byte big-endian timestamp_ms header per frame, so receive
+    latency needs no correlated stream state), plus a slow RS-data drain each
+    way to keep the bulk path warm, and checks:
+      • frame delivery latency stays bounded (the feedback loop
+        queueing -> gap spread -> higher copies -> more wire traffic ->
+        more queueing must not run away),
+      • delivered (real app) goodput stays non-trivial,
+      • wire overhead ratio (wire bytes / app bytes, measured at the
+        scheduler) stays below --assert-max-wire-overhead if given,
+      • copies/copies-simulation stability comes via --assert-max-small-copies.
+
+    A broken design would let the duplication feedback spiral; a working one
+    holds frames at the stall-threshold-ish latencies (hundreds of ms-plus
+    RTT) at bounded overhead.
+    """
+    duration = getattr(args, "continuous_duration", None) or 60.0
+    frame_size = max(24, int(getattr(args, "small_storm_size", 300)))
+    frame_hz = max(1.0, float(getattr(args, "small_storm_hz", 30.0)))
+    progress_slow_every = 25  # one slow RS-data chunk per this many frames
+    slow_size = 2000
+
+    stop = threading.Event()
+    lats = {"s2c": [], "c2s": []}
+    timed_lat = []
+    delivered = {"s2c": 0, "c2s": 0}
+    offered = {"s2c": 0, "c2s": 0}
+    errors = []
+    stall_events = []
+    lock = threading.Lock()
+    t_start = time.perf_counter()
+    STALL_S = 3.0
+
+    def writer(name, send_all):
+        next_frame = time.perf_counter()
+        seq = 0
+        while not stop.is_set():
+            seq += 1
+            t0_ms = int(time.perf_counter() * 1000)
+            body = bytes([int(t0_ms + seq) & 0xFF] * (frame_size - 8))
+            frame = t0_ms.to_bytes(8, "big") + body
+            chunk = frame
+            if seq % progress_slow_every == 0:
+                chunk += os.urandom(slow_size)
+            try:
+                send_all(chunk)
+            except (BrokenPipeError, OSError):
+                break
+            with lock:
+                offered[name] += len(chunk)
+            next_frame += 1.0 / frame_hz
+            sleep_t = next_frame - time.perf_counter()
+            if sleep_t < -1.0:
+                next_frame = time.perf_counter()  # don't catch up after hiccups
+            elif sleep_t > 0:
+                time.sleep(sleep_t)
+
+    def c2s_send(data):
+        client_proc.stdin.write(data)
+        client_proc.stdin.flush()
+
+    def reader(name, stream):
+        buf = b""
+
+        def fill(n):
+            nonlocal buf
+            while len(buf) < n and not stop.is_set():
+                try:
+                    r, _, _ = select.select([stream], [], [], 0.5)
+                    if not r:
+                        continue
+                    chunk = stream.recv(65536) if hasattr(stream, "recv") else stream.read(65536)
+                except (OSError, ValueError):
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+
+        count = 0
+        while not stop.is_set():
+            fill(frame_size)
+            if len(buf) < frame_size:
+                break  # EOF mid-shutdown
+            frame, buf = buf[:frame_size], buf[frame_size:]
+            t0_ms = int.from_bytes(frame[:8], "big")
+            lat = int(time.perf_counter() * 1000) - t0_ms
+            # Frame body byte pattern: seq-1 was folded into the body byte; the
+            # writer wrote bytes [ (t0_ms+seq)&0xFF ].  Sanity-check cheaply:
+            # just verify body is a single repeated byte (well-formed frame).
+            if len(set(frame[8:])) != 1:
+                with lock:
+                    errors.append((name, frame_size, "content mismatch"))
+            count += 1
+            with lock:
+                lats[name].append(lat)
+                timed_lat.append((time.perf_counter(), lat))
+                delivered[name] += frame_size
+            if lat > STALL_S * 1000.0:
+                with lock:
+                    stall_events.append((f"{name} frame", lat / 1000.0))
+            if count % progress_slow_every == 0:
+                fill(slow_size)
+                if len(buf) < slow_size:
+                    break
+                with lock:
+                    delivered[name] += slow_size
+                buf = buf[slow_size:]
+
+    tcp_conn.settimeout(1.0)
+    threads = [
+        threading.Thread(target=writer, args=("s2c", tcp_conn.sendall), daemon=True),
+        threading.Thread(target=reader, args=("s2c", client_proc.stdout.raw), daemon=True),
+        threading.Thread(target=writer, args=("c2s", c2s_send), daemon=True),
+        threading.Thread(target=reader, args=("c2s", tcp_conn), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    buckets = getattr(args, "_buckets", None)
+    passed_prev = {"s2c": 0, "c2s": 0}
+    t_prev = t_start
+    try:
+        while time.perf_counter() - t_start < duration:
+            time.sleep(min(10.0, max(0.1, duration - (time.perf_counter() - t_start))))
+            now = time.perf_counter()
+            if now - t_prev >= 9.9:
+                with lock:
+                    done_s, done_c = len(lats["s2c"]), len(lats["c2s"])
+                line = f"[small-storm t={now-t_start:.0f}s] frames s2c={done_s} c2s={done_c}"
+                if buckets:
+                    dt = now - t_prev
+                    for d in ("s2c", "c2s"):
+                        b = buckets[d]
+                        line += (f" {d}_wire={((b.bytes_passed - passed_prev[d]) / max(dt, 1e-9)) / 1024:.0f}KB/s"
+                                 f"(q={b.queue_bytes / 1024:.0f}KB)")
+                        passed_prev[d] = b.bytes_passed
+                t_prev = now
+                print(line, flush=True)
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    for t in threads:
+        t.join(timeout=5.0)
+    try:
+        client_proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+    with lock:
+        lat_snap = {k: list(v) for k, v in lats.items()}
+        timed_snap = list(timed_lat)
+        delivered_snap = dict(delivered)
+        offered_snap = dict(offered)
+        err_snap = list(errors)
+        stall_snap = list(stall_events)
+
+    def _stats(name, L):
+        if not L:
+            print(f"  {name}: no samples")
+            return
+        s = sorted(L)
+        p50 = s[len(s) // 2]
+        p95 = s[min(len(s) - 1, int(len(s) * 0.95))]
+        print(f"  {name}: n={len(L)} min={min(L):.0f} avg={sum(L) / len(L):.0f} "
+              f"p50={p50:.0f} p95={p95:.0f} max={max(L):.0f} ms")
+
+    print("\nSmall-storm scenario summary:")
+    for d in ("s2c", "c2s"):
+        _stats(f"{d} frame latency", lat_snap[d])
+    dur = max(1e-9, time.perf_counter() - t_start)
+    for d in ("s2c", "c2s"):
+        print(f"  {d}: offered ~{offered_snap[d] / 1024 / dur:.1f} KB/s, "
+              f"delivered ~{delivered_snap[d] / 1024 / dur:.1f} KB/s app data")
+    if buckets:
+        for d in ("s2c", "c2s"):
+            wire = buckets[d].bytes_passed
+            app = max(1, delivered_snap[d])
+            print(f"  {d} wire overhead: {wire / app:.2f}x (wire={wire / 1024:.0f}KB "
+                  f"app={app / 1024:.0f}KB)")
+
+    if err_snap:
+        print(f"\nPayload validation: {len(err_snap)} mismatch(es)", file=sys.stderr)
+    else:
+        print("\nPayload validation: all frames received with well-formed content.")
+
+    interactive = lat_snap["s2c"] + lat_snap["c2s"]
+    failures = _evaluate_test_criteria(args, interactive, stall_snap,
+                                       timed_latencies_ms=timed_snap,
+                                       test_start_time=t_start)
+    if buckets:
+        for d in ("s2c", "c2s"):
+            wire = buckets[d].bytes_passed
+            app = max(1, delivered_snap[d])
+            max_ov = getattr(args, "assert_max_wire_overhead", None)
+            if max_ov is not None and wire / app > max_ov:
+                failures.append(f"{d} wire overhead {wire / app:.2f}x > {max_ov}x")
+        if getattr(args, "test_min_goodput_kbps", None) is not None:
+            for d in ("s2c", "c2s"):
+                got = delivered_snap[d] / 1024 / dur
+                if got < args.test_min_goodput_kbps:
+                    failures.append(f"{d} goodput {got:.1f} KB/s < {args.test_min_goodput_kbps} KB/s")
+    if failures:
+        print("\nTEST FAILED:", file=sys.stderr)
+        for f in failures:
+            print(f"  FAIL: {f}", file=sys.stderr)
+    else:
+        print("\nTEST PASSED: all criteria met.")
+    return 1 if (err_snap or failures) else 0
+
+
 # ---------------------------------------------------------------------------
 # Heavy Wi-Fi-stop-then-recover test
 # ---------------------------------------------------------------------------
@@ -1638,6 +1863,39 @@ def check_server_stall_ms(max_stall_ms, warmup_s=15.0):
     return 0 if ok else 1
 
 
+def check_server_log_capped(max_kb, server_proc=None):
+    """The debug logs are notorious for exploding when a spam path fires (production
+    grew a 29 GB server log in ~2 h, 2026-08-21). The product caps every debug log at
+    --debug-log-cap-kb (default 256 MB) and emits one '[debug-log-capped]' marker.
+    This assert verifies BOTH that the mechanism engaged (marker present) and that the
+    file did not grow past cap + one-page slack. Returns 0 (pass) or 1 (fail)."""
+    import glob
+    # The cap often trips on teardown writes (the tail of a run); reading while the
+    # server is still alive races those final bytes. Wait for it to exit first.
+    if server_proc is not None:
+        try:
+            server_proc.wait(timeout=30)
+        except Exception:
+            pass
+    logs = glob.glob("/tmp/ssh-oll-server-*.log")
+    if not logs:
+        print("check_server_log_capped: no server --debug log found", file=sys.stderr)
+        return 1
+    log = max(logs, key=lambda p: os.path.getmtime(p))
+    try:
+        with open(log, "rb") as f:
+            txt = f.read().decode("utf-8", errors="replace")
+    except OSError as e:
+        print(f"check_server_log_capped: cannot read {log}: {e}", file=sys.stderr)
+        return 1
+    size_kb = os.path.getsize(log) / 1024.0
+    has_marker = "[debug-log-capped" in txt
+    ok = has_marker and size_kb <= max_kb + 32  # one page-ish slack above the cap
+    print(f"server log cap: size={size_kb:.0f}KB marker={'yes' if has_marker else 'NO'} "
+          f"(cap {max_kb}KB, limit {max_kb + 32}KB) -> {'PASS' if ok else 'FAIL'}", flush=True)
+    return 0 if ok else 1
+
+
 def check_server_adapts(min_lines=25, warmup_s=20.0):
     """Fail if the server never adapted: count [adapt-model] lines after warmup. In a
     download-only session (little/no client->server RS traffic) the adapt path used to
@@ -1972,6 +2230,54 @@ def main():
              "to build a queue (sustained oversubscription, like a download peer faster than the link). Default 2.0.",
     )
     parser.add_argument(
+        "--scenario-small-storm",
+        action="store_true",
+        default=False,
+        help="Small-packet storm scenario: sustained small-frame producer (e.g. 30Hz TUI redraw) "
+             "at --small-storm-hz Hz of --small-storm-size bytes per frame in BOTH directions over "
+             "the latency/loss/bandwidth-shaped link. Times per-frame delivery latency and reports "
+             "wire overhead (wire bytes / app bytes). Guards the duplication-feedback spiral.",
+    )
+    parser.add_argument(
+        "--small-storm-hz",
+        type=float,
+        default=30.0,
+        metavar="HZ",
+        help="In --scenario-small-storm: frames per second per direction. Default 30.",
+    )
+    parser.add_argument(
+        "--small-storm-size",
+        type=int,
+        default=300,
+        metavar="BYTES",
+        help="In --scenario-small-storm: bytes per small frame. Default 300.",
+    )
+    parser.add_argument(
+        "--assert-max-wire-overhead",
+        type=float,
+        default=None,
+        metavar="X",
+        help="Fail if (wire bytes / app bytes) exceeds X on either bandwidth-scheduled direction. "
+             "Captures how much duplication/parity the model is spending.",
+    )
+    parser.add_argument(
+        "--test-min-goodput-kbps",
+        type=float,
+        default=None,
+        metavar="KB_S",
+        help="Fail if delivered application goodput (KB/s delivered to the destination reader) in "
+             "either direction falls below this, over the test duration.",
+    )
+    parser.add_argument(
+        "--assert-server-log-capped",
+        type=int,
+        default=None,
+        metavar="CAP_KB",
+        help="Pass --debug-log-cap-kb CAP_KB to the harness-spawned server, then fail unless its "
+             "newest --debug log CONTAINS a '[debug-log-capped]' marker AND its size is <= CAP_KB+32. "
+             "Proves the debug-log size cap (the anti-29GB-log mechanism) works end to end.",
+    )
+    parser.add_argument(
         "--assert-max-stall-ms",
         type=int,
         default=None,
@@ -2220,10 +2526,13 @@ def main():
     _server_debug = getattr(args, "server_debug", False) or \
         getattr(args, "assert_max_stall_ms", None) is not None or \
         getattr(args, "assert_server_adapts", False) or \
-        getattr(args, "assert_server_unacked_max", None) is not None
+        getattr(args, "assert_server_unacked_max", None) is not None or \
+        getattr(args, "assert_server_log_capped", None) is not None
     _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
     if _server_debug:
         _server_cmd += ["--debug"]
+    if getattr(args, "assert_server_log_capped", None) is not None:
+        _server_cmd += ["--debug-log-cap-kb", str(args.assert_server_log_capped)]
     server_proc = subprocess.Popen(
         _server_cmd,
         stdout=subprocess.PIPE,
@@ -2263,7 +2572,7 @@ def main():
     stop_proxy.set = _stop_proxy_set_and_wake  # type: ignore[method-assign]
 
     connection_callback = None
-    if args.continuous or getattr(args, "scenario_wifi_heavy", False) or getattr(args, "scenario_bw_flood", False):
+    if args.continuous or getattr(args, "scenario_wifi_heavy", False) or getattr(args, "scenario_bw_flood", False) or getattr(args, "scenario_small_storm", False):
         connection_count = [0]
         connection_lock = threading.Lock()
 
@@ -2412,10 +2721,20 @@ def main():
             rc = (rc or 0) | check_max_small_copies(client_proc.pid, args.assert_max_small_copies)
         if getattr(args, "assert_max_stall_ms", None) is not None:
             rc = (rc or 0) | check_server_stall_ms(args.assert_max_stall_ms)
+        if getattr(args, "assert_server_log_capped", None) is not None:
+            rc = (rc or 0) | check_server_log_capped(args.assert_server_log_capped, server_proc)
         return rc
 
     if getattr(args, "scenario_bw_flood", False):
         return _finalize(_run_bw_flood(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+        ))
+    if getattr(args, "scenario_small_storm", False):
+        return _finalize(_run_small_storm(
             client_proc,
             tcp_conn,
             stop_proxy,

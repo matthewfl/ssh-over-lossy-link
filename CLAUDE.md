@@ -51,6 +51,22 @@ make clean
   scenario; do not hand-build synthetic one-off "/tmp/*audit*.py" measurement harnesses
   that bypass the suite runner — they drift from the suite's gate and led me past a
   whole day's worth of suspect-but-fine measurements during the audit.
+- 'Restore-shaped' operations on a dirty tree (git checkout/restore of a tracked file,
+  stash pop-and-drop, `sed -i` reversal) can silently WIPE uncommitted work — one bad
+  `git checkout -- client.cc` threw away the incident fix source twice in one session
+  (2026-08-25). Rules: before such an operation, snapshot all uncommitted changes
+  completely (both `git diff > /tmp/<name>.patch` AND `cp` the dirty files to
+  /tmp/<name>/...), independently confirm the snapshot's size/content; afterwards,
+  verify the tree against the snapshot (diff stat/grep the key added lines) BEFORE
+  builds, runs, or commits consume it. For A/B pre/post-fix comparisons, NEVER mutate
+  the working tree to build the 'old' variant: check out a scratch copy
+  (`git worktree add /tmp/<wt> <commit>` or a temp `git clone . /tmp/x`), build the
+  pre-fix binary THERE, and leave the working tree alone.
+- Log-cap gotcha that cost a scenario cycle: if you change a log marker line, its
+  ASSERT in test_ssh_oll.py must be updated in the same edit — and once a checker is
+  added, re-verify by grepping BOTH the format string in the C++ code and the needle
+  string in the checker (a `[debug-log-capped bytes=...` marker does not contain the
+  exact substring `[debug-log-capped]`).
 
 - **Linux**: native `epoll`. **macOS**: needs `epoll-shim` (`brew install epoll-shim`);
   the Makefile auto-detects via `uname` and adds the include/lib flags.

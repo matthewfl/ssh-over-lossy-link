@@ -89,6 +89,11 @@ ssh-oll   [command line options]   lossy-ssh-host   [hostname on remote (default
 --reconnect-timeout [N]       Global idle timeout in seconds before giving up; 0 = adaptive (12×RTT, min 60 s, max 300 s); else 1–7200. Default 0
 --file-lock PATH              Acquire an exclusive lock on PATH (flock, 15 s timeout) before client start, to serialize concurrent client launches.
 --debug                       Write verbose debug logs to /tmp/ssh-oll-{client,server}-<pid>.log.
+--debug-log-cap-kb [N]        Max size of each --debug log in KB (default 262144 = 256 MB; 0 = unlimited).
+                              Once the cap is reached, logging stops with a single `[debug-log-capped]`
+                              marker line (the tunnel itself is unaffected). Propagated to the spawned
+                              server so the daemonized remote side is bounded too.
+                              Every-loop-pass spam sites are rate-limited regardless of the cap.
 --server                      Start the server instance of ssh-oll.  Default off (client mode).
 --unix-socket-connection PATH  Connect directly to Unix socket PATH instead of using SSH -L (for testing).
 ```
