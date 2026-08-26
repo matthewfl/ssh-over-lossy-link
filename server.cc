@@ -148,12 +148,11 @@ int run_server(const Args& args) {
   close(STDERR_FILENO);
 
   // Open per-process debug log if --debug was passed.
-  DebugLog dbg;
+  FILE* dbg = nullptr;
   if (args.debug) {
     char dbg_path[128];
     snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-server-%d.log", (int)getpid());
-    dbg.f = fopen(dbg_path, "w");
-    dbg.cap_bytes = 1024ull * (uint64_t)args.config.debug_log_cap_kb;
+    dbg = fopen(dbg_path, "w");
   }
 
   int epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -334,7 +333,7 @@ int run_server(const Args& args) {
     int err = get_so_error(backend_fd);
     if (err == 0) {
       backend_connected = true;
-      if (dbg.f) dbglogf(dbg, "[backend-connected t=%llu]\n",
+      if (dbg) fprintf(dbg, "[backend-connected t=%llu]\n",
                        (unsigned long long)(now_ns()/1000000ULL));
       int one = 1;
       setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -343,7 +342,7 @@ int run_server(const Args& args) {
       epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
       backend_events_state = EPOLLIN;
     } else if (err != EINPROGRESS && err != 0) {
-      if (dbg.f) dbglogf(dbg, "[backend-connect-failed t=%llu errno=%d]\n",
+      if (dbg) fprintf(dbg, "[backend-connect-failed t=%llu errno=%d]\n",
                        (unsigned long long)(now_ns()/1000000ULL), err);
       close(backend_fd);
       backend_fd = -1;
@@ -409,14 +408,14 @@ int run_server(const Args& args) {
     packet_io::flush_carrier_writes(carriers, epfd, ev, nullptr,
       [&](int fd, const char* reason) {
         any_removed = true;
-        if (dbg.f) dbglogf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
+        if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=%s]\n",
                          (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1, reason);
       });
     if (carriers.empty() && !unacked_data.empty()) {
       retransmit_needed = true;
       { static uint64_t last_spam_ns = 0;
-        if (dbg.f && dbg_rate_allow(last_spam_ns, now_ns(), 1000000000ull))
-          dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
+        if (dbg && dbg_rate_allow(last_spam_ns, now_ns(), 1000000000ull))
+          fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=write_error_all_dead]\n",
                   (unsigned long long)(now_ns()/1000000ULL), unacked_data.size());
       }
     }
@@ -424,7 +423,7 @@ int run_server(const Args& args) {
     // to run on the next iteration so we retransmit onto survivors immediately.
     if (any_removed && !carriers.empty() && !unacked_data.empty()) {
       last_retransmit_check_ns = 0;
-      if (dbg.f) dbglogf(dbg, "[retransmit-check-reset t=%llu unacked=%zu survivors=%zu reason=write_error]\n",
+      if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu survivors=%zu reason=write_error]\n",
                        (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), carriers.size());
     }
     for (auto it = outstanding_ping_ns.begin(); it != outstanding_ping_ns.end(); ) {
@@ -513,7 +512,7 @@ int run_server(const Args& args) {
           // Real write error (EPIPE, ECONNRESET, etc.): backend connection is broken.
           // Close it now so we stop trying to write on every iteration. The server
           // will detect no usable backend on the next iteration and stop running.
-          if (dbg.f) dbglogf(dbg, "[backend-write-err t=%llu errno=%d]\n",
+          if (dbg) fprintf(dbg, "[backend-write-err t=%llu errno=%d]\n",
                            (unsigned long long)(now_ns()/1000000ULL), errno);
           epoll_ctl(epfd, EPOLL_CTL_DEL, backend_fd, nullptr);
           close(backend_fd);
@@ -586,7 +585,7 @@ int run_server(const Args& args) {
   recv_cb.on_start_connection = [&](int fd, uint64_t carrier_id) {
     auto it = carriers.find(fd);
     if (it != carriers.end()) it->second.shared_carrier_id = carrier_id;
-    if (dbg.f) dbglogf(dbg, "[carrier-hello fd=%d shared_carrier_id=%llu]\n",
+    if (dbg) fprintf(dbg, "[carrier-hello fd=%d shared_carrier_id=%llu]\n",
                      fd, (unsigned long long)carrier_id);
   };
   recv_cb.on_ping = [&](int fd, uint64_t id, size_t payload_size) { send_pong(fd, id, payload_size); };
@@ -596,7 +595,7 @@ int run_server(const Args& args) {
   recv_cb.on_suggest_close = [&](int fd) {
     if (!carriers.count(fd)) return;
     pending_peer_suggest_close.insert(fd);
-    if (dbg.f) dbglogf(dbg, "[carrier-mark-close t=%llu fd=%d reason=peer_suggest_close pending=%zu]\n",
+    if (dbg) fprintf(dbg, "[carrier-mark-close t=%llu fd=%d reason=peer_suggest_close pending=%zu]\n",
                      (unsigned long long)(now_ns()/1000000ULL), fd, pending_peer_suggest_close.size());
   };
   recv_cb.on_ack = [&](int fd, uint64_t acked_id) {
@@ -610,8 +609,8 @@ int run_server(const Args& args) {
       bool spans_outage = (it->second < last_recovery_ns);
       // Sanity check: discard clearly-bogus values (> 60s); wrap-around produces ~1.8e19 ns.
       if (!spans_outage && rtt < 60000000000ULL) {
-        if (dbg.f && rtt > 5000000000ULL)
-          dbglogf(dbg, "[ack-rtt-high t=%llu acked_id=%llu rtt_ms=%llu]\n",
+        if (dbg && rtt > 5000000000ULL)
+          fprintf(dbg, "[ack-rtt-high t=%llu acked_id=%llu rtt_ms=%llu]\n",
                   (unsigned long long)(now_ns()/1000000ULL), (unsigned long long)acked_id,
                   (unsigned long long)(rtt/1000000ULL));
         server_recent_rtt_ns.push_back(rtt);
@@ -672,7 +671,7 @@ int run_server(const Args& args) {
     }
     runtime_reconnect_timeout_sec = pc.reconnect_timeout_sec;
     runtime_max_delay_ns = static_cast<uint64_t>(pc.max_delay_ms * 1000000.0f);
-    if (dbg.f) dbglogf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d reconnect_timeout_sec=%u]\n",
+    if (dbg) fprintf(dbg, "[set-config-applied t=%llu pkt_size=%zu rs_red=%.2f small_copies=%u auto_adapt=%d reconnect_timeout_sec=%u]\n",
                      (unsigned long long)(now_ns()/1000000ULL), max_packet,
                      (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
                      (int)runtime_auto_adapt, (unsigned)runtime_reconnect_timeout_sec);
@@ -742,9 +741,9 @@ int run_server(const Args& args) {
             if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
             cs.connect_ns = now_ns();
             if (recovered_from_empty) last_recovery_ns = cs.connect_ns;
-            if (dbg.f) { dbglogf(dbg, "[carrier-open t=%llu fd=%d total=%zu]\n",
+            if (dbg) { fprintf(dbg, "[carrier-open t=%llu fd=%d total=%zu]\n",
                                (unsigned long long)(now_ns()/1000000ULL), client, carriers.size());
-                        dbg_flush(dbg); }
+                        fflush(dbg); }
             // Send READY so client knows the link is up before it sends data.
             packet_io::append_ready(carriers[client].write_buf);
             // Catch-up cumulative ACK: tell the client how much c2s data we've already
@@ -764,7 +763,7 @@ int run_server(const Args& args) {
               retransmit_needed = false;
               auto& cs = carriers[client];
               const uint64_t retransmit_now = now_ns();
-              if (dbg.f) dbglogf(dbg, "[retransmit-on-reconnect t=%llu fd=%d items=%zu]\n",
+              if (dbg) fprintf(dbg, "[retransmit-on-reconnect t=%llu fd=%d items=%zu]\n",
                                (unsigned long long)(retransmit_now/1000000ULL), client, unacked_data.size());
               for (auto& [uid, ui] : unacked_data) {
                 if (ui.is_small) {
@@ -827,9 +826,9 @@ int run_server(const Args& args) {
           if (nr <= 0) {
             if (nr == 0) {
               running = false;
-              if (dbg.f) dbglogf(dbg, "[backend-eof t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
+              if (dbg) fprintf(dbg, "[backend-eof t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-              if (dbg.f) dbglogf(dbg, "[backend-read-err t=%llu errno=%d]\n",
+              if (dbg) fprintf(dbg, "[backend-read-err t=%llu errno=%d]\n",
                                (unsigned long long)(now_ns()/1000000ULL), errno);
             }
             break;
@@ -840,7 +839,7 @@ int run_server(const Args& args) {
           flush_backend_pending();
         }
         if (e & (EPOLLERR | EPOLLHUP)) {
-          if (dbg.f) dbglogf(dbg, "[backend-err t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
+          if (dbg) fprintf(dbg, "[backend-err t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
           running = false;
           break;
         }
@@ -852,7 +851,7 @@ int run_server(const Args& args) {
         bool carrier_removed = false;
         if (e & EPOLLIN) {
           if (!process_carrier_read(fd, it->second)) {
-            if (dbg.f) dbglogf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=read_error eof=%d err=%d errstr=%s events=0x%x rbuf=%zu wbuf=%zu]\n",
+            if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=read_error eof=%d err=%d errstr=%s events=0x%x rbuf=%zu wbuf=%zu]\n",
                              (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1,
                              last_read_eof ? 1 : 0, last_read_errno,
                              last_read_errno ? strerror(last_read_errno) : "none",
@@ -863,19 +862,19 @@ int run_server(const Args& args) {
             pending_peer_suggest_close.erase(fd);
             if (carriers.empty() && !unacked_data.empty()) {
               retransmit_needed = true;
-              if (dbg.f) dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
+              if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
                                (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd);
             }
             if (!carriers.empty() && !unacked_data.empty()) {
               last_retransmit_check_ns = 0;
-              if (dbg.f) dbglogf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
+              if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
                                (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
             }
             carrier_removed = true;
           }
         }
         if (!carrier_removed && pending_peer_suggest_close.count(fd)) {
-          if (dbg.f) dbglogf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=peer_suggest_close]\n",
+          if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=peer_suggest_close]\n",
                            (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
@@ -883,18 +882,18 @@ int run_server(const Args& args) {
           pending_peer_suggest_close.erase(fd);
           if (carriers.empty() && !unacked_data.empty()) {
             retransmit_needed = true;
-            if (dbg.f) dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=peer_closed_last]\n",
+            if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=peer_closed_last]\n",
                              (unsigned long long)(now_ns()/1000000ULL), unacked_data.size());
           }
           if (!carriers.empty() && !unacked_data.empty()) {
             last_retransmit_check_ns = 0;
-            if (dbg.f) dbglogf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu reason=peer_suggest_close]\n",
+            if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu reason=peer_suggest_close]\n",
                              (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
           }
           carrier_removed = true;
         }
         if (!carrier_removed && (e & (EPOLLERR | EPOLLHUP))) {
-          if (dbg.f) dbglogf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=epoll_err_hup]\n",
+          if (dbg) fprintf(dbg, "[carrier-remove t=%llu fd=%d total=%zu reason=epoll_err_hup]\n",
                            (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size()-1);
           close(fd);
           epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
@@ -902,12 +901,12 @@ int run_server(const Args& args) {
           pending_peer_suggest_close.erase(fd);
           if (carriers.empty() && !unacked_data.empty()) {
             retransmit_needed = true;
-            if (dbg.f) dbglogf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
+            if (dbg) fprintf(dbg, "[retransmit-needed t=%llu unacked=%zu reason=all_dead fd=%d]\n",
                              (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd);
           }
           if (!carriers.empty() && !unacked_data.empty()) {
             last_retransmit_check_ns = 0;
-            if (dbg.f) dbglogf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
+            if (dbg) fprintf(dbg, "[retransmit-check-reset t=%llu unacked=%zu fd=%d survivors=%zu]\n",
                              (unsigned long long)(now_ns()/1000000ULL), unacked_data.size(), fd, carriers.size());
           }
         }
@@ -917,14 +916,14 @@ int run_server(const Args& args) {
     const uint64_t now_ns_val = now_ns();
 
     // ── Debug: periodic state dump (mirrors client format) ────────────────────
-    if (dbg.f) {
+    if (dbg) {
       static uint64_t last_dbg_ns = 0;
       if (now_ns_val - last_dbg_ns >= 1000000000ULL) {
         last_dbg_ns = now_ns_val;
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_data) unacked_bytes += ui.data.size();
         if (rs_pending.empty()) {
-          dbglogf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
                   carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(),
                   (unsigned long long)next_deliver_id, backend_read_buf.size(),
                   (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
@@ -933,7 +932,7 @@ int run_server(const Args& args) {
                   (unsigned long long)(get_window_base_rtt_ns()/1000000ULL));
         } else {
           auto it = rs_pending.begin();
-          dbglogf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
                   carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
                   (unsigned long long)next_deliver_id, backend_read_buf.size(),
                   (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
@@ -942,7 +941,7 @@ int run_server(const Args& args) {
                   s2c_window.rate_bps/1024.0,
                   (unsigned long long)(get_window_base_rtt_ns()/1000000ULL));
         }
-        dbg_flush(dbg);
+        fflush(dbg);
       }
     }
 
@@ -987,7 +986,7 @@ int run_server(const Args& args) {
             packet_io::append_carrier_status(carriers[best].write_buf, dead_ids);
             ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = best;
             epoll_ctl(epfd, EPOLL_CTL_MOD, best, &ev);
-            if (dbg.f) dbglogf(dbg, "[carrier-status-sent t=%llu over_fd=%d dead_count=%zu]\n",
+            if (dbg) fprintf(dbg, "[carrier-status-sent t=%llu over_fd=%d dead_count=%zu]\n",
                              (unsigned long long)(now_ns_val/1000000ULL), best, dead_ids.size());
           }
         }
@@ -1003,7 +1002,7 @@ int run_server(const Args& args) {
       for (int cfd : quality.reap_fds) {
         auto it = carriers.find(cfd);
         if (it == carriers.end()) continue;
-        if (dbg.f) dbglogf(dbg, "[carrier-reap t=%llu fd=%d total=%zu reason=dead_but_open]\n",
+        if (dbg) fprintf(dbg, "[carrier-reap t=%llu fd=%d total=%zu reason=dead_but_open]\n",
                          (unsigned long long)(now_ns_val/1000000ULL), cfd, carriers.size()-1);
         close(cfd);
         epoll_ctl(epfd, EPOLL_CTL_DEL, cfd, nullptr);
@@ -1078,7 +1077,7 @@ int run_server(const Args& args) {
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = cfd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-          if (dbg.f) dbglogf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
+          if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), cfd);
         }
         if (quality.rtt_outlier_fd >= 0 && carriers.count(quality.rtt_outlier_fd)
@@ -1088,7 +1087,7 @@ int run_server(const Args& args) {
           ev.events = EPOLLIN | EPOLLOUT;
           ev.data.fd = quality.rtt_outlier_fd;
           epoll_ctl(epfd, EPOLL_CTL_MOD, quality.rtt_outlier_fd, &ev);
-          if (dbg.f) dbglogf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
+          if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), quality.rtt_outlier_fd);
         }
       }
@@ -1105,7 +1104,7 @@ int run_server(const Args& args) {
           ? (uint64_t)runtime_reconnect_timeout_sec * 1000000000ULL
           : scaled_ns(12, 60000000000ULL, 300000000000ULL);
       if (now_ns_val - last_global_recv_ns > global_idle_ns) {
-        if (dbg.f) dbglogf(dbg, "[global-idle-timeout t=%llu]\n", (unsigned long long)(now_ns_val/1000000ULL));
+        if (dbg) fprintf(dbg, "[global-idle-timeout t=%llu]\n", (unsigned long long)(now_ns_val/1000000ULL));
         running = false;
       }
     }
@@ -1156,7 +1155,7 @@ int run_server(const Args& args) {
             }
             if (!candidates.empty()) {
               unsigned copies = std::min(small_rt_copies, static_cast<unsigned>(candidates.size()));
-              if (dbg.f) dbglogf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
+              if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
                                (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
                                (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL), copies);
               for (unsigned c = 0; c < copies; ++c) {
@@ -1199,7 +1198,7 @@ int run_server(const Args& args) {
               sent_set.insert(itc->second.carrier_id);
               touched.insert(cfd);
             }
-            if (dbg.f && !touched.empty()) dbglogf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu unique_cfds=%zu]\n",
+            if (dbg && !touched.empty()) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu unique_cfds=%zu]\n",
                              (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)uid,
                              (unsigned long long)((now_ns_val - ui.send_ns)/1000000ULL),
                              ui.n, ui.k, rt_carriers.size(), touched.size());
@@ -1229,7 +1228,7 @@ int run_server(const Args& args) {
       // Evict stale incomplete RS groups (memory management only — no gap-jump).
       for (auto it = rs_pending.begin(); it != rs_pending.end(); ) {
         if (it->second.first_recv_ns > 0 && now_ns_val - it->second.first_recv_ns > rs_stale_ns) {
-          if (dbg.f) dbglogf(dbg, "[rs-stale-evict t=%llu id=%llu age_ms=%llu shards_had=%zu k=%u n=%u]\n",
+          if (dbg) fprintf(dbg, "[rs-stale-evict t=%llu id=%llu age_ms=%llu shards_had=%zu k=%u n=%u]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)it->first,
                            (unsigned long long)((now_ns_val - it->second.first_recv_ns)/1000000ULL),
                            it->second.shards.size(), it->second.k, it->second.n);
@@ -1255,7 +1254,7 @@ int run_server(const Args& args) {
           if (!has_higher) { next_deliver_id_stuck_since_ns = 0; break; }
           if (next_deliver_id_stuck_since_ns == 0) {
             next_deliver_id_stuck_since_ns = now_ns_val;
-            if (dbg.f) dbglogf(dbg, "[gap-detected t=%llu next_deliver_id=%llu reassembly=%zu rs_pending=%zu]\n",
+            if (dbg) fprintf(dbg, "[gap-detected t=%llu next_deliver_id=%llu reassembly=%zu rs_pending=%zu]\n",
                              (unsigned long long)(now_ns_val/1000000ULL), (unsigned long long)next_deliver_id,
                              reassembly.size(), rs_pending.size());
           }
@@ -1375,7 +1374,7 @@ int run_server(const Args& args) {
       // (this can force an immediate drop when carriers die — protection, not relaxation).
       runtime_small_packet_redundancy =
           std::min(runtime_small_packet_redundancy, std::max(2u, n_now));
-      if (dbg.f) {
+      if (dbg) {
         // Shard-gap percentiles (ms) so the latency budget B can be tuned: set B above the
         // "normal" spread (around p50-p90) but below a retransmit-scale delay (the tail).
         uint64_t g50 = 0, g90 = 0, g99 = 0;
@@ -1386,7 +1385,7 @@ int run_server(const Args& args) {
           g90 = g[g.size() * 90 / 100];
           g99 = g[std::min(g.size() - 1, g.size() * 99 / 100)];
         }
-        dbglogf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u "
+        fprintf(dbg, "[adapt-model t=%llu q=%.3f q_c2s=%.3f q_s2c=%.3f n=%u r_model=%.2f copies=%u "
                      "stall_ms=%llu q_jit=%.3f int_ms=%llu gap_ms_p50=%.1f p90=%.1f p99=%.1f]\n",
                 (unsigned long long)(now_ns_val/1000000ULL), q_used,
                 est_loss_q, (double)s2c_loss_q, n_now,
@@ -1399,7 +1398,7 @@ int run_server(const Args& args) {
       if (runtime_rs_redundancy != last_sent_rs_redundancy || runtime_small_packet_redundancy != last_sent_small_packet_redundancy) {
         last_sent_rs_redundancy = runtime_rs_redundancy;
         last_sent_small_packet_redundancy = runtime_small_packet_redundancy;
-        if (dbg.f) dbglogf(dbg, "[adapt-config-sent t=%llu rs_red=%.2f small_copies=%u carriers=%zu]\n",
+        if (dbg) fprintf(dbg, "[adapt-config-sent t=%llu rs_red=%.2f small_copies=%u carriers=%zu]\n",
                          (unsigned long long)(now_ns_val/1000000ULL), (double)runtime_rs_redundancy,
                          (unsigned)runtime_small_packet_redundancy, carriers.size());
         queue_server_config_to_carrier(carriers.begin()->first);
@@ -1423,14 +1422,14 @@ int run_server(const Args& args) {
     }
 
     ensure_backend_connected();
-    if (dbg.f && !backend_read_buf.empty() && carriers.empty()) {
+    if (dbg && !backend_read_buf.empty() && carriers.empty()) {
       static uint64_t last_stall_log = 0;
       if (now_ns_val - last_stall_log >= 1000000000ULL) {
         last_stall_log = now_ns_val;
-        dbglogf(dbg, "[srv-t2c-stall t=%llu] backend_buf=%zu carriers=0 unacked=%zu retransmit=%d\n",
+        fprintf(dbg, "[srv-t2c-stall t=%llu] backend_buf=%zu carriers=0 unacked=%zu retransmit=%d\n",
                 (unsigned long long)(now_ns_val/1000000ULL),
                 backend_read_buf.size(), unacked_data.size(), (int)retransmit_needed);
-        dbg_flush(dbg);
+        fflush(dbg);
       }
     }
     // Refresh the send-window state once per loop pass: outstanding = queued-but-unACKed
@@ -1581,31 +1580,31 @@ int run_server(const Args& args) {
     // If the backend write failed and was closed, stop running — there's nowhere to
     // deliver client data and no way to send sshd's responses to the client.
     if (backend_fd < 0 && backend_connected == false && !backend_pending.empty()) {
-      if (dbg.f) dbglogf(dbg, "[backend-closed-with-pending t=%llu pending=%zu]\n",
+      if (dbg) fprintf(dbg, "[backend-closed-with-pending t=%llu pending=%zu]\n",
                        (unsigned long long)(now_ns()/1000000ULL), backend_pending.size());
       running = false;
     }
-    if (dbg.f) {
+    if (dbg) {
       static uint64_t loop_count = 0;
       static uint64_t last_log_ns = 0;
       loop_count++;
       uint64_t t = now_ns();
       if (t - last_log_ns >= 5000000000ULL) {
         last_log_ns = t;
-        dbglogf(dbg, "[loop-count t=%llu loops=%llu carriers=%zu]\n",
+        fprintf(dbg, "[loop-count t=%llu loops=%llu carriers=%zu]\n",
                 (unsigned long long)(t/1000000ULL), (unsigned long long)loop_count, carriers.size());
-        dbg_flush(dbg);
+        fflush(dbg);
       }
     }
   }
 
-  if (dbg.f) {
-    dbglogf(dbg, "[server-exit t=%llu carriers=%zu unacked=%zu next_send_id=%llu backend_fd=%d connected=%d]\n",
+  if (dbg) {
+    fprintf(dbg, "[server-exit t=%llu carriers=%zu unacked=%zu next_send_id=%llu backend_fd=%d connected=%d]\n",
             (unsigned long long)(now_ns()/1000000ULL),
             carriers.size(), unacked_data.size(), (unsigned long long)next_send_id,
             backend_fd, (int)backend_connected);
-    dbg_flush(dbg);
-    fclose(dbg.f);
+    fflush(dbg);
+    fclose(dbg);
   }
   for (auto& [fd, _] : carriers)
     close(fd);

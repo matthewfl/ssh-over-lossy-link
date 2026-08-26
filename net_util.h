@@ -22,37 +22,6 @@ namespace ssholl {
 // ---------------------------------------------------------------------------
 // Production incident (2026-08-21): a spam path printed on every event-loop pass
 // and the server debug log reached 29 GB in ~2 h. Every debug write now goes through
-// DebugLog: a hard byte cap (default 256 MB, tunable via --debug-log-cap-kb,
-// propagated to the spawned server) after which logging stops with one marker line.
-// Hot loop-pass sites additionally rate-gate at the callsite.
-struct DebugLog {
-  FILE* f = nullptr;
-  uint64_t bytes_written = 0;
-  uint64_t cap_bytes = 256ull * 1024 * 1024;  // default cap; 0 = unlimited
-  bool capped = false;
-};
-
-inline void dbglogf(DebugLog& log, const char* fmt, ...) {
-  if (!log.f || log.capped) return;
-  va_list ap;
-  va_start(ap, fmt);
-  int rc = vfprintf(log.f, fmt, ap);
-  va_end(ap);
-  if (rc > 0) log.bytes_written += static_cast<uint64_t>(rc);
-  if (log.cap_bytes > 0 && log.bytes_written >= log.cap_bytes) {
-    log.capped = true;
-    fprintf(log.f, "[debug-log-capped bytes=%llu cap=%llu -- further logging suppressed]\n",
-            (unsigned long long)log.bytes_written, (unsigned long long)log.cap_bytes);
-    fflush(log.f);
-  }
-}
-
-inline void dbg_flush(DebugLog& log) {
-  if (log.f) fflush(log.f);
-}
-
-// Per-site spam gate: allow at most one print every min_interval_ns. The timestamp
-// cell is provided by the caller as a static local so each callsite gets its own.
 inline bool dbg_rate_allow(uint64_t& last_ns, uint64_t now_ns_v, uint64_t min_interval_ns) {
   if (last_ns != 0 && now_ns_v - last_ns < min_interval_ns) return false;
   last_ns = now_ns_v;

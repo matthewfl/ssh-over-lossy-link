@@ -1975,37 +1975,28 @@ def check_server_stall_ms(max_stall_ms, warmup_s=15.0):
     return 0 if ok else 1
 
 
-def check_server_log_capped(max_kb, server_proc=None):
-    """The debug logs are notorious for exploding when a spam path fires (production
-    grew a 29 GB server log in ~2 h, 2026-08-21). The product caps every debug log at
-    --debug-log-cap-kb (default 256 MB) and emits one '[debug-log-capped]' marker.
-    This assert verifies BOTH that the mechanism engaged (marker present) and that the
-    file did not grow past cap + one-page slack. Returns 0 (pass) or 1 (fail)."""
-    import glob
-    # The cap often trips on teardown writes (the tail of a run); reading while the
-    # server is still alive races those final bytes. Wait for it to exit first.
-    if server_proc is not None:
-        try:
-            server_proc.wait(timeout=30)
-        except Exception:
-            pass
-    logs = glob.glob("/tmp/ssh-oll-server-*.log")
-    if not logs:
-        print("check_server_log_capped: no server --debug log found", file=sys.stderr)
-        return 1
-    log = max(logs, key=lambda p: os.path.getmtime(p))
-    try:
-        with open(log, "rb") as f:
-            txt = f.read().decode("utf-8", errors="replace")
-    except OSError as e:
-        print(f"check_server_log_capped: cannot read {log}: {e}", file=sys.stderr)
-        return 1
-    size_kb = os.path.getsize(log) / 1024.0
-    has_marker = "[debug-log-capped" in txt
-    ok = has_marker and size_kb <= max_kb + 32  # one page-ish slack above the cap
-    print(f"server log cap: size={size_kb:.0f}KB marker={'yes' if has_marker else 'NO'} "
-          f"(cap {max_kb}KB, limit {max_kb + 32}KB) -> {'PASS' if ok else 'FAIL'}", flush=True)
-    return 0 if ok else 1
+def check_debug_log_volume(max_kb, client_pid):
+    """Both --debug logs of the just-finished run must stay small in NORMAL
+    operation. A 12-hour session accumulates ~360x the bytes of a 120 s run, so
+    this gates the per-minute debug volume — regression protection against any
+    future per-iteration spam path (the 29 GB-bomb class of bug), achieved by
+    not writing junk in the first place (no caps, no rotation)."""
+    rc = 0
+    client_log = f"/tmp/ssh-oll-client-{client_pid}.log"
+    server_logs = glob.glob("/tmp/ssh-oll-server-*.log")
+    server_log = max(server_logs, key=os.path.getmtime) if server_logs else None
+    for side, path in (("client", client_log), ("server", server_log)):
+        if not path or not os.path.exists(path):
+            print(f"debug-log-volume: {side} log not found ({path}) -> FAIL")
+            rc = 1
+            continue
+        kb = os.path.getsize(path) / 1024.0
+        ok = kb <= max_kb
+        print(f"debug-log-volume: {side} {os.path.basename(path)} {kb:.0f} KB "
+              f"(limit {max_kb}) -> {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            rc = 1
+    return rc
 
 
 def check_server_adapts(min_lines=25, warmup_s=20.0):
@@ -2388,13 +2379,13 @@ def main():
              "either direction falls below this, over the test duration.",
     )
     parser.add_argument(
-        "--assert-server-log-capped",
+        "--assert-max-debug-log-kb",
         type=int,
         default=None,
-        metavar="CAP_KB",
-        help="Pass --debug-log-cap-kb CAP_KB to the harness-spawned server, then fail unless its "
-             "newest --debug log CONTAINS a '[debug-log-capped]' marker AND its size is <= CAP_KB+32. "
-             "Proves the debug-log size cap (the anti-29GB-log mechanism) works end to end.",
+        metavar="KB",
+        help="Fail if EITHER side's newest --debug log exceeds KB after the run. A 60 s run x720 "
+             "is a 12-hour session: this gates the per-minute debug volume so long debug-enabled "
+             "sessions stay small (prevents regressing the 29 GB-bomb class without any cap).",
     )
     parser.add_argument(
         "--assert-max-stall-ms",
@@ -2646,12 +2637,10 @@ def main():
         getattr(args, "assert_max_stall_ms", None) is not None or \
         getattr(args, "assert_server_adapts", False) or \
         getattr(args, "assert_server_unacked_max", None) is not None or \
-        getattr(args, "assert_server_log_capped", None) is not None
+        getattr(args, "assert_max_debug_log_kb", None) is not None
     _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
     if _server_debug:
         _server_cmd += ["--debug"]
-    if getattr(args, "assert_server_log_capped", None) is not None:
-        _server_cmd += ["--debug-log-cap-kb", str(args.assert_server_log_capped)]
     server_proc = subprocess.Popen(
         _server_cmd,
         stdout=subprocess.PIPE,
@@ -2734,7 +2723,8 @@ def main():
         getattr(args, "assert_max_carrier_removes", None) is not None or \
         getattr(args, "assert_max_carrier_count", None) is not None or \
         getattr(args, "assert_max_small_copies", None) is not None or \
-        getattr(args, "assert_min_dead_idle_removes", None) is not None
+        getattr(args, "assert_min_dead_idle_removes", None) is not None or \
+        getattr(args, "assert_max_debug_log_kb", None) is not None
     client_cmd = [
         args.ssh_oll_path,
         "--unix-socket-connection",
@@ -2840,8 +2830,8 @@ def main():
             rc = (rc or 0) | check_max_small_copies(client_proc.pid, args.assert_max_small_copies)
         if getattr(args, "assert_max_stall_ms", None) is not None:
             rc = (rc or 0) | check_server_stall_ms(args.assert_max_stall_ms)
-        if getattr(args, "assert_server_log_capped", None) is not None:
-            rc = (rc or 0) | check_server_log_capped(args.assert_server_log_capped, server_proc)
+        if getattr(args, "assert_max_debug_log_kb", None) is not None:
+            rc = (rc or 0) | check_debug_log_volume(args.assert_max_debug_log_kb, client_proc.pid)
         return rc
 
     if getattr(args, "scenario_bw_flood", False):

@@ -688,21 +688,31 @@ run_test "blackhole-dead-carrier-recovery-noauto" \
     --assert-min-dead-idle-removes 3 \
     --extra-client-args --force-ssh-carrier-mode --max-connections 12 --no-auto
 
-# Debug-log size cap: production grew a ~29 GB server debug log in ~2 h (2026-08-21).
-# Every debug log now has a hard byte cap (--debug-log-cap-kb, default 256 MB, propagated
-# to the spawned server) that stops logging with one [debug-log-capped] marker, and the
-# known every-loop-pass spam sites are rate-gated at 1/s. This scenario generates enough
-# debug output to trip a tiny 16 KB cap and asserts the marker + bounded size.
-run_test "debug-log-cap" \
+# Debug-log volume gate: production grew a ~29 GB server debug log in ~2 h by writing
+# junk (a per-main-loop-pass state dump + unbounded per-pass retransmit spam). Policy:
+# NO caps, NO rotation — we simply don't write junk in the first place: the per-loop
+# dumps self-gate at 1 Hz and the known hot sites are rate-gated at 1/s. This ~120 s
+# churn-heavy run (loss + periodic blackouts + connection death = the noisiest debug
+# regimes) asserts BOTH sides' debug logs stay small. Measured baseline post-clean:
+# ~190 KB client / ~107 KB server per 120 s (~70/40 MB per hypothetical 12-hour debug
+# session); the 512 KB gate gives 2.7x jitter headroom.
+run_test "debug-log-volume" \
     --init-latency-override 0.05 \
-    --latency-ms 250 \
-    --link-bandwidth-kbps 256 \
+    --continuous --continuous-duration 120 \
+    --continuous-tcp-to-client-only \
+    --latency-random \
+    --latency-random-low-ms  300 \
+    --latency-random-high-ms 500 \
+    --latency-random-pct     5   \
+    --connection-death-probability 0.02 \
+    --scenario-stop-recover \
+    --scenario-blackout-start 20 \
+    --scenario-blackout-duration 10 \
+    --scenario-periodic-blackout-interval 30 \
+    --scenario-periodic-blackout-duration 10 \
+    --scenario-periodic-blackout-count 3 \
     --connections 8 \
-    --packet-size 800 --payload-size 800 \
-    --scenario-bw-flood --bw-flood-rate-x 2.0 \
-    --continuous-duration 45 \
-    --server-debug \
-    --assert-server-log-capped 16
+    --assert-max-debug-log-kb 512
 
 # Small-packet storm: 60 Hz x 300 B interactive frames in BOTH directions (the
 # 'TUI redraw storm' case) past a 256 KB/s shared link. The suite variant is
