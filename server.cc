@@ -628,14 +628,14 @@ int run_server(const Args& args) {
     // Data confirmed received: remove from retransmit buffer.
     uint64_t acked_bytes = 0;
     for (auto it_u = unacked_data.begin(); it_u != unacked_data.end() && it_u->first <= acked_id; ) {
-      acked_bytes += it_u->second.data.size();
+      acked_bytes += it_u->second.wire_cost();
       it_u = unacked_data.erase(it_u);
     }
     // ACK-clocked rate estimate for the s2c send window (this also has a nice property: when
     // the window has closed the pump and deliveries pause at the cap, so there is nothing new
     // to ACK and the rate simply holds — it cannot spiral down to zero).
     uint64_t outstanding_after = 0;
-    for (const auto& [uid2, ui2] : unacked_data) outstanding_after += ui2.data.size();
+    for (const auto& [uid2, ui2] : unacked_data) outstanding_after += ui2.wire_cost();
     rate_window_on_ack(s2c_window, acked_bytes, now_ns(), outstanding_after, get_window_base_rtt_ns());
   };
   recv_cb.on_pong = [&](int fd, uint64_t) {
@@ -1355,6 +1355,15 @@ int run_server(const Args& args) {
       // applies when there are fewer than kMaxSmallCopies carriers.)
       unsigned copies = std::min(carrier_adapt::small_copies_for_loss(q_jitter, carrier_adapt::kInteractiveEps),
                                  carrier_adapt::kMaxSmallCopies);
+      // Saturation clamp for duplication (the rs-side analog is the 0.5f ceiling above):
+      // when a send window is pinned at its cap, the "lateness" the model sees is
+      // predominantly queueing at the saturated link — and every wasted copy STEALS
+      // wire share from payload at the very moment the link is scarce (measured in the
+      // 60 Hz small-packet storm: copies pinned at 8, wire overhead ~6x, app goodput
+      // stuck ~8 KB/s at ~22 s interactive lag on a 256 KB/s link).  Under saturation
+      // hold duplication at the useful minimum; true loss stalls are still repaired by
+      // retransmits and RS parity (which is itself clamped under saturation).
+      if (send_saturated) copies = std::min(copies, 3u);
       unsigned copies_target = std::min(std::max(2u, n_now), std::max(2u, copies));
       if (copies_target >= runtime_small_packet_redundancy) {
         runtime_small_packet_redundancy = copies_target;  // up: immediate
@@ -1430,7 +1439,7 @@ int run_server(const Args& args) {
     // window's worth — otherwise the bytes just queue one buffer earlier.
     {
       uint64_t ob = 0;
-      for (const auto& [uid, ui] : unacked_data) ob += ui.data.size();
+      for (const auto& [uid, ui] : unacked_data) ob += ui.wire_cost();
       unacked_bytes_cache = ob;
     }
     // The pre-encode read buffer is only a pipe for the encoder — bound it to a fraction of the
@@ -1488,7 +1497,7 @@ int run_server(const Args& args) {
             ui.send_ns = now_ns();
             unacked_data[next_send_id] = std::move(ui);
           }
-          unacked_bytes_cache += chunk;
+          unacked_bytes_cache += chunk;  // single copy: wire cost == payload
           queue_small_to_carriers(backend_read_buf.data(), chunk);
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
           continue;
@@ -1523,6 +1532,7 @@ int run_server(const Args& args) {
           ui.n = n;  ui.k = static_cast<unsigned>(k);
           ui.block_size = static_cast<uint16_t>(block_size);
           ui.is_small = false;
+          ui.wire_bytes = static_cast<uint64_t>(n) * block_size;  // wire cost: all n shards
           ui.send_ns = now_ns();
           for (unsigned si = 0; si < n; ++si) {
             ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
@@ -1530,7 +1540,7 @@ int run_server(const Args& args) {
           unacked_data[next_send_id] = std::move(ui);
         }
         next_send_id++;
-        unacked_bytes_cache += k * block_size;  // the window gate re-checks against this
+        unacked_bytes_cache += static_cast<uint64_t>(n) * block_size;  // wire cost
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
       }
       // Any sub-block remainder: send as SMALL (no RS needed for < block_size).
@@ -1539,12 +1549,23 @@ int run_server(const Args& args) {
       // equivalent guard on the client side and prevents a too-large SMALL packet if
       // somehow a full block remains (e.g. future code change removes the m==0 continue).
       // Hold the remainder up to --max-delay so it can coalesce into a full RS block first.
+      // SMALL sends count at WIRE cost in the window (payload x copies — otherwise a
+      // duplicated small-packet producer (interactive redraw storm) grows carrier queues
+      // ~copies-fold past the cap; measured ~15x overhead, multi-MB queue per minute).
       if (!backend_read_buf.empty() && backend_read_buf.size() < block_size && !carriers.empty()) {
         if (backend_partial_since_ns == 0) backend_partial_since_ns = now_ns();
-        if (runtime_max_delay_ns == 0 || now_ns() - backend_partial_since_ns >= runtime_max_delay_ns) {
+        const bool small_gate_closed = !rate_window_open(
+            unacked_bytes_cache + backend_read_buf.size() * runtime_small_packet_redundancy,
+            s2c_window, get_window_base_rtt_ns());
+        if ((runtime_max_delay_ns == 0 || now_ns() - backend_partial_since_ns >= runtime_max_delay_ns)
+            && !small_gate_closed) {
           size_t chunk = backend_read_buf.size();
+          const unsigned copies = std::max(1u, std::min(runtime_small_packet_redundancy,
+                                                        static_cast<unsigned>(carriers.size())));
           { UnackedItem ui; ui.data.assign(backend_read_buf.begin(), backend_read_buf.end());
-            ui.is_small = true; ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
+            ui.is_small = true; ui.wire_bytes = static_cast<uint64_t>(chunk) * copies;
+            ui.send_ns = now_ns(); unacked_data[next_send_id] = std::move(ui); }
+          unacked_bytes_cache += static_cast<uint64_t>(chunk) * copies;  // wire cost
           queue_small_to_carriers(backend_read_buf.data(), chunk);
           backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + chunk);
           backend_partial_since_ns = 0;

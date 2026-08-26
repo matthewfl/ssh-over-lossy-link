@@ -1266,6 +1266,8 @@ def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     timed_lat = []
     delivered = {"s2c": 0, "c2s": 0}
     offered = {"s2c": 0, "c2s": 0}
+    from collections import deque as _deque
+    writer_t0s = {"s2c": _deque(), "c2s": _deque()}
     errors = []
     stall_events = []
     lock = threading.Lock()
@@ -1277,17 +1279,22 @@ def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         seq = 0
         while not stop.is_set():
             seq += 1
-            t0_ms = int(time.perf_counter() * 1000)
-            body = bytes([int(t0_ms + seq) & 0xFF] * (frame_size - 8))
-            frame = t0_ms.to_bytes(8, "big") + body
-            chunk = frame
+            body = bytes([seq & 0xFF] * (frame_size - 8))
+            chunk = seq.to_bytes(8, "big") + body  # header = seq (delivery-order key)
             if seq % progress_slow_every == 0:
                 chunk += os.urandom(slow_size)
             try:
                 send_all(chunk)
             except (BrokenPipeError, OSError):
                 break
+            # Record the wire-entry time AFTER the (possibly blocking) send returns:
+            # when the link can't carry the wire bytes the producer's send blocks —
+            # that IS the backpressure a coalescing TUI redraw would observe, and
+            # counting that wait as 'latency' measures our own queue, not the tunnel
+            # (same rule as bw-flood). Frames arrive in order (ordered stream), so the
+            # reader matches them against this FIFO.
             with lock:
+                writer_t0s[name].append(time.perf_counter())
                 offered[name] += len(chunk)
             next_frame += 1.0 / frame_hz
             sleep_t = next_frame - time.perf_counter()
@@ -1323,14 +1330,20 @@ def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             if len(buf) < frame_size:
                 break  # EOF mid-shutdown
             frame, buf = buf[:frame_size], buf[frame_size:]
-            t0_ms = int.from_bytes(frame[:8], "big")
-            lat = int(time.perf_counter() * 1000) - t0_ms
-            # Frame body byte pattern: seq-1 was folded into the body byte; the
-            # writer wrote bytes [ (t0_ms+seq)&0xFF ].  Sanity-check cheaply:
-            # just verify body is a single repeated byte (well-formed frame).
-            if len(set(frame[8:])) != 1:
+            frame_seq = int.from_bytes(frame[:8], "big")
+            # Content sanity: body must be one repeated byte equal to seq & 0xFF.
+            if len(set(frame[8:])) != 1 or frame[8] != (frame_seq & 0xFF):
                 with lock:
                     errors.append((name, frame_size, "content mismatch"))
+            with lock:
+                t0 = writer_t0s[name].popleft() if writer_t0s[name] else None
+            if t0 is None:
+                # Writer done/teardown raced past an in-flight frame.
+                if not stop.is_set():
+                    with lock:
+                        errors.append((name, frame_seq, "no matching writer t0"))
+                continue
+            lat = (time.perf_counter() - t0) * 1000.0
             count += 1
             with lock:
                 lats[name].append(lat)
@@ -1382,6 +1395,92 @@ def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     stop.set()
     for t in threads:
         t.join(timeout=5.0)
+
+    # Recovery phase (the question the scenario answers: "can the storm CLOG the
+    # network?" — i.e. does the damage persist AFTER the storm?): drop the offered rate
+    # well below recoverable link capacity and require interactive latency to fall back
+    # to the recovery targets.  A runaway design (feedback spiral, unbounded queues)
+    # keeps showing multi-second latency here long after the storm stopped.
+    rec_lats = {"s2c": [], "c2s": []}
+    rec_arrivals = {"s2c": [], "c2s": []}
+    rec_s = max(0.0, float(getattr(args, "small_storm_recovery_s", 20.0)))
+    rec_hz = getattr(args, "small_storm_recovery_hz", 5.0)
+    if rec_s > 0.0 and rec_hz:
+        def rec_writer(name, send_all, t_end):
+            while time.perf_counter() < t_end:
+                t0_ms = int(time.perf_counter() * 1000)
+                frame = t0_ms.to_bytes(8, "big") + b"RECSTORM" + bytes([0xAB] * (frame_size - 16))
+                try:
+                    send_all(frame)
+                except (BrokenPipeError, OSError):
+                    break
+                time.sleep(1.0 / rec_hz)
+        def rec_reader(name, stream, t_end):
+            buf = b""
+            while time.perf_counter() < t_end or buf:
+                while len(buf) < frame_size:
+                    try:
+                        r, _, _ = select.select([stream], [], [], 0.5)
+                        if not r:
+                            break
+                        chunk = stream.recv(65536) if hasattr(stream, "recv") else stream.read(65536)
+                    except (OSError, ValueError):
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                if len(buf) < frame_size:
+                    if time.perf_counter() >= t_end:
+                        break
+                    continue
+                # Resync: leftover storm traffic (incl. its 2 KB slow chunks, which
+                # destroy fixed-size alignment) drains through this stream; skip bytes
+                # until the next magic marker lines up.
+                magic_at = buf.find(b"RECSTORM")
+                if magic_at < 8:
+                    # no usable marker: drop up to any marker tail and keep reading
+                    buf = buf[max(0, magic_at + 8):] if magic_at >= 0 else buf[len(buf) - 8:]
+                    continue
+                if magic_at + frame_size - 8 > len(buf):
+                    buf = buf[magic_at - 8:]  # found marker; wait for the rest of the frame
+                    continue
+                i = magic_at - 8
+                frame = buf[i:i + frame_size]
+                buf = buf[i + frame_size:]
+                t0_ms = int.from_bytes(frame[:8], "big")
+                lat = time.perf_counter() * 1000.0 - t0_ms
+                if 0 <= lat < max(60000.0, rec_s * 2000):  # ignore misparsed frames
+                    with lock:
+                        rec_lats[name].append(lat)
+                        rec_arrivals[name].append((time.perf_counter(), lat))
+        t_end = time.perf_counter() + rec_s
+        rec_threads = [
+            threading.Thread(target=rec_writer, args=("s2c", tcp_conn.sendall, t_end), daemon=True),
+            threading.Thread(target=rec_reader, args=("s2c", client_proc.stdout.raw, t_end + 10.0), daemon=True),
+            threading.Thread(target=rec_writer, args=("c2s", c2s_send, t_end), daemon=True),
+            threading.Thread(target=rec_reader, args=("c2s", tcp_conn, t_end + 10.0), daemon=True),
+        ]
+        for t in rec_threads:
+            t.start()
+        for t in rec_threads:
+            t.join(timeout=(t_end - time.perf_counter()) + 12.0)
+        # The first half of the recovery window is dominated by draining the accreted
+        # storm backlog (frames that were queued during the storm). Certify the
+        # POST-DRAIN quality instead: only frames arriving in the SECOND HALF of the
+        # recovery window count toward the assert.
+        t_half = t_end - rec_s / 2.0
+        for d in ("s2c", "c2s"):
+            rec_lats[d + "_late"] = [lat for (t_rec, lat) in rec_arrivals[d] if t_rec >= t_half]
+        print(f"  recovery: {rec_s:.0f}s at {rec_hz}Hz — frame latency after storm:")
+        for d in ("s2c", "c2s"):
+            r = rec_lats[d]
+            if r:
+                s = sorted(r)
+                print(f"    {d}: n={len(r)} min={min(r):.0f} avg={sum(r) / len(r):.0f} "
+                      f"p50={s[len(s) // 2]:.0f} p95={s[min(len(s) - 1, int(len(r) * 0.95))]:.0f} "
+                      f"max={max(r):.0f} ms")
+            else:
+                print(f"    {d}: NO samples (recovery phase never received a frame!)")
     try:
         client_proc.stdin.close()
     except (BrokenPipeError, OSError):
@@ -1440,6 +1539,19 @@ def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 got = delivered_snap[d] / 1024 / dur
                 if got < args.test_min_goodput_kbps:
                     failures.append(f"{d} goodput {got:.1f} KB/s < {args.test_min_goodput_kbps} KB/s")
+    maxrec = float(getattr(args, "assert_max_recovery_latency", 0) or 0)
+    if maxrec > 0:
+        for d in ("s2c", "c2s"):
+            r = rec_lats[d + "_late"] if rec_lats.get(d + "_late") is not None else rec_lats[d]
+            if not r:
+                failures.append(f"{d} recovery phase delivered no frames in its post-drain "
+                                f"window (link stuck)")
+            else:
+                s = sorted(r)
+                p50 = s[len(s) // 2]
+                if p50 > maxrec:
+                    failures.append(f"{d} recovery post-drain p50 latency {p50:.0f} ms > "
+                                    f"{maxrec:.0f} ms (storm caused unrecoverable congestion)")
     if failures:
         print("\nTEST FAILED:", file=sys.stderr)
         for f in failures:
@@ -2252,6 +2364,13 @@ def main():
         metavar="BYTES",
         help="In --scenario-small-storm: bytes per small frame. Default 300.",
     )
+    parser.add_argument("--small-storm-recovery-s", type=float, default=20.0,
+                        help="Seconds of slow-recovery traffic after the small-storm (0 = none).")
+    parser.add_argument("--small-storm-recovery-hz", type=float, default=5.0,
+                        help="Recovery-phase frame rate per direction.")
+    parser.add_argument("--assert-max-recovery-latency", type=float, default=0,
+                        help="Small-storm: after the storm, max p50 interactive latency (ms). "
+                             "Catches unrecoverable congestion (runaway queues / spirals).")
     parser.add_argument(
         "--assert-max-wire-overhead",
         type=float,

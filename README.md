@@ -282,9 +282,18 @@ struct __attribute__((__packed__)) packet_carrier_status : packet_header {
 // probe keeps the window at link capacity instead of stalling at ~half). When the
 // window is closed the sender also stops reading its data source
 // (client stdin / server backend socket) so backpressure propagates to the producing
-// application instead of queueing unboundedly in ssh-oll. Small/interactive packets are
-// never gated. The window exists to cap the queueing an interactive packet can wait
-// behind during a bulk transfer on a constrained link.
+// application instead of queueing unboundedly in ssh-oll. Small/interactive packets
+// are counted at WIRE cost (payload x number of copies sent) and are gated while the
+// window is closed — a sustained high-rate small-packet producer (e.g. 60 Hz interactive
+// redraws) would otherwise duplicate its way past the window and grow carrier queues
+// ~copies-fold beyond the cap. While the window is open, small sends proceed normally
+// (copy counts included). The window exists to cap the queueing an interactive packet
+// can wait behind during a bulk transfer on a constrained link.
+//
+// Saturation clamps: while a send window is pinned at its cap, the server adapt model
+// caps RS redundancy at 0.5 and small-packet copies at 3 — the lateness seen then is
+// queueing at the saturated link, and wasting scarce wire on redundancy makes it
+// strictly worse (genuine loss stalls still ride the retransmit path).
 
 // PACKET_SERVER_CONFIG: server -> client. Same payload as packet_config (no auto_adapt).
 // When auto_adapt is on, server adapts redundancy and sends this so the client stays in sync.

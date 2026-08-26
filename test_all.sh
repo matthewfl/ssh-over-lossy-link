@@ -704,6 +704,33 @@ run_test "debug-log-cap" \
     --server-debug \
     --assert-server-log-capped 16
 
+# Small-packet storm: 60 Hz x 300 B interactive frames in BOTH directions (the
+# 'TUI redraw storm' case) past a 256 KB/s shared link. The suite variant is
+# deterministic (fixed 250 ms): it exercises the wire-cost accounting + saturation
+# clamp code paths and is a stable regression gate (latency ~RTT throughout).
+# The discrimination vs the pre-fix build lives in the SPIKY regime
+# (--latency-random 5% x 5 s): pre-fix grew a ~9.4 MB scheduler queue in 60 s at
+# ~15x wire overhead and ~20 s frame latencies; post-fix stays bounded (~2.5-4x),
+# which that regime is too noisy to gate on in-suite — its numbers are documented
+# here for the record. Recovery matters: after the storm, interactive latency must
+# fall back to ~RTT within the (drain-aware) recovery window.
+run_test "small-pkt-storm-256kbps" \
+    --init-latency-override 0.05 \
+    --latency-ms 250 \
+    --link-bandwidth-kbps 256 \
+    --connections 8 \
+    --packet-size 800 --payload-size 800 \
+    --scenario-small-storm \
+    --small-storm-hz 60 --small-storm-size 300 \
+    --continuous-duration 45 \
+    --client-debug --server-debug \
+    --test-max-latency 5000 \
+    --test-min-goodput-kbps 5 \
+    --assert-max-wire-overhead 4.0 \
+    --small-storm-recovery-s 90 \
+    --assert-max-recovery-latency 5000 \
+    --extra-client-args --max-connections 120
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"

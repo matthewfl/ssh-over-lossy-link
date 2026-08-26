@@ -92,6 +92,14 @@ struct UnackedItem {
   unsigned k = 0;
   uint16_t block_size = 0;
   bool is_small = false;
+  // Estimated WIRE bytes for this send once in flight (RS: n*block_size, i.e. the
+  // data inflated by the redundancy factor; SMALL: payload x copies sent).  The
+  // send window compares against these: unacked data otherwise counts one logical
+  // copy while Nx bytes queue on carriers, and a duplicated small-packet flood then
+  // grows carrier queues ~copies-fold past the cap (measured: ~15x wire overhead,
+  // multi-MB queue in 60 s on a 256 KB/s link).  0 = fall back to data.size().
+  uint64_t wire_bytes = 0;
+  uint64_t wire_cost() const { return wire_bytes ? wire_bytes : data.size(); }
   uint64_t send_ns = 0;        // when originally sent (for timeout-based retransmit)
   bool retransmitted = false;  // set once this item has been resent; its ACK's RTT is then
                                // ambiguous (Karn's algorithm) and must not be timed.
@@ -189,13 +197,33 @@ inline void rate_window_on_ack(RateWindow& w, uint64_t acked_bytes, uint64_t now
     // probe freezes and the link's queueing settles at the budget.
     uint64_t budget_cap = static_cast<uint64_t>(
         inst * (static_cast<double>(base_rtt_ns) / 1e9 + RateWindow::kBudgetSec) * RateWindow::kHeadroomMult);
-    bool queue_saturated = outstanding_after >= budget_cap;
+    // …but the saturate-stop must not bind while the cap sits at its FLOOR: the floor
+    // cap (128 KB × base_s) exceeds the natural target of ANY depressed-rate estimate
+    // (e.g. a lossy link whose decode-stall-stretched ACK clock reads ~30 KB/s), which
+    // would freeze the probe forever — exactly the locked-low equilibrium the probe
+    // exists to escape.  At the floor we are already admitting the minimum, so letting
+    // the probe grow there costs at most one probe cycle of overshooting above the
+    // floor; above the floor (rate-derived caps) the stop binds as designed.
+    uint64_t floor_bytes = static_cast<uint64_t>(RateWindow::kFloorBytes *
+                           std::max(1.0, static_cast<double>(base_rtt_ns) / 1e9));
+    bool cap_at_floor = rate_window_cap(w, base_rtt_ns) <= floor_bytes;
+    bool queue_saturated = !cap_at_floor && outstanding_after >= budget_cap;
     bool rate_responsive = w.prev_fold_rate == 0.0 ||
                            inst >= w.prev_fold_rate * RateWindow::kProbeResponseMult;
     w.prev_fold_rate = inst;
+    // Empty-fold corruption guard: when the window was supply-limited all fold but
+    // produced (nearly) no ACKed bytes, the fold carries NO capacity information —
+    // delivery was decode-/return-path-stalled behind the saturated link (measured:
+    // k-of-n groups complete in ~5 s clumps under sustained loss, so most 500 ms
+    // folds read inst=0 and the 0.5/0.5 EWMA locked the estimate around ~40 KB/s
+    // on a link capable of 256 KB/s). HOLD the estimate instead of decaying it.
+    double floor_rate = static_cast<double>(floor_bytes) /
+                        std::max(1.0, static_cast<double>(base_rtt_ns) / 1e9);
+    bool silent_saturated = supply_limited && inst < floor_rate * 0.25 && w.rate_bps > 0.0;
     if (supply_limited && rate_responsive && !queue_saturated && w.rate_bps > 0.0)
       inst = std::max(inst, w.rate_bps * RateWindow::kProbeMult);
-    w.rate_bps = (w.rate_bps > 0.0) ? (0.5 * w.rate_bps + 0.5 * inst) : inst;
+    if (!silent_saturated)
+      w.rate_bps = (w.rate_bps > 0.0) ? (0.5 * w.rate_bps + 0.5 * inst) : inst;
     w.fold_bytes = 0;
     w.last_fold_ns = now_ns;
   }

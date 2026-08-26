@@ -786,14 +786,14 @@ int run_client(const Args& args) {
     // Data confirmed delivered: no longer need to retransmit.
     uint64_t acked_bytes = 0;
     for (auto it_u = unacked_sends.begin(); it_u != unacked_sends.end() && it_u->first <= acked_id; ) {
-      acked_bytes += it_u->second.data.size();
+      acked_bytes += it_u->second.wire_cost();  // wire cost: the rate estimate prices capacity
       it_u = unacked_sends.erase(it_u);
     }
     // ACK-clocked delivered-rate estimate for the c2s send window (see RateWindow in
     // net_util.h): when the window has closed the pump there is nothing new to ACK, so the
     // rate holds rather than spiralling down.
     uint64_t outstanding_after = 0;
-    for (const auto& [uid2, ui2] : unacked_sends) outstanding_after += ui2.data.size();
+    for (const auto& [uid2, ui2] : unacked_sends) outstanding_after += ui2.wire_cost();
     rate_window_on_ack(c2s_window, acked_bytes, recv_time, outstanding_after,
                        get_window_base_rtt_ns());
   };
@@ -953,7 +953,7 @@ int run_client(const Args& args) {
     // are never gated. The window always opens when empty, so one oversized group can't
     // deadlock the stream.
     uint64_t c2s_outstanding = 0;
-    for (const auto& [uid, ui] : unacked_sends) c2s_outstanding += ui.data.size();
+    for (const auto& [uid, ui] : unacked_sends) c2s_outstanding += ui.wire_cost();
     while (stdin_buf.size() >= effective_max_packet && !carriers.empty() &&
            rate_window_open(c2s_outstanding, c2s_window, get_window_base_rtt_ns())) {
       const size_t block_size = effective_max_packet;
@@ -1017,6 +1017,7 @@ int run_client(const Args& args) {
       {
         UnackedItem& ui = unacked_sends[next_send_id];
         ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
+        ui.wire_bytes = num_shards * block_size;  // wire cost: all n shards
         ui.n = n;
         ui.k = static_cast<unsigned>(k);
         ui.block_size = static_cast<uint16_t>(block_size);
@@ -1026,7 +1027,7 @@ int run_client(const Args& args) {
           ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
       }
       next_send_id++;
-      c2s_outstanding += k * block_size;  // the window gate re-checks against this
+      c2s_outstanding += num_shards * block_size;  // wire cost; RS wire_bytes set below
       if (dbg.f && unacked_sends.size() > 500 && next_send_id % 100 == 0)
         dbglogf(dbg, "[pump-grow t=%llu unacked=%zu next_send_id=%llu k=%u block=%zu outstanding_kb=%zu cap_kb=%zu rate_kbps=%.0f]\n",
                 (unsigned long long)(now_ns()/1000000ULL), unacked_sends.size(),
@@ -1038,9 +1039,20 @@ int run_client(const Args& args) {
       stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + k * block_size);
     }
     // Sub-block remainder → SMALL, held up to --max-delay so it can coalesce into a block.
+    // SMALL sends must count toward the send window at WIRE cost (payload x copies):
+    // unacked otherwise holds one logical copy while Nx bytes go on the wire, and a
+    // high-rate small-packet producer (60 Hz redraw stream ≈ 22 KB/s app × ~9 copies
+    // ≈ 200 KB/s of wire traffic) can then queue duplicated bytes past the window
+    // forever — measured in the small-storm scenario: ~15× overhead, a scheduler queue
+    // growing to ~9 MB in 60 s, frame latency p95 ~20 s.  Gated: while the window is
+    // saturated, hold sub-block bytes in stdin_buf (real backpressure on the app).
     if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
       if (stdin_partial_since_ns == 0) stdin_partial_since_ns = now_ns();
-      if (max_delay_ns == 0 || now_ns() - stdin_partial_since_ns >= max_delay_ns) {
+      const unsigned small_wire_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()),
+                                                               effective_small_packet_redundancy));
+      const bool small_gate_closed = !rate_window_open(c2s_outstanding + stdin_buf.size() * small_wire_copies,
+                                                       c2s_window, get_window_base_rtt_ns());
+      if ((max_delay_ns == 0 || now_ns() - stdin_partial_since_ns >= max_delay_ns) && !small_gate_closed) {
         size_t chunk = stdin_buf.size();
         const unsigned n_copies = std::max(1u, std::min(static_cast<unsigned>(carriers.size()),
                                                         effective_small_packet_redundancy));
@@ -1063,6 +1075,8 @@ int run_client(const Args& args) {
         if (!carriers.empty())
           next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
         c2s_packets_sent_window += n_copies;
+        c2s_outstanding += chunk * n_copies;  // window accounting at WIRE cost
+        ui.wire_bytes = chunk * n_copies;
         if (n_copies > 1) next_send_id++;
         stdin_buf.clear();
         stdin_partial_since_ns = 0;
@@ -1897,7 +1911,7 @@ int run_client(const Args& args) {
         // is only meaningful while the window is open (real packet loss with spare
         // capacity), which is exactly when the flood-latency sim pins the cap closed.
         uint64_t c2s_outstanding_for_gate = 0;
-        for (const auto& [uid, ui] : unacked_sends) c2s_outstanding_for_gate += ui.data.size();
+        for (const auto& [uid, ui] : unacked_sends) c2s_outstanding_for_gate += ui.wire_cost();
         const bool window_saturated = server_s2c_window_saturated
             || (c2s_outstanding_for_gate >= rate_window_cap(c2s_window, get_window_base_rtt_ns()) * 3 / 4);
         bool load_pressure = !window_saturated
