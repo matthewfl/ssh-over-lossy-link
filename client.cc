@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <string>
 #include <vector>
+#include <poll.h>
 #include <sys/epoll.h>
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -163,12 +164,46 @@ std::string launch_server(const Args& args) {
   close(pipefd[1]);
   std::string path;
   char buf[512];
-  ssize_t n;
-  while (path.find('\n') == std::string::npos && (n = read(pipefd[0], buf, sizeof buf)) > 0)
-    path.append(buf, buf + n);
+  // Bounded startup handshake: poll (never a bare blocking read) with a deadline
+  // derived from the SSH ConnectTimeout (default 30 s; its remote-side server
+  // spawn and socket-path print add slack). Without this, a stalled launch would
+  // block forever here — and with the liveness watchdog armed earlier it would
+  // FALSE-ABORT a merely-slow legitimate connect (35 s > 30 s stall threshold).
+  const unsigned launch_timeout_sec = std::max(2u * args.config.connect_timeout_sec + 15u, 60u);
+  const uint64_t deadline_ns = now_ns() + static_cast<uint64_t>(launch_timeout_sec) * 1000000000ULL;
+  while (path.find('\n') == std::string::npos) {
+    loop_watchdog_tick();   // keep the backstop quiet: this loop makes progress checks
+    struct pollfd pfd{pipefd[0], POLLIN, 0};
+    int pr = poll(&pfd, 1, 1000);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) {          // 1 s tick: no data yet — check the deadline
+      if (now_ns() >= deadline_ns) {
+        std::fprintf(stderr, "ssh-oll: server launch timed out after %us (ssh child pid %d still running; killing it)\n",
+                     launch_timeout_sec, (int)pid);
+        kill(pid, SIGKILL);
+        waitpid(pid, nullptr, 0);
+        close(pipefd[0]);
+        return {};
+      }
+      continue;
+    }
+    ssize_t n = read(pipefd[0], buf, sizeof buf);
+    if (n <= 0) break;     // EOF or error: the ssh child finished/failed
+    path.append(buf, n > 0 ? buf + n : buf);
+  }
   close(pipefd[0]);
   int status = 0;
-  waitpid(pid, &status, 0);
+  // Child already exited (we saw EOF) or is a zombie; reap without unbounded wait.
+  for (int i = 0; i < 20 && waitpid(pid, &status, WNOHANG) == 0; ++i)
+    usleep(100000);
+  if (status == 0 && waitpid(pid, &status, WNOHANG) == 0) {
+    // Still running unexpectedly (pipe EOF without child exit): kill it.
+    kill(pid, SIGTERM);
+    waitpid(pid, &status, 0);
+  }
   while (path.back() == '\n' || path.back() == '\r')
     path.pop_back();
   return path;
