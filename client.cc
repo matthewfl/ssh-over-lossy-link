@@ -227,6 +227,11 @@ int run_client(const Args& args) {
   std::map<unsigned, pid_t> ssh_idx_to_pid;  // SSH slot index -> PID
   std::vector<pid_t> pids_to_reap;           // SIGTERMed but not yet waitpid'd
 
+  // Arm the liveness watchdog BEFORE launch_server: its blocking pipe read + waitpid
+  // precede the main loop, and a silent stall there must not hang forever either.
+  // (Re-arming later keeps the same itimer; the log fd only gets stamped in below.)
+  arm_loop_watchdog(-1);
+
   if (!args.unix_socket_connection.empty()) {
     socket_path = args.unix_socket_connection;
   } else {
@@ -492,10 +497,11 @@ int run_client(const Args& args) {
     dbg = fopen(dbg_path, "w");
   }
 
-  // Liveness watchdog: the main loop is expected to tick at the 500 ms epoll
-  // timeout cadence EVEN WHEN REDUCED TO ZERO CARRIERS (arg noted hang). If any
-  // iteration stalls >30 s inside a syscall or loop, abort loudly instead of
-  // freezing silently. Disarmed at the end of run_client before blocking cleanup.
+  // Liveness watchdog (also armed before launch_server above): the main loop is
+  // expected to tick at the 500 ms epoll timeout cadence EVEN WHEN REDUCED TO ZERO
+  // CARRIERS (arg noted hang). If any iteration stalls >30 s inside a syscall or
+  // loop, abort loudly instead of freezing silently. Disarmed at the end of
+  // run_client before blocking cleanup.
   arm_loop_watchdog(dbg ? fileno(dbg) : -1);
 
   // Test hook (harness watchdog scenario): SSHOLL_TEST_HANG_AFTER_SEC=N makes the
