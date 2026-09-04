@@ -2,30 +2,115 @@
 #define SSH_OLL_NET_UTIL_H
 
 // Small shared utilities used by both the client and the server: a monotonic clock,
-// RTT percentile / timeout scaling, and the unacked-retransmit buffer entry. These were
+// RTT percentile / timeout scaling, the unacked-retransmit buffer entry, the main-loop
+// liveness watchdog, and a bounded (non-blocking) child-reap helper. These were
 // previously duplicated (and at risk of drifting) in client.cc and server.cc.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cstdarg>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <set>
 #include <vector>
+#include <signal.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 namespace ssholl {
 
 // ---------------------------------------------------------------------------
-// Bounded debug logging
+// Bounded debug logging (rate gates only — no caps, no rotation)
 // ---------------------------------------------------------------------------
 // Production incident (2026-08-21): a spam path printed on every event-loop pass
-// and the server debug log reached 29 GB in ~2 h. Every debug write now goes through
+// and the server debug log reached 29 GB in ~2 h. Policy: don't write junk in the
+// first place; known per-pass spam sites are gated to 1/s via this helper.
 inline bool dbg_rate_allow(uint64_t& last_ns, uint64_t now_ns_v, uint64_t min_interval_ns) {
   if (last_ns != 0 && now_ns_v - last_ns < min_interval_ns) return false;
   last_ns = now_ns_v;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Main-loop liveness watchdog (async-signal-safe abort on hang)
+// ---------------------------------------------------------------------------
+// Serial event loops must never go silent: every iteration is expected to complete
+// within ~500 ms (the epoll timeout cap), so if the top-of-loop tick stops updating
+// for kLoopWatchdogMs milliseconds, something is blocked inside a syscall or an
+// accidental infinite loop. Rather than freeze silently (production incident
+// 2026-09-04: client hung during a bulk upload on macOS), the watchdog writes a
+// marker line to stderr (+ the debug log fd, if armed with one) and calls abort(),
+// producing a stack trace / crash report at the stuck site on any platform.
+//
+// The SIGALRM handler must stay async-signal-safe: only clock_gettime-family reads,
+// write(), and abort() are used — no fprintf/malloc.
+inline constexpr uint64_t kLoopWatchdogNs = 30000000000ULL;  // 30 s of loop silence
+inline constexpr int kLoopWatchdogPollSeconds = 5;           // itimer cadence
+
+namespace watchdog_detail {
+inline volatile sig_atomic_t g_tick_seen = 0;  // stamped by loop iterations (seconds)
+inline int g_log_fd = -1;                       // raw debug-log fd for async-safe write
+inline uint64_t g_stall_seconds = 30;           // configurable for tests
+
+inline uint64_t now_seconds() {
+  struct timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec);
+}
+
+inline void handler(int) {
+  const uint64_t now = now_seconds();
+  const uint64_t last = static_cast<uint64_t>(g_tick_seen);
+  if (last != 0 && now - last > g_stall_seconds) {
+    static const char msg[] =
+        "[loop-watchdog-fired: main loop made no progress; aborting (see stderr)\n";
+    ssize_t w = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    if (g_log_fd >= 0) w = ::write(g_log_fd, msg, sizeof(msg) - 1);
+    (void)w;
+    ::abort();
+  }
+}
+}  // namespace watchdog_detail
+
+// Stamp the current time as loop progress. Call once per event-loop iteration.
+inline void loop_watchdog_tick() {
+  using namespace watchdog_detail;
+  g_tick_seen = static_cast<sig_atomic_t>(now_seconds());
+}
+
+// Arm the watchdog: an itimer fires the handler every kLoopWatchdogPollSeconds.
+// log_fd (optional) receives the abort marker via async-signal-safe write().
+// Test hook: SSHOLL_WATCHDOG_SEC overrides the 30 s stall threshold.
+inline void arm_loop_watchdog(int log_fd = -1) {
+  using namespace watchdog_detail;
+  g_log_fd = log_fd;
+  if (const char* e = getenv("SSHOLL_WATCHDOG_SEC")) {
+    long v = atol(e);
+    if (v >= 1) g_stall_seconds = static_cast<uint64_t>(v);
+  }
+  g_tick_seen = static_cast<sig_atomic_t>(now_seconds());
+  struct sigaction sa{};
+  sa.sa_handler = handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGALRM, &sa, nullptr);
+  struct itimerval tv{};
+  tv.it_interval.tv_sec = kLoopWatchdogPollSeconds;
+  tv.it_value.tv_sec = kLoopWatchdogPollSeconds;
+  setitimer(ITIMER_REAL, &tv, nullptr);
+}
+
+// Disarm before slow/intentionally-blocking shutdown cleanup (waitpid loops etc).
+inline void disarm_loop_watchdog() {
+  struct itimerval tv{};
+  setitimer(ITIMER_REAL, &tv, nullptr);
 }
 
 // Monotonic clock in nanoseconds (steady_clock).

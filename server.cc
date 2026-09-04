@@ -154,6 +154,9 @@ int run_server(const Args& args) {
     snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-server-%d.log", (int)getpid());
     dbg = fopen(dbg_path, "w");
   }
+  // Liveness watchdog (see client.cc): abort instead of hanging silently if the
+  // single-threaded loop fails to iterate for >30 s.
+  arm_loop_watchdog(dbg ? fileno(dbg) : -1);
 
   int epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd < 0) {
@@ -707,6 +710,7 @@ int run_server(const Args& args) {
   bool running = true;
 
   while (running) {
+    loop_watchdog_tick();
     // 500ms bound ensures retransmit/ping checks run promptly even when carriers are idle.
     // When a backend remainder is being held for coalescing (--max-delay), wake sooner so
     // it flushes on time instead of waiting a full poll cycle.

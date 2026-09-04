@@ -741,6 +741,20 @@ run_test "small-pkt-storm-256kbps" \
     --assert-max-recovery-latency 5000 \
     --extra-client-args --max-connections 120
 
+# Watchdog: inject a false hang into the client's main loop (env hook) and require
+# the liveness watchdog to abort loudly instead of freezing silently (motivation:
+# the 2026-09-04 macOS client freeze at ~0% CPU, zero further prints, during a
+# bulk upload). A pre-fix binary ignores the env hook and keeps running, so this
+# test FAILs via timeout on old builds and PASSes only with the watchdog.
+run_test "loop-watchdog-hang-abort" \
+    --init-latency-override 0.05 \
+    --scenario-watchdog-hang \
+    --watchdog-hang-after-s 3 \
+    --watchdog-abort-timeout-s 25 \
+    --latency-ms 5 --connections 3 \
+    --packet-size 100 --payload-size 100 \
+    --client-debug
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"

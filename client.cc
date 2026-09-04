@@ -492,6 +492,21 @@ int run_client(const Args& args) {
     dbg = fopen(dbg_path, "w");
   }
 
+  // Liveness watchdog: the main loop is expected to tick at the 500 ms epoll
+  // timeout cadence EVEN WHEN REDUCED TO ZERO CARRIERS (arg noted hang). If any
+  // iteration stalls >30 s inside a syscall or loop, abort loudly instead of
+  // freezing silently. Disarmed at the end of run_client before blocking cleanup.
+  arm_loop_watchdog(dbg ? fileno(dbg) : -1);
+
+  // Test hook (harness watchdog scenario): SSHOLL_TEST_HANG_AFTER_SEC=N makes the
+  // loop block forever after N seconds, simulating a stuck syscall. The watchdog
+  // (SSHOLL_WATCHDOG_SEC shortens the threshold) must fire and abort.
+  const long test_hang_after_sec = [] {
+    const char* e = getenv("SSHOLL_TEST_HANG_AFTER_SEC");
+    return e ? atol(e) : 0;
+  }();
+  const uint64_t test_hang_start_ns = now_ns();
+
   struct epoll_event ev{};
 
   // Maps each carrier fd to its SSH directory index (SSH mode only).
@@ -1084,6 +1099,12 @@ int run_client(const Args& args) {
 
   while (running) {
     if (g_shutdown_requested) break;
+    if (test_hang_after_sec > 0 && now_ns() - test_hang_start_ns > static_cast<uint64_t>(test_hang_after_sec) * 1000000000ULL) {
+      // Simulated stuck syscall: never return (watchdog must fire).
+      if (dbg) { fprintf(dbg, "[test-hang-injected: blocking loop now]\n"); fflush(dbg); }
+      for (;;) ::sleep(3600);
+    }
+    loop_watchdog_tick();
 
     // Bound epoll_wait so we can run periodic tasks (ping, inactivity check, RS drain)
     // promptly even when the link is idle.  500 ms ensures carrier death is detected
@@ -2372,14 +2393,26 @@ int run_client(const Args& args) {
     // Direct Unix socket mode: no SSH processes or client_dir to clean up
   } else {
     // Kill all remaining SSH processes (those not yet killed by remove_carrier).
+    // Bounded (non-blocking) reaps: an un-reapable child must never stall
+    // teardown — escalate to SIGKILL after ~2 s and keep going.
     for (auto& [_, p] : ssh_idx_to_pid)
       kill(p, SIGTERM);
-    // Reap previously-killed-but-not-yet-waited processes.
+    disarm_loop_watchdog();   // WNOHANG poll loops below are bounded by design
+    auto reap_bounded = [](pid_t p) {
+      for (int i = 0; i < 20; ++i) {
+        if (waitpid(p, nullptr, WNOHANG) != 0) return;
+        usleep(100000);
+      }
+      kill(p, SIGKILL);
+      for (int i = 0; i < 20; ++i) {
+        if (waitpid(p, nullptr, WNOHANG) != 0) return;
+        usleep(100000);
+      }  // give up after ~4 s total; a stuck reap must not freeze shutdown
+    };
     for (pid_t p : pids_to_reap)
-      waitpid(p, nullptr, 0);
-    // Reap the freshly-killed ones.
+      reap_bounded(p);
     for (auto& [_, p] : ssh_idx_to_pid)
-      waitpid(p, nullptr, 0);
+      reap_bounded(p);
     remove_client_dir(client_dir);
   }
   if (dbg) fclose(dbg);

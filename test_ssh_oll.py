@@ -1226,6 +1226,81 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
 
 # ---------------------------------------------------------------------------
+# Main-loop watchdog test (hang -> abort instead of silent freeze)
+# ---------------------------------------------------------------------------
+
+def _run_watchdog_hang(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
+    """Watchdog scenario: inject a false hang into the client loop and require
+    the liveness watchdog to abort the process loudly.
+
+    Production incident (2026-09-04, macOS): the client froze at ~0% CPU during
+    a bulk upload with zero further debug prints — a blocked syscall the Linux
+    harness can't reproduce. The defense: a process-wide liveness watchdog that
+    writes a marker and calls abort() if the main loop makes no progress for a
+    configurable stall window (30 s in production).
+
+    Injection: the client reads SSHOLL_TEST_HANG_AFTER_SEC=<n> from its env and
+    blocks forever inside the loop after n seconds. SSHOLL_WATCHDOG_SEC=<m>
+    shortens the watchdog threshold. Pre-fix binaries (no watchdog) must time
+    out here (client keeps running); post-fix binaries abort with the marker.
+
+    PASS criteria: client aborts with the loop-watchdog marker within the
+    watchdog bound."""
+    deadline = time.perf_counter() + max(30.0, args.watchdog_abort_timeout_s)
+    abort_seen = False
+    hang_inject = args.watchdog_hang_after_s
+    print(f"[watchdog] waiting for client to hang (~{hang_inject}s) then abort via watchdog...")
+    started = time.perf_counter()
+    while time.perf_counter() < deadline:
+        rc = client_proc.poll()
+        if rc is not None:
+            abort_seen = True
+            break
+        time.sleep(0.25)
+    failures = 0
+    marker_sources = []
+    if abort_seen:
+        try:
+            _, serr = client_proc.communicate(timeout=5)
+            marker_sources.append(serr.decode("utf-8", "replace"))
+        except Exception:
+            pass
+    client_log = f"/tmp/ssh-oll-client-{client_proc.pid}.log"
+    try:
+        with open(client_log) as f:
+            marker_sources.append(f.read())
+    except OSError:
+        pass
+    marker_ok = any("[loop-watchdog-fired" in s for s in marker_sources)
+    # Teardown regardless of outcome (a pre-fix binary is still running here).
+    try:
+        client_proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        client_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        client_proc.kill()
+        client_proc.wait(timeout=5)
+    if abort_seen:
+        after = time.perf_counter() - started
+        print(f"watchdog: client aborted (rc={client_proc.returncode}) "
+              f"marker={'present' if marker_ok else 'MISSING'} at ~{after:.1f}s (inject at ~{hang_inject}s)")
+    else:
+        print(f"watchdog: client DID NOT abort within {args.watchdog_abort_timeout_s}s "
+              f"(hang injected at ~{hang_inject}s)")
+    if not abort_seen:
+        failures += 1
+    if abort_seen and not marker_ok:
+        failures += 1
+    if failures:
+        print("FAIL: loop watchdog did not abort a hung client")
+    else:
+        print("TEST PASSED: loop watchdog aborted the hung client with the marker.")
+    return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------
 # Small-packet storm test (interactive redraw flood)
 # ---------------------------------------------------------------------------
 
@@ -2342,6 +2417,24 @@ def main():
              "wire overhead (wire bytes / app bytes). Guards the duplication-feedback spiral.",
     )
     parser.add_argument(
+        "--scenario-watchdog-hang",
+        action="store_true",
+        default=False,
+        help=("Watchdog scenario: inject a false hang into the client loop (via "
+              "SSHOLL_TEST_HANG_AFTER_SEC) and require the liveness watchdog to abort the "
+              "client with the loop-watchdog marker. Pre-fix binaries must time out here."),
+    )
+    parser.add_argument("--watchdog-hang-after-s", type=float, default=3.0,
+                        help="In --scenario-watchdog-hang: seconds of normal operation before the hang injection.")
+    parser.add_argument("--watchdog-abort-timeout-s", type=float, default=20.0,
+                        help="In --scenario-watchdog-hang: deadline for the watchdog abort.")
+    parser.add_argument(
+        "--client-env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Extra environment variable for the client process (repeatable).")
+    parser.add_argument(
         "--small-storm-hz",
         type=float,
         default=30.0,
@@ -2738,11 +2831,24 @@ def main():
         client_cmd += ["--debug"]
     if args.extra_client_args:
         client_cmd += args.extra_client_args
+    client_env_list = list(getattr(args, "client_env", []) or [])
+    if getattr(args, "scenario_watchdog_hang", False):
+        # Inject the hang + shorten the watchdog threshold via client-side env
+        # hooks (must happen BEFORE the client process is spawned below).
+        client_env_list += [
+            f"SSHOLL_TEST_HANG_AFTER_SEC={int(args.watchdog_hang_after_s)}",
+            "SSHOLL_WATCHDOG_SEC=3",
+        ]
+    client_env = dict(os.environ)
+    for kv in client_env_list:
+        k, _, v = kv.partition("=")
+        client_env[k] = v
     client_proc = subprocess.Popen(
         client_cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=client_env,
     )
 
     # Wait for TCP backend connection (server connects when first data flows).
@@ -2834,6 +2940,14 @@ def main():
             rc = (rc or 0) | check_debug_log_volume(args.assert_max_debug_log_kb, client_proc.pid)
         return rc
 
+    if getattr(args, "scenario_watchdog_hang", False):
+        return _finalize(_run_watchdog_hang(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+        ))
     if getattr(args, "scenario_bw_flood", False):
         return _finalize(_run_bw_flood(
             client_proc,
