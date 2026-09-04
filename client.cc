@@ -200,9 +200,16 @@ std::string launch_server(const Args& args) {
   for (int i = 0; i < 20 && waitpid(pid, &status, WNOHANG) == 0; ++i)
     usleep(100000);
   if (status == 0 && waitpid(pid, &status, WNOHANG) == 0) {
-    // Still running unexpectedly (pipe EOF without child exit): kill it.
+    // Still running unexpectedly (pipe EOF without child exit): kill it. SIGKILL
+    // escalation keeps even this wait bounded (a wedged ssh ignoring SIGTERM would
+    // otherwise block startup-teardown forever).
     kill(pid, SIGTERM);
-    waitpid(pid, &status, 0);
+    for (int i = 0; i < 20 && waitpid(pid, &status, WNOHANG) == 0; ++i)
+      usleep(100000);
+    if (waitpid(pid, &status, WNOHANG) == 0) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);   // kernel guarantees a SIGKILLed child reaps promptly
+    }
   }
   while (path.back() == '\n' || path.back() == '\r')
     path.pop_back();
@@ -290,7 +297,10 @@ int run_client(const Args& args) {
       if (pid < 0) {
         std::perror("ssh-oll: fork");
         for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
-        for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
+        for (auto& [_, p] : ssh_idx_to_pid) {  // bounded reap, then SIGKILL fallback
+          for (int i = 0; i < 20 && waitpid(p, nullptr, WNOHANG) == 0; ++i) usleep(100000);
+          if (waitpid(p, nullptr, WNOHANG) == 0) { kill(p, SIGKILL); waitpid(p, nullptr, 0); }
+        }
         remove_client_dir(client_dir);
         return 1;
       }
@@ -354,7 +364,10 @@ int run_client(const Args& args) {
     std::perror("ssh-oll: epoll_create1");
     if (args.unix_socket_connection.empty()) {
       for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
-      for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
+      for (auto& [_, p] : ssh_idx_to_pid) {  // bounded reap, then SIGKILL fallback
+        for (int i = 0; i < 20 && waitpid(p, nullptr, WNOHANG) == 0; ++i) usleep(100000);
+        if (waitpid(p, nullptr, WNOHANG) == 0) { kill(p, SIGKILL); waitpid(p, nullptr, 0); }
+      }
       remove_client_dir(client_dir);
     }
     return 1;
@@ -588,7 +601,10 @@ int run_client(const Args& args) {
     close(epfd);
     if (args.unix_socket_connection.empty()) {
       for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
-      for (auto& [_, p] : ssh_idx_to_pid) waitpid(p, nullptr, 0);
+      for (auto& [_, p] : ssh_idx_to_pid) {  // bounded reap, then SIGKILL fallback
+        for (int i = 0; i < 20 && waitpid(p, nullptr, WNOHANG) == 0; ++i) usleep(100000);
+        if (waitpid(p, nullptr, WNOHANG) == 0) { kill(p, SIGKILL); waitpid(p, nullptr, 0); }
+      }
       remove_client_dir(client_dir);
     }
     return 1;
