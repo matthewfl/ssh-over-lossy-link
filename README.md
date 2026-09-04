@@ -190,6 +190,10 @@ Security is not a primary focus of this layer: the payload is already an SSH ses
 
 The implementation uses **epoll** (Linux) or **epoll-shim** (macOS, kqueue-based). Supported platforms: Linux (native epoll), macOS (via [epoll-shim](https://github.com/jiixyj/epoll-shim), install with `brew install epoll-shim`). Dependencies include a Reed–Solomon (erasure coding) library (vendored); epoll-shim required on macOS.
 
+### Liveness watchdog (hang diagnosis)
+
+Both client and server arm a watchdog before their event loop: if the main loop makes no progress for **30 s** (e.g. it is stuck inside a blocking syscall), the process emits the marker line `[loop-watchdog-fired: main loop made no progress; aborting]` to stderr (and the `--debug` log) and then aborts, producing a platform crash report with the stuck stack. On macOS the report is in `~/Library/Logs/DiagnosticReports/ssh-oll-*.ips` — that stack pinpoints the blocked syscall. The threshold can be overridden (including in tests) with the environment variable `SSHOLL_WATCHDOG_SEC` (seconds, >= 1). If a freeze ever recurs, send the marker line plus the crash report — it names the exact blocked frame. All blocking syscalls in the client are themselves bounded with escalation (SIGTERM -> 2 s poll -> SIGKILL) or watchdog-covered; nothing in the codebase can idle-spin for more than the watchdog window without crashing loudly.
+
 ## Packet format (wire protocol)
 
 ```
