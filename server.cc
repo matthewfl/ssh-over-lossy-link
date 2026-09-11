@@ -715,7 +715,16 @@ int run_server(const Args& args) {
     // When a backend remainder is being held for coalescing (--max-delay), wake sooner so
     // it flushes on time instead of waiting a full poll cycle.
     int poll_timeout_ms = 500;
-    if (backend_partial_since_ns != 0 && runtime_max_delay_ns > 0) {
+    // The --max-delay shortcut only matters while a flush is POSSIBLE: the
+    // remainder-hold block (which owns and resets backend_partial_since_ns) is
+    // gated on !carriers.empty(). Once every carrier dies the stamp goes stale
+    // forever, and an unguarded shortcut would compute remaining_ms=0 on every
+    // pass — a 100%-CPU epoll busy-loop for the whole reconnect window
+    // (2026-09-11 production incident: server spun at 100% CPU ~10 min after
+    // the client crashed; pre-fix repro measured 99-101% vs ~0% post-fix).
+    // When a carrier reconnects, the pump re-enters and a stale stamp flushes
+    // immediately (elapsed >= max_delay), so no data is delayed by the guard.
+    if (backend_partial_since_ns != 0 && runtime_max_delay_ns > 0 && !carriers.empty()) {
       uint64_t elapsed = now_ns() - backend_partial_since_ns;
       uint64_t remaining_ms = (runtime_max_delay_ns > elapsed) ? ((runtime_max_delay_ns - elapsed) / 1000000ULL + 1) : 0;
       if (static_cast<int>(remaining_ms) < poll_timeout_ms) poll_timeout_ms = static_cast<int>(remaining_ms);

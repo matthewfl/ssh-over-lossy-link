@@ -1179,8 +1179,12 @@ int run_client(const Args& args) {
         epoll_timeout_ms = static_cast<int>((floor_interval - elapsed) / 1000000ULL + 1);
     }
     // If a sub-block remainder is being held for coalescing (--max-delay), wake in time
-    // to flush it rather than waiting a full poll cycle.
-    if (stdin_partial_since_ns != 0 && max_delay_ns > 0) {
+    // to flush it rather than waiting a full poll cycle. Guard on !carriers.empty():
+    // the pump's remainder-hold block (which owns and resets stdin_partial_since_ns)
+    // is itself carrier-gated, so with every carrier dead the stamp is stale and an
+    // unguarded shortcut would zero the timeout forever — the same 100%-CPU
+    // reconnect-wait spin fixed on the server side (2026-09-11 incident).
+    if (stdin_partial_since_ns != 0 && max_delay_ns > 0 && !carriers.empty()) {
       uint64_t elapsed = now_ns() - stdin_partial_since_ns;
       uint64_t remaining_ms = (max_delay_ns > elapsed) ? ((max_delay_ns - elapsed) / 1000000ULL + 1) : 0;
       if (static_cast<int>(remaining_ms) < epoll_timeout_ms) epoll_timeout_ms = static_cast<int>(remaining_ms);

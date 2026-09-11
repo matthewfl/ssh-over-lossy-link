@@ -30,6 +30,7 @@ import os
 import queue
 import random
 import re
+import signal
 import select
 import socket
 import string
@@ -1301,6 +1302,137 @@ def _run_watchdog_hang(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
 
 # ---------------------------------------------------------------------------
+# Client-crash idle-CPU scenario (server must idle while waiting for reconnect)
+# ---------------------------------------------------------------------------
+
+def _run_client_crash_idle(client_proc, tcp_conn, stop_proxy, tcp_listen, args, server_daemon_pid=None):
+    """Crash the client mid-session and require the SERVER to idle at low CPU
+    while it waits for a reconnect.
+
+    Production incident (2026-09-11): after the client died, the server spun at
+    100% CPU for its whole reconnect window (~10 min at --reconnect-timeout 600).
+    Root cause: a sub-block remainder held for --max-delay coalescing stamps
+    backend_partial_since_ns; the only reset of that stamp lives inside the pump
+    block, which is gated on !carriers.empty(); once every carrier dies the stamp
+    goes stale forever, the poll_timeout_ms shortcut computes remaining_ms=0 on
+    every pass, and epoll_wait returns instantly in a hot loop. (Measured
+    pre-fix: 100-102 ticks/s. The 2026-08-21 29 GB debug log was this same spin,
+    back when the retransmit-needed print was still ungated.)
+
+    Deterministic trigger: the server runs with --max-delay ~5 s; one odd-sized s2c
+    chunk is coalescing-held, the client is SIGKILLed mid-hold (before the flush
+    could ever fire), and the hold window then elapses with every carrier dead —
+    the stale stamp is guaranteed and the pre-fix poll-timeout shortcut yields 0
+    from that moment on. No 1 ms exit-tail race.
+
+    PASS: every 1 s server-CPU sample < --assert-server-idle-cpu-pct (default
+    30), the server stays alive through the sampling window (it is *supposed*
+    to wait for reconnect), and it exits cleanly once the backend closes."""
+    failures = []
+    # 1. One odd-sized s2c chunk (< block_size) parks in backend_read_buf as a
+    #    held partial; with the scenario's huge --max-delay it stays held.
+    probe = bytes(range(256)) * 2  # 512 bytes
+    tcp_conn.sendall(probe)
+    time.sleep(args.client_crash_hold_s)
+    # 2. Crash the client — no clean shutdown, like a real crash. This must land
+    #    INSIDE the hold window (before --max-delay elapses) so the partial stamp
+    #    is live at death; afterwards nothing can reset it (pump block is
+    #    carrier-gated) and the hold window expiring turns the stamp stale.
+    client_proc.kill()
+    try:
+        client_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    # Wait past the hold window: elapsed >= max_delay is what makes the stale
+    # stamp compute remaining_ms=0 on every pass (the pre-fix spin).
+    hold_s = int(args.client_crash_server_max_delay_ms) / 1000.0
+    time.sleep(max(2.0, hold_s + 1.0))
+    # 3. The server daemon pid comes from the pre-spawn log-set diff in main()
+    #    (identity by recency is wrong when any other ssh-oll server is alive).
+    srv_pid = server_daemon_pid
+    if srv_pid is None:
+        print("client-crash: could not identify this run's server daemon pid "
+              "(log-set diff failed)", file=sys.stderr)
+        stop_proxy.set()
+        return 1
+    if not os.path.exists(f"/proc/{srv_pid}"):
+        print(f"client-crash: server daemon {srv_pid} died instead of waiting for reconnect",
+              file=sys.stderr)
+        stop_proxy.set()
+        return 1
+    if not os.path.exists("/proc/self/stat"):
+        # No /proc (macOS): the spin is platform-independent logic, but the CPU
+        # measurement is Linux-only. CI tolerates macOS; note and pass.
+        print("client-crash: /proc unavailable on this platform; CPU not measured (Linux-only gate)")
+        try:
+            tcp_conn.close()
+        except OSError:
+            pass
+        stop_proxy.set()
+        tcp_listen.close()
+        return 0
+
+    def cpu_ticks():
+        try:
+            with open(f"/proc/{srv_pid}/stat") as f:
+                st = f.read()
+            fields = st[st.rindex(")") + 2:].split()
+            return int(fields[11]) + int(fields[12])  # utime + stime
+        except (OSError, ValueError, IndexError):
+            return None
+
+    # 4. Sample the server's CPU while it idles waiting for a reconnect.
+    clk = os.sysconf("SC_CLK_TCK")
+    samples = []
+    for i in range(5):
+        a = cpu_ticks()
+        time.sleep(1.0)
+        b = cpu_ticks()
+        if a is None or b is None or not os.path.exists(f"/proc/{srv_pid}"):
+            failures.append(f"server daemon died during CPU sampling (sample {i})")
+            break
+        pct = (b - a) / clk * 100.0
+        samples.append(pct)
+        print(f"client-crash: server idle CPU sample {i}: {pct:.0f}%")
+    print("client-crash: server idle CPU samples: " + ", ".join(f"{s:.0f}%" for s in samples))
+    for s in samples:
+        if s >= args.assert_server_idle_cpu_pct:
+            failures.append(
+                f"server idled at {s:.0f}% CPU (>= {args.assert_server_idle_cpu_pct:.0f}%): "
+                "busy loop while waiting for reconnect")
+            break
+    # 5. Teardown: backend EOF is the server's normal exit; verify it still can.
+    try:
+        tcp_conn.close()
+    except OSError:
+        pass
+    exit_deadline = time.monotonic() + 10.0
+    exited = False
+    while time.monotonic() < exit_deadline:
+        if not os.path.exists(f"/proc/{srv_pid}"):
+            exited = True
+            break
+        time.sleep(0.25)
+    if not exited:
+        failures.append("server did not exit after backend close (stuck in reconnect wait?)")
+        try:
+            os.kill(srv_pid, signal.SIGKILL)
+        except OSError:
+            pass
+    stop_proxy.set()
+    try:
+        tcp_listen.close()
+    except OSError:
+        pass
+    if failures:
+        for msg in failures:
+            print("FAIL: " + msg, file=sys.stderr)
+        return 1
+    print("TEST PASSED: server idles at low CPU while waiting for reconnect.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Small-packet storm test (interactive redraw flood)
 # ---------------------------------------------------------------------------
 
@@ -2429,6 +2561,29 @@ def main():
     parser.add_argument("--watchdog-abort-timeout-s", type=float, default=20.0,
                         help="In --scenario-watchdog-hang: deadline for the watchdog abort.")
     parser.add_argument(
+        "--scenario-client-crash",
+        action="store_true",
+        default=False,
+        help=("Client-crash idle-CPU scenario: SIGKILL the client mid-session and require "
+              "the SERVER to idle at low CPU while waiting for a reconnect. Regression for "
+              "the 2026-09-11 production spin: a sub-block partial held for --max-delay left "
+              "a stale stamp once all carriers died, forcing poll_timeout_ms=0 and a 100%%-CPU "
+              "epoll busy-loop for the whole reconnect window. The scenario launches the "
+              "server with a huge --max-delay so the held partial at kill time is "
+              "deterministic (no 1 ms race)."),
+    )
+    parser.add_argument("--client-crash-hold-s", type=float, default=0.5,
+                        help="In --scenario-client-crash: seconds to let the server hold the "
+                             "sub-block partial before the client is killed.")
+    parser.add_argument("--assert-server-idle-cpu-pct", type=float, default=30.0,
+                        help="In --scenario-client-crash: max server CPU %% per 1 s sample while "
+                             "idling for reconnect (default 30).")
+    parser.add_argument("--client-crash-server-max-delay-ms", type=int, default=5000,
+                        help="In --scenario-client-crash: --max-delay passed to the server. The "
+                             "sub-block partial is held for this long, the client is killed "
+                             "mid-hold, and once the hold window elapses with all carriers "
+                             "dead the stale stamp must NOT zero the poll timeout.")
+    parser.add_argument(
         "--client-env",
         action="append",
         default=[],
@@ -2730,10 +2885,21 @@ def main():
         getattr(args, "assert_max_stall_ms", None) is not None or \
         getattr(args, "assert_server_adapts", False) or \
         getattr(args, "assert_server_unacked_max", None) is not None or \
-        getattr(args, "assert_max_debug_log_kb", None) is not None
+        getattr(args, "assert_max_debug_log_kb", None) is not None or \
+        getattr(args, "scenario_client_crash", False)
     _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
     if _server_debug:
         _server_cmd += ["--debug"]
+    if getattr(args, "scenario_client_crash", False):
+        # Deterministic spin trigger: with a moderate --max-delay, one odd-sized s2c
+        # chunk parks in backend_read_buf as a coalescing-held partial; the client is
+        # killed mid-hold and the hold window then elapses with all carriers dead,
+        # so the stale backend_partial_since_ns stamp is guaranteed (no 1 ms race).
+        _server_cmd += ["--max-delay", str(int(args.client_crash_server_max_delay_ms))]
+    # Snapshot existing server debug logs so we can identify THIS run's server daemon
+    # by diff (the daemon names its log /tmp/ssh-oll-server-<pid>.log). Identity by
+    # recency (newest glob) is wrong when any other ssh-oll server is alive.
+    pre_server_logs = set(glob.glob("/tmp/ssh-oll-server-*.log"))
     server_proc = subprocess.Popen(
         _server_cmd,
         stdout=subprocess.PIPE,
@@ -2742,6 +2908,14 @@ def main():
     )
     server_socket_path = server_proc.stdout.readline().strip()
     server_proc.wait(timeout=5)
+    # The daemon child opened its debug log before the parent printed the socket path,
+    # so the diff is stable here. (Only meaningful when the server runs with --debug.)
+    new_server_logs = set(glob.glob("/tmp/ssh-oll-server-*.log")) - pre_server_logs
+    server_daemon_pid = None
+    if len(new_server_logs) == 1:
+        m = re.search(r"server-(\d+)\.log$", next(iter(new_server_logs)))
+        if m:
+            server_daemon_pid = int(m.group(1))
     if not server_socket_path or not os.path.exists(server_socket_path):
         print("Failed to get server socket path or server did not create socket.", file=sys.stderr)
         if server_proc.stderr:
@@ -2829,6 +3003,11 @@ def main():
     ]
     if _client_debug:
         client_cmd += ["--debug"]
+    if getattr(args, "scenario_client_crash", False):
+        # The client is the config master: its SET_CONFIG pushes max_delay_ms to the
+        # server (overriding the server's own CLI value), so the hold window must be
+        # set on the CLIENT for the held-partial trigger to work.
+        client_cmd += ["--max-delay", str(int(args.client_crash_server_max_delay_ms))]
     if args.extra_client_args:
         client_cmd += args.extra_client_args
     client_env_list = list(getattr(args, "client_env", []) or [])
@@ -2947,6 +3126,15 @@ def main():
             stop_proxy,
             tcp_listen,
             args,
+        ))
+    if getattr(args, "scenario_client_crash", False):
+        return _finalize(_run_client_crash_idle(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+            server_daemon_pid,
         ))
     if getattr(args, "scenario_bw_flood", False):
         return _finalize(_run_bw_flood(

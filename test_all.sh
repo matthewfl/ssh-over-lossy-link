@@ -755,6 +755,22 @@ run_test "loop-watchdog-hang-abort" \
     --packet-size 100 --payload-size 100 \
     --client-debug
 
+# Client-crash idle-CPU regression (2026-09-11 incident): after the client died,
+# the server spun at 100% CPU for its whole reconnect window (~10 min in
+# production). Root cause: a sub-block partial held for --max-delay coalescing
+# left a stale backend_partial_since_ns stamp once all carriers died (its only
+# reset lives inside the carrier-gated pump block), so poll_timeout_ms computed
+# 0 forever and epoll_wait returned instantly in a hot loop. The scenario holds
+# a 5 s partial -- on the CLIENT, since SET_CONFIG is client-master and pushes
+# max_delay to the server -- kills the client mid-hold, and samples the server
+# daemon's CPU via /proc. Pre-fix: 99-101% per sample (FAIL). Post-fix: ~0%.
+run_test "client-crash-server-idle-cpu" \
+    --init-latency-override 0.05 \
+    --latency-ms 5 \
+    --connections 3 \
+    --packet-size 800 --payload-size 800 \
+    --scenario-client-crash
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"
