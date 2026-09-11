@@ -33,6 +33,7 @@ import re
 import signal
 import select
 import socket
+import struct
 import string
 import subprocess
 import sys
@@ -1354,11 +1355,16 @@ def _run_client_crash_idle(client_proc, tcp_conn, stop_proxy, tcp_listen, args, 
         def s2c_writer():
             chunk = bytes(512 * 1024)
             deadline = time.perf_counter() + bulk_s
+            # 2s socket timeout: if the server's window freezes closed mid-flood the
+            # send blocks forever; the writer must be able to exit so the teardown
+            # close() can actually deliver the connection end.
+            tcp_conn.settimeout(2.0)
             while not stop_bulk.is_set() and time.perf_counter() < deadline:
                 try:
                     tcp_conn.sendall(chunk)   # backpressures at the window cap
                 except OSError:
                     return
+            tcp_conn.settimeout(None)
         def c2s_writer():
             chunk = bytes(256 * 1024)
             deadline = time.perf_counter() + bulk_s
@@ -1457,6 +1463,15 @@ def _run_client_crash_idle(client_proc, tcp_conn, stop_proxy, tcp_listen, args, 
                 "busy loop while waiting for reconnect")
             break
     # 5. Teardown: backend EOF is the server's normal exit; verify it still can.
+    # SO_LINGER 0 makes close() abortive (RST): if the flood left undelivered data in
+    # the kernel send buffer (the server's frozen-closed window can't take it), a
+    # normal close()'s FIN would be stuck behind it forever and the server would
+    # never see the connection end — a teardown artifact, not a server defect.
+    try:
+        tcp_conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+    except OSError:
+        pass
     try:
         tcp_conn.close()
     except OSError:
