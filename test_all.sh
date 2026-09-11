@@ -771,6 +771,26 @@ run_test "client-crash-server-idle-cpu" \
     --packet-size 800 --payload-size 800 \
     --scenario-client-crash
 
+# Second spin path in the same 2026-09-11 incident class, found by re-running the
+# ORIGINAL natural repro (bulk echo transfer + client death) after the first fix:
+# on_deliver and flush_backend_pending raw-MODded the backend fd's epoll registration
+# to EPOLLIN|EPOLLOUT without updating backend_events_state, re-arming EPOLLIN while
+# the send window was saturated; the arm-dedup then skipped the re-mask forever, and
+# the perpetually-ready backend fd spun the loop at 100% CPU (measured 1.25M
+# iterations/s) for the whole reconnect window. Fix: every backend-registration
+# change goes through arm_backend (single writer), plus a self-healing mask that
+# force-MODs on every unwanted EPOLLIN event. This variant floods both directions
+# UNPACED (draining the client's stdout so its memory stays bounded), saturating the
+# s2c window so the kill freezes it saturated with no ACKs ever coming.
+# Pre-fix: 100% per sample. Post-fix: 0%.
+run_test "client-crash-server-idle-cpu-bulk" \
+    --init-latency-override 0.05 \
+    --latency-ms 5 \
+    --connections 3 \
+    --packet-size 800 --payload-size 800 \
+    --scenario-client-crash-bulk \
+    --client-crash-bulk-s 6
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "────────────────────────────────────────────────────────"

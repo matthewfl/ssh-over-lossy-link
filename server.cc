@@ -199,6 +199,16 @@ int run_server(const Args& args) {
   // up to this long so it can coalesce into a full RS block. 0 = send immediately.
   uint64_t runtime_max_delay_ns = static_cast<uint64_t>(args.config.max_delay_ms * 1000000.0f);
   uint64_t backend_partial_since_ns = 0;
+  // Event-anchored s2c saturation latch: set at the INSTANT the encode gate closes
+  // (data still pending when the send window fills). The saturation clamps in the
+  // adapt block (rs<=0.5, copies<=3) must not depend on loop PASS CADENCE: a
+  // spin-cadence loop samples the cap-touching instants constantly, while a properly
+  // event-driven loop wakes exactly when ACKs reopen the window and would otherwise
+  // NEVER observe it closed — measured on bw-flood: removing the (accidental) spin
+  // silently released the clamp, rs pinned at 2.0 (3x wire amplification), and
+  // goodput dropped ~40% while the wire stayed pinned (2026-09-11 regression found
+  // while re-validating the path-B spin fix).
+  uint64_t s2c_saturated_latch_ns = 0;
   float last_sent_rs_redundancy = -1.0f;
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
@@ -312,8 +322,13 @@ int run_server(const Args& args) {
   // call this; the periodic pump block re-arms every pass as the window opens/closes.
   auto arm_backend = [&]() {
     if (backend_fd < 0 || !backend_connected) return;
-    uint32_t want = (backend_read_wanted ? (uint32_t)EPOLLIN : 0u) |
-                    (!backend_pending.empty() ? (uint32_t)EPOLLOUT : 0u);
+    // EPOLLRDHUP is always armed: peer-EOF detection must never be gated by the
+    // send-window mask. When the window is saturated we strip EPOLLIN (backpressure),
+    // but the backend closing must still exit the reconnect wait promptly instead of
+    // lingering until the global idle timeout.
+    uint32_t want = (uint32_t)EPOLLRDHUP |
+                   (backend_read_wanted ? (uint32_t)EPOLLIN : 0u) |
+                   (!backend_pending.empty() ? (uint32_t)EPOLLOUT : 0u);
     if (want == backend_events_state) return;
     backend_events_state = want;
     ev.events = want;
@@ -325,9 +340,10 @@ int run_server(const Args& args) {
     if (backend_fd >= 0) return;
     backend_fd = connect_tcp(args.remote_hostname, args.remote_port);
     if (backend_fd < 0) return;
-    ev.events = EPOLLIN | EPOLLOUT;  // EPOLLOUT for connect completion
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;  // EPOLLOUT for connect completion
     ev.data.fd = backend_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, backend_fd, &ev);
+    backend_events_state = EPOLLIN | EPOLLOUT | EPOLLRDHUP;  // arm_backend's dedup must track this ADD
   };
 
   auto ensure_backend_connected = [&]() {
@@ -340,10 +356,9 @@ int run_server(const Args& args) {
                        (unsigned long long)(now_ns()/1000000ULL));
       int one = 1;
       setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-      ev.events = EPOLLIN;  // EPOLLOUT only when we have backend_pending data to write
-      ev.data.fd = backend_fd;
-      epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
-      backend_events_state = EPOLLIN;
+      // Route every registration change through arm_backend so the tracked
+      // backend_events_state can never diverge from the kernel's actual interest.
+      arm_backend();
     } else if (err != EINPROGRESS && err != 0) {
       if (dbg) fprintf(dbg, "[backend-connect-failed t=%llu errno=%d]\n",
                        (unsigned long long)(now_ns()/1000000ULL), err);
@@ -507,10 +522,11 @@ int run_server(const Args& args) {
       ssize_t n = write(backend_fd, front.data.data(), front.data.size());
       if (n <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          // Kernel buffer full: re-arm EPOLLOUT so we resume when space is available.
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = backend_fd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+          // Kernel buffer full: EPOLLOUT (pending is nonempty) is re-armed via arm_backend.
+          // NEVER raw-MOD EPOLLIN here — while the send window is saturated that would
+          // re-arm reads against the mask's intent and desync backend_events_state
+          // (the 2026-09-11 path-B spin: a perpetually-ready backend fd at 100% CPU).
+          arm_backend();
         } else {
           // Real write error (EPIPE, ECONNRESET, etc.): backend connection is broken.
           // Close it now so we stop trying to write on every iteration. The server
@@ -526,11 +542,9 @@ int run_server(const Args& args) {
       }
       front.data.erase(front.data.begin(), front.data.begin() + n);
       if (!front.data.empty()) {
-        // Partial write: kernel buffer accepted some bytes but not all. Re-arm EPOLLOUT
-        // so we resume writing the remainder when space is available.
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = backend_fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+        // Partial write: pending is still nonempty, so arm_backend keeps EPOLLOUT armed
+        // for the remainder. No raw MOD — see the EAGAIN path above.
+        arm_backend();
         return;
       }
       // Record the highest id written to the backend for a single coalesced cumulative ACK
@@ -542,9 +556,8 @@ int run_server(const Args& args) {
       backend_pending.pop_front();
     }
     if (backend_fd >= 0 && backend_pending.empty()) {
-      ev.events = EPOLLIN;
-      ev.data.fd = backend_fd;
-      epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
+      // Pending drained: re-derive the interest from read_wanted via arm_backend.
+      arm_backend();
     }
     // Emit the one coalesced ACK covering everything just written to the backend.
     flush_pending_ack();
@@ -554,11 +567,11 @@ int run_server(const Args& args) {
   recv_cb.on_deliver = [&](int cfd, uint64_t id, const uint8_t* data, size_t len) {
     backend_pending.push_back({id, std::vector<uint8_t>(data, data + len), cfd});
     connect_backend();
-    if (backend_fd >= 0 && backend_connected) {
-      ev.events = EPOLLIN | EPOLLOUT;
-      ev.data.fd = backend_fd;
-      epoll_ctl(epfd, EPOLL_CTL_MOD, backend_fd, &ev);
-    }
+    // EPOLLOUT for the new pending data comes from arm_backend (pending nonempty).
+    // The old raw MOD re-armed EPOLLIN too — desyncing backend_events_state while
+    // the window was saturated and feeding the 2026-09-11 path-B spin.
+    if (backend_fd >= 0 && backend_connected)
+      arm_backend();
   };
   recv_cb.on_rs_decode = [&](unsigned /*shards_received*/, unsigned /*n*/,
                               uint64_t spread_ns, uint64_t gap_final_ns) {
@@ -830,10 +843,19 @@ int run_server(const Args& args) {
           // Send window is saturated: do NOT read more. Converting the epoll interest now
           // stops a perpetually-ready readable backend from busy-spinning the event loop;
           // the producer gets real TCP backpressure instead (the whole point of the window).
+          //
+          // Self-heal: reset the tracked interest state before re-arming so arm_backend's
+          // dedup can NEVER skip this mask. If any path ever touches the backend
+          // registration without going through arm_backend (or a MOD silently fails),
+          // the tracked state could claim "already masked" while the kernel still
+          // reports EPOLLIN — and a level-triggered readable fd would then spin the
+          // whole loop at 100% CPU for the entire reconnect window (2026-09-11
+          // incident, path B: measured 1.25M loop iterations/s, ~0% post-fix).
+          backend_events_state = 0xFFFFFFFF;
           arm_backend();
-          e &= ~(uint32_t)EPOLLIN;
+          e &= ~(uint32_t)EPOLLIN;   // keep EPOLLRDHUP: EOF must still be detectable
         }
-        if (e & EPOLLIN) {
+        if (e & (EPOLLIN | EPOLLRDHUP)) {
           uint8_t buf[READ_BUF_SIZE];
           ssize_t nr = read(backend_fd, buf, sizeof buf);
           if (nr <= 0) {
@@ -1330,7 +1352,11 @@ int run_server(const Args& args) {
       // bytes from data onto overhead (observed: rs pinned at 2.0 → k=2-of-8 at n=8,
       // ~4× wire amplification, ~21 KB/s delivered where the bucket allows 256 KB/s).
       // Cap at 0.5; genuine loss then rides the retransmit path.
+      const bool s2c_window_saturated_recent =
+          (s2c_saturated_latch_ns != 0
+           && now_ns_val - s2c_saturated_latch_ns < 2 * adapt_interval_ns);
       const bool send_saturated =
+          s2c_window_saturated_recent ||
           (unacked_bytes_cache != 0
            && unacked_bytes_cache >= rate_window_cap(s2c_window, get_window_base_rtt_ns()))
           || client_c2s_window_saturated;
@@ -1555,6 +1581,12 @@ int run_server(const Args& args) {
         unacked_bytes_cache += static_cast<uint64_t>(n) * block_size;  // wire cost
         backend_read_buf.erase(backend_read_buf.begin(), backend_read_buf.begin() + k * block_size);
       }
+      // The encode gate closed mid-flight (data still pending, carriers alive): latch
+      // the cap-touching instant HERE — this pass is the only reliable observer of it.
+      // A later pass wakes on the ACK batch that reopened the window and cannot see it.
+      if (backend_read_buf.size() >= block_size && !carriers.empty() &&
+          !rate_window_open(unacked_bytes_cache, s2c_window, get_window_base_rtt_ns()))
+        s2c_saturated_latch_ns = now_ns();
       // Any sub-block remainder: send as SMALL (no RS needed for < block_size).
       // The RS loop above exits only when backend_read_buf.size() < block_size (natural
       // exit) or carriers.empty() (early exit). The explicit size check matches the
@@ -1569,6 +1601,7 @@ int run_server(const Args& args) {
         const bool small_gate_closed = !rate_window_open(
             unacked_bytes_cache + backend_read_buf.size() * runtime_small_packet_redundancy,
             s2c_window, get_window_base_rtt_ns());
+        if (small_gate_closed) s2c_saturated_latch_ns = now_ns();  // event-anchored, see decl
         if ((runtime_max_delay_ns == 0 || now_ns() - backend_partial_since_ns >= runtime_max_delay_ns)
             && !small_gate_closed) {
           size_t chunk = backend_read_buf.size();

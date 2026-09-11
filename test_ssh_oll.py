@@ -1329,24 +1329,79 @@ def _run_client_crash_idle(client_proc, tcp_conn, stop_proxy, tcp_listen, args, 
     30), the server stays alive through the sampling window (it is *supposed*
     to wait for reconnect), and it exits cleanly once the backend closes."""
     failures = []
-    # 1. One odd-sized s2c chunk (< block_size) parks in backend_read_buf as a
-    #    held partial; with the scenario's huge --max-delay it stays held.
-    probe = bytes(range(256)) * 2  # 512 bytes
-    tcp_conn.sendall(probe)
-    time.sleep(args.client_crash_hold_s)
-    # 2. Crash the client — no clean shutdown, like a real crash. This must land
-    #    INSIDE the hold window (before --max-delay elapses) so the partial stamp
-    #    is live at death; afterwards nothing can reset it (pump block is
-    #    carrier-gated) and the hold window expiring turns the stamp stale.
-    client_proc.kill()
-    try:
-        client_proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    # Wait past the hold window: elapsed >= max_delay is what makes the stale
-    # stamp compute remaining_ms=0 on every pass (the pre-fix spin).
-    hold_s = int(args.client_crash_server_max_delay_ms) / 1000.0
-    time.sleep(max(2.0, hold_s + 1.0))
+    bulk = getattr(args, "scenario_client_crash_bulk", False)
+    if bulk:
+        # Path B trigger: UNPACED bidirectional flood. Inflight s2c bytes pin at the
+        # send-window cap (the encode gate stops at cap; ACKs drain it every ~RTT
+        # and the gate refills within microseconds, so the window spends ~all its
+        # time saturated/masked), while concurrent c2s deliveries keep firing the
+        # server's raw backend-registration MODs. The kill then freezes the window
+        # saturated forever (no client -> no ACKs -> never reopens).
+        bulk_s = float(args.client_crash_bulk_s)
+        stop_bulk = threading.Event()
+        drained = [0]
+        def stdout_drainer():
+            # Keep the client's stdout_buf empty so its memory stays bounded and
+            # ACKs keep flowing (the client ACKs on delivery, not on stdout write).
+            try:
+                while not stop_bulk.is_set():
+                    d = client_proc.stdout.read1(65536)
+                    if not d:
+                        break
+                    drained[0] += len(d)
+            except (OSError, ValueError):
+                pass
+        def s2c_writer():
+            chunk = bytes(512 * 1024)
+            deadline = time.perf_counter() + bulk_s
+            while not stop_bulk.is_set() and time.perf_counter() < deadline:
+                try:
+                    tcp_conn.sendall(chunk)   # backpressures at the window cap
+                except OSError:
+                    return
+        def c2s_writer():
+            chunk = bytes(256 * 1024)
+            deadline = time.perf_counter() + bulk_s
+            while not stop_bulk.is_set() and time.perf_counter() < deadline:
+                try:
+                    client_proc.stdin.write(chunk)
+                    client_proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    return
+        th_drain = threading.Thread(target=stdout_drainer, daemon=True)
+        th_s2c = threading.Thread(target=s2c_writer, daemon=True)
+        th_c2s = threading.Thread(target=c2s_writer, daemon=True)
+        th_drain.start(); th_s2c.start(); th_c2s.start()
+        time.sleep(bulk_s)
+        stop_bulk.set()
+        client_proc.kill()
+        try:
+            client_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        for th in (th_s2c, th_c2s, th_drain):
+            th.join(timeout=3)
+        print(f"client-crash: bulk drained {drained[0] // 1024} KB from client stdout")
+        time.sleep(2.0)  # carrier EOFs propagate; server settles into its reconnect wait
+    else:
+        # Path A trigger: one odd-sized s2c chunk (< block_size) parks in backend_read_buf
+        # as a held partial; with the scenario's huge --max-delay it stays held.
+        probe = bytes(range(256)) * 2  # 512 bytes
+        tcp_conn.sendall(probe)
+        time.sleep(args.client_crash_hold_s)
+        # Crash the client — no clean shutdown, like a real crash. This must land
+        # INSIDE the hold window (before --max-delay elapses) so the partial stamp
+        # is live at death; afterwards nothing can reset it (pump block is
+        # carrier-gated) and the hold window expiring turns the stamp stale.
+        client_proc.kill()
+        try:
+            client_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        # Wait past the hold window: elapsed >= max_delay is what makes the stale
+        # stamp compute remaining_ms=0 on every pass (the pre-fix spin).
+        hold_s = int(args.client_crash_server_max_delay_ms) / 1000.0
+        time.sleep(max(2.0, hold_s + 1.0))
     # 3. The server daemon pid comes from the pre-spawn log-set diff in main()
     #    (identity by recency is wrong when any other ssh-oll server is alive).
     srv_pid = server_daemon_pid
@@ -2584,6 +2639,21 @@ def main():
                              "mid-hold, and once the hold window elapses with all carriers "
                              "dead the stale stamp must NOT zero the poll timeout.")
     parser.add_argument(
+        "--scenario-client-crash-bulk",
+        action="store_true",
+        default=False,
+        help=("Bulk variant of the client-crash scenario: saturate the s2c send window with a "
+              "paced bidirectional flood (concurrent c2s deliveries keep re-arming the backend "
+              "epoll registration), then SIGKILL the client so the window can never reopen, "
+              "and assert the server idles at low CPU. Regression gate for the second spin path "
+              "(2026-09-11): unsynced raw epoll MODs re-armed EPOLLIN while the window was "
+              "saturated, the arm-dedup then skipped the re-mask forever, and a perpetually-ready "
+              "backend fd spun the loop at 100% CPU for the whole reconnect window."),
+    )
+    parser.add_argument("--client-crash-bulk-s", type=float, default=8.0,
+                        help="In --scenario-client-crash-bulk: seconds of bidirectional flood "
+                             "before the client is killed.")
+    parser.add_argument(
         "--client-env",
         action="append",
         default=[],
@@ -2886,12 +2956,13 @@ def main():
         getattr(args, "assert_server_adapts", False) or \
         getattr(args, "assert_server_unacked_max", None) is not None or \
         getattr(args, "assert_max_debug_log_kb", None) is not None or \
-        getattr(args, "scenario_client_crash", False)
+        getattr(args, "scenario_client_crash", False) or \
+        getattr(args, "scenario_client_crash_bulk", False)
     _server_cmd = [args.ssh_oll_path, "--server", "127.0.0.1", str(args.tcp_port)]
     if _server_debug:
         _server_cmd += ["--debug"]
-    if getattr(args, "scenario_client_crash", False):
-        # Deterministic spin trigger: with a moderate --max-delay, one odd-sized s2c
+    if getattr(args, "scenario_client_crash", False) and not getattr(args, "scenario_client_crash_bulk", False):
+        # Deterministic spin trigger (path A): with a moderate --max-delay, one odd-sized s2c
         # chunk parks in backend_read_buf as a coalescing-held partial; the client is
         # killed mid-hold and the hold window then elapses with all carriers dead,
         # so the stale backend_partial_since_ns stamp is guaranteed (no 1 ms race).
@@ -2910,12 +2981,33 @@ def main():
     server_proc.wait(timeout=5)
     # The daemon child opened its debug log before the parent printed the socket path,
     # so the diff is stable here. (Only meaningful when the server runs with --debug.)
-    new_server_logs = set(glob.glob("/tmp/ssh-oll-server-*.log")) - pre_server_logs
+    # Identify THIS run's server daemon deterministically: scan /proc for the process
+    # whose cmdline is exactly our binary + --server 127.0.0.1 <our port> (the port is
+    # unique per run). Log-name diffing is not reliable: pids get reused, and an
+    # overwritten same-named log defeats a set-diff. Fall back to the log-set diff
+    # where /proc is unavailable (macOS).
     server_daemon_pid = None
-    if len(new_server_logs) == 1:
-        m = re.search(r"server-(\d+)\.log$", next(iter(new_server_logs)))
-        if m:
-            server_daemon_pid = int(m.group(1))
+    if os.path.isdir("/proc") and os.path.exists("/proc/self/cmdline"):
+        want_port = str(args.tcp_port).encode()
+        want_bin = os.path.basename(args.ssh_oll_path).encode()
+        for p in os.listdir("/proc"):
+            if not p.isdigit():
+                continue
+            try:
+                with open(f"/proc/{p}/cmdline", "rb") as f:
+                    cmd = f.read().split(b"\0")
+            except OSError:
+                continue
+            if (len(cmd) >= 4 and cmd[1] == b"--server" and cmd[2] == b"127.0.0.1"
+                    and cmd[3] == want_port and cmd[0].endswith(want_bin)):
+                server_daemon_pid = int(p)
+                break
+    if server_daemon_pid is None:
+        new_server_logs = set(glob.glob("/tmp/ssh-oll-server-*.log")) - pre_server_logs
+        if len(new_server_logs) == 1:
+            m = re.search(r"server-(\d+)\.log$", next(iter(new_server_logs)))
+            if m:
+                server_daemon_pid = int(m.group(1))
     if not server_socket_path or not os.path.exists(server_socket_path):
         print("Failed to get server socket path or server did not create socket.", file=sys.stderr)
         if server_proc.stderr:
@@ -3003,7 +3095,7 @@ def main():
     ]
     if _client_debug:
         client_cmd += ["--debug"]
-    if getattr(args, "scenario_client_crash", False):
+    if getattr(args, "scenario_client_crash", False) and not getattr(args, "scenario_client_crash_bulk", False):
         # The client is the config master: its SET_CONFIG pushes max_delay_ms to the
         # server (overriding the server's own CLI value), so the hold window must be
         # set on the CLIENT for the held-partial trigger to work.
@@ -3128,6 +3220,15 @@ def main():
             args,
         ))
     if getattr(args, "scenario_client_crash", False):
+        return _finalize(_run_client_crash_idle(
+            client_proc,
+            tcp_conn,
+            stop_proxy,
+            tcp_listen,
+            args,
+            server_daemon_pid,
+        ))
+    if getattr(args, "scenario_client_crash_bulk", False):
         return _finalize(_run_client_crash_idle(
             client_proc,
             tcp_conn,
