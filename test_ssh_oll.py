@@ -200,7 +200,8 @@ class _BucketScheduler:
         self.heap = []               # (eta, seq, conn_id, chunk)
         self.seq = 0
         self.conns = {}              # conn_id -> outgoing socket
-        self.prev_eta = time.perf_counter()
+        self.fifo_eta = time.perf_counter()   # shared bottleneck FIFO (rate-only chain)
+        self.conn_eta = {}           # conn_id -> per-connection recovery chain (HoL)
         self.queue_bytes = 0
         self.bytes_passed = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -213,12 +214,28 @@ class _BucketScheduler:
     def detach(self, conn_id):
         with self.cv:
             self.conns.pop(conn_id, None)
+            self.conn_eta.pop(conn_id, None)
 
     def push(self, conn_id, data, arrival_ts):
         with self.cv:
             delay = self.delay_spec() if callable(self.delay_spec) else self.delay_spec
-            self.prev_eta = max(arrival_ts + delay, self.prev_eta + len(data) / self.rate)
-            heapq.heappush(self.heap, (self.prev_eta, self.seq, conn_id, data))
+            # Faithful lossy-link model (fixed 2026-09-30: the old single global chain
+            # let ONE slow draw ratchet the WHOLE direction's chain to arrival+5s forever,
+            # because continuous arrivals meant max(arrival+low, prev+eps) could never
+            # fall back — manufacturing a permanently 5-second-late "wire" out of a 5%
+            # loss model and poisoning every lag measurement taken through it):
+            #   - the shared bottleneck is ONE FIFO drained at rate (arrival order), with
+            #     NO propagation in the chain: other connections are never held behind
+            #     one connection's slow draw;
+            #   - a connection's own slow draw (loss -> retransmit/RTO recovery) holds
+            #     ONLY that connection's later chunks (per-connection TCP head-of-line),
+            #     exactly like a real dropped packet.
+            self.fifo_eta = max(arrival_ts, self.fifo_eta + len(data) / self.rate)
+            ce = self.conn_eta.get(conn_id, arrival_ts)
+            ce = max(arrival_ts + delay, ce + len(data) / self.rate)
+            self.conn_eta[conn_id] = ce
+            eta = max(self.fifo_eta, ce)
+            heapq.heappush(self.heap, (eta, self.seq, conn_id, data))
             self.seq += 1
             self.queue_bytes += len(data)
             self.cv.notify()
@@ -2476,6 +2493,24 @@ def main():
              "Default 0 (off).",
     )
     parser.add_argument(
+        "--latency-episode-every-ms",
+        type=float,
+        default=0.0,
+        help="Correlated stall episodes: for --latency-episode-ms out of every "
+             "--latency-episode-every-ms, ALL chunks on ALL connections get the episode delay "
+             "(--latency-episode-ms). Unlike --latency-random (independent per-chunk draws, "
+             "which redundancy can mask), episodes stall every carrier TOGETHER — the regime "
+             "where fan-out redundancy cannot help and amplification only adds load. "
+             "0 = off.",
+    )
+    parser.add_argument(
+        "--latency-episode-ms",
+        type=float,
+        default=3000.0,
+        help="When --latency-episode-every-ms: both the episode duration (ms) and the delay "
+             "applied to chunks sent during the episode. Default 3000",
+    )
+    parser.add_argument(
         "--iterations",
         type=int,
         default=5,
@@ -2886,7 +2921,20 @@ def main():
     args = parser.parse_args()
 
     # Build delay spec: constant seconds or callable() -> seconds for randomize mode
-    if args.latency_random:
+    if getattr(args, "latency_episode_every_ms", 0.0) > 0.0:
+        # Correlated stall episodes: within each period, the first `dur` seconds stall ALL
+        # connections together at the episode delay; outside episodes the base delay applies.
+        # Faithful to real lossy links where bad spells (fade, congestion, route flap) hit
+        # every connection at once — the regime the 2026-09-30 lag incident lives in.
+        _ep_period = args.latency_episode_every_ms / 1000.0
+        _ep_dur_s = args.latency_episode_ms / 1000.0
+        _ep_high = args.latency_episode_ms / 1000.0
+        _ep_low = (args.latency_ms / 1000.0) if args.latency_ms else 0.1
+        _ep_t0 = time.perf_counter()
+        def delay_spec():
+            ph = (time.perf_counter() - _ep_t0) % _ep_period
+            return _ep_high if ph < _ep_dur_s else _ep_low
+    elif args.latency_random:
         low_sec = args.latency_random_low_ms / 1000.0
         high_sec = args.latency_random_high_ms / 1000.0
         pct_high = max(0.0, min(100.0, args.latency_random_pct)) / 100.0
