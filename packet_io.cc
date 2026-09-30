@@ -308,21 +308,37 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
   out.insert(out.end(), data, data + len);
 }
 
-void append_small_front(CarrierState& s, uint64_t id, const uint8_t* data, size_t len) {
-  std::vector<uint8_t> tmp;
-  tmp.reserve(sizeof(PacketHeader) + sizeof(uint16_t) + len);
-  append_small(tmp, id, data, len);
+// Front-insert is only packet-safe at a PACKET BOUNDARY. A partial flush
+// (kernel buffer filled mid-packet under load) leaves s.write_pos in the MIDDLE
+// of the head packet; inserting a new packet there splits the queued packet on
+// the wire — the receiver parses the split header (garbage size field, often
+// > MAX_PACKET_PAYLOAD), clears its read buffer, loses framing, and swallows
+// whole wire images into delivered "payloads": measured as t2c stream corruption
+// in the wifi-heavy scenario (2026-09-30, ~10/10 runs; introduced with the
+// front-insert change). When a partial packet is in flight, fall back to a
+// back-append (always a whole packet at a whole-packet boundary).
+static void insert_front_packet(CarrierState& s, std::vector<uint8_t>& tmp) {
+  const bool aligned = (s.write_pos == 0 || s.write_pos >= s.write_buf.size());
+  if (!aligned) {
+    s.write_buf.insert(s.write_buf.end(), tmp.begin(), tmp.end());
+    return;
+  }
   size_t pos = std::min(s.write_pos, s.write_buf.size());
   s.write_buf.insert(s.write_buf.begin() + static_cast<std::ptrdiff_t>(pos),
                      tmp.begin(), tmp.end());
 }
 
+void append_small_front(CarrierState& s, uint64_t id, const uint8_t* data, size_t len) {
+  std::vector<uint8_t> tmp;
+  tmp.reserve(sizeof(PacketHeader) + sizeof(uint16_t) + len);
+  append_small(tmp, id, data, len);
+  insert_front_packet(s, tmp);
+}
+
 void append_ack_front(CarrierState& s, uint64_t acked_id) {
   std::vector<uint8_t> tmp;
   append_ack(tmp, acked_id);
-  size_t pos = std::min(s.write_pos, s.write_buf.size());
-  s.write_buf.insert(s.write_buf.begin() + static_cast<std::ptrdiff_t>(pos),
-                     tmp.begin(), tmp.end());
+  insert_front_packet(s, tmp);
 }
 
 RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks,
