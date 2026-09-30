@@ -308,6 +308,23 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
   out.insert(out.end(), data, data + len);
 }
 
+void append_small_front(CarrierState& s, uint64_t id, const uint8_t* data, size_t len) {
+  std::vector<uint8_t> tmp;
+  tmp.reserve(sizeof(PacketHeader) + sizeof(uint16_t) + len);
+  append_small(tmp, id, data, len);
+  size_t pos = std::min(s.write_pos, s.write_buf.size());
+  s.write_buf.insert(s.write_buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                     tmp.begin(), tmp.end());
+}
+
+void append_ack_front(CarrierState& s, uint64_t acked_id) {
+  std::vector<uint8_t> tmp;
+  append_ack(tmp, acked_id);
+  size_t pos = std::min(s.write_pos, s.write_buf.size());
+  s.write_buf.insert(s.write_buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                     tmp.begin(), tmp.end());
+}
+
 RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks,
                               double interactive_q, double interactive_eps) {
   RsGroupParams p;

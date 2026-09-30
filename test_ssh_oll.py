@@ -1077,41 +1077,57 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
     STALL_S = 3.0
 
-    def writer(send_all, expected):
+    def writer(send_all, expected, bursty=False):
         # Latency is measured from wire-entry, not from scheduling intent: send_all() can
         # legitimately BLOCK for long stretches (the send window's whole point is to push
         # backpressure into the producing app), and under a sustained >1x offered load that
         # block grows linearly — counting it would report the writer's own queue, not the
         # tunnel's. flood t0 = before send (its first bytes enter first); ping t0 = after
         # send_all returns (its bytes are the last of the pair, so they enter the pipe then).
+        burst_every = max(0.0, float(getattr(args, "bw_flood_burst_every_s", 0.0) or 0.0))
+        burst_ms = max(10.0, float(getattr(args, "bw_flood_burst_ms", 300.0) or 300.0))
+        ping_gap_s = 0.1  # lone-ping cadence in quiet gaps (typing between bursts)
         next_pair = time.perf_counter()
+        period_start = time.perf_counter()
         while not stop.is_set():
-            flood = os.urandom(flood_size)
-            ping = os.urandom(ping_size)
-            flood_t0 = time.perf_counter()
-            try:
-                send_all(flood + ping)
-            except (BrokenPipeError, OSError):
-                break
-            ping_t0 = time.perf_counter()
-            expected.put(("flood", flood, flood_t0))
-            expected.put(("ping", ping, ping_t0))
-            next_pair += pair_period_s
-            sleep_t = next_pair - time.perf_counter()
-            if sleep_t < -pair_period_s:
-                next_pair = time.perf_counter()  # don't try to catch up after hiccups
-                sleep_t = 0.0
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+            now = time.perf_counter()
+            in_burst = (not bursty) or ((now - period_start) % burst_every) < (burst_ms / 1000.0)
+            if in_burst:
+                flood = os.urandom(flood_size)
+                ping = os.urandom(ping_size)
+                flood_t0 = time.perf_counter()
+                try:
+                    send_all(flood + ping)
+                except (BrokenPipeError, OSError):
+                    break
+                ping_t0 = time.perf_counter()
+                expected.put(("flood", flood, flood_t0))
+                expected.put(("ping", ping, ping_t0))
+                next_pair += pair_period_s
+                sleep_t = next_pair - time.perf_counter()
+                if sleep_t < -pair_period_s:
+                    next_pair = time.perf_counter()  # don't try to catch up after hiccups
+                    sleep_t = 0.0
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+            else:
+                # Quiet gap: only interactive pings (the typing between bulk bursts).
+                ping = os.urandom(ping_size)
+                try:
+                    send_all(ping)
+                except (BrokenPipeError, OSError):
+                    break
+                expected.put(("ping", ping, time.perf_counter()))
+                time.sleep(max(0.0, ping_gap_s - (time.perf_counter() - now)))
 
     def s2c_writer():
-        writer(tcp_conn.sendall, exp_s2c)
+        writer(tcp_conn.sendall, exp_s2c, bursty=True)
 
     def c2s_writer():
         def send_all(data):
             client_proc.stdin.write(data)
             client_proc.stdin.flush()
-        writer(send_all, exp_c2s)
+        writer(send_all, exp_c2s, bursty=True)
 
     def reader(name, stream, expected):
         buf = b""
@@ -2643,6 +2659,23 @@ def main():
         metavar="X",
         help="In --scenario-bw-flood: producer rate as a multiple of --link-bandwidth-kbps. Must be > 1 "
              "to build a queue (sustained oversubscription, like a download peer faster than the link). Default 2.0.",
+    )
+    parser.add_argument(
+        "--bw-flood-burst-every-s",
+        type=float,
+        default=0.0,
+        metavar="S",
+        help="In --scenario-bw-flood: bursty-bulk mode (the interactive-lag regime: tmux/program "
+             "redraw bursts over an otherwise idle link). Bulk pairs are sent for --bw-flood-burst-ms "
+             "out of every S seconds; between bursts only interactive pings flow (the typing). 0 = off "
+             "(sustained flood).",
+    )
+    parser.add_argument(
+        "--bw-flood-burst-ms",
+        type=float,
+        default=300.0,
+        metavar="MS",
+        help="In --scenario-bw-flood with --bw-flood-burst-every-s: burst duration in ms. Default 300.",
     )
     parser.add_argument(
         "--scenario-small-storm",

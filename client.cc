@@ -617,7 +617,7 @@ int run_client(const Args& args) {
     auto it = carriers.find(fd);
     if (it == carriers.end()) return;
     carrier_pending_acks[fd].emplace_back(next_send_id, now_ns());
-    packet_io::append_small(it->second.write_buf, next_send_id, data, len);
+    packet_io::append_small_front(it->second, next_send_id, data, len);
     if (!same_id)
       next_send_id++;
   };
@@ -924,7 +924,7 @@ int run_client(const Args& args) {
     if (!have_pending_ack || carriers.empty()) return;
     int cfd = pending_ack_fd;
     if (!carriers.count(cfd)) cfd = carriers.begin()->first;
-    packet_io::append_ack(carriers[cfd].write_buf, pending_ack_id);
+    packet_io::append_ack_front(carriers[cfd], pending_ack_id);
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = cfd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -1279,7 +1279,7 @@ int run_client(const Args& args) {
             // case ACKs were lost while carriers were down. Without this the server can
             // keep retransmitting already-delivered data indefinitely on a quiet stream.
             if (next_deliver_id > 0) {
-              packet_io::append_ack(it->second.write_buf, next_deliver_id - 1);
+              packet_io::append_ack_front(it->second, next_deliver_id - 1);
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = fd;
               epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);

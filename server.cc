@@ -208,7 +208,9 @@ int run_server(const Args& args) {
   // silently released the clamp, rs pinned at 2.0 (3x wire amplification), and
   // goodput dropped ~40% while the wire stayed pinned (2026-09-11 regression found
   // while re-validating the path-B spin fix).
-  uint64_t s2c_saturated_latch_ns = 0;
+  uint64_t s2c_saturated_latch_ns = 0;  // last instant the s2c pump was window-blocked with
+                                        // data waiting; feeds the saturation clamp. Declared
+                                        // near the pump that stamps it (see "event-anchored").
   float last_sent_rs_redundancy = -1.0f;
   unsigned last_sent_small_packet_redundancy = 0;
   uint64_t last_adapt_ns = 0;
@@ -403,7 +405,7 @@ int run_server(const Args& args) {
       auto it = carriers.begin();
       std::advance(it, idx);
       int fd = it->first;
-      packet_io::append_small(it->second.write_buf, next_send_id, data, len);
+      packet_io::append_small_front(it->second, next_send_id, data, len);
       // Record that this SMALL packet id has been carried on this logical carrier.
       unacked_data[next_send_id].small_sent_on.insert(it->second.carrier_id);
       ev.events = EPOLLIN | EPOLLOUT;
@@ -450,12 +452,6 @@ int run_server(const Args& args) {
     }
   };
 
-  auto queue_ack_to_carrier = [&](int fd, uint64_t acked_id) {
-    auto it = carriers.find(fd);
-    if (it == carriers.end()) return;
-    packet_io::append_ack(it->second.write_buf, acked_id);
-  };
-
   // Coalesced (cumulative) ACK. An ACK means "every id <= acked_id delivered", so rather than
   // emitting one ACK per delivered group we track only the HIGHEST id written to the backend
   // (and the carrier that completed it, for per-carrier RTT) and emit a single cumulative ACK
@@ -469,7 +465,7 @@ int run_server(const Args& args) {
     if (!have_pending_ack || carriers.empty()) return;
     int cfd = pending_ack_fd;
     if (!carriers.count(cfd)) cfd = carriers.begin()->first;
-    queue_ack_to_carrier(cfd, pending_ack_id);
+    packet_io::append_ack_front(carriers[cfd], pending_ack_id);
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.fd = cfd;
     epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
@@ -777,7 +773,7 @@ int run_server(const Args& args) {
             // down. Without this the client can keep retransmitting already-delivered
             // data indefinitely on a quiet stream.
             if (next_deliver_id > 0)
-              packet_io::append_ack(carriers[client].write_buf, next_deliver_id - 1);
+              packet_io::append_ack_front(carriers[client], next_deliver_id - 1);
             ev.events = EPOLLIN | EPOLLOUT;
             ev.data.fd = client;
             epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);

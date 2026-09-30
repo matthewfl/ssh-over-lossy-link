@@ -127,6 +127,19 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
 void append_rs_shard(std::vector<uint8_t>& out, uint64_t id, unsigned n, unsigned k,
                     uint16_t block_size, unsigned shard_index, const uint8_t* shard_data);
 
+// Queue a SMALL packet AHEAD of any pending (unflushed) bulk shards on this carrier.
+// Insertion lands at write_pos — after the bytes already handed to the kernel, before
+// the queued shards — so interactive data and control packets never wait behind a bulk
+// burst's shards in ssh-oll's own queue (the kernel/bottleneck FIFO remains, physics).
+// Correctness: wire order carries no meaning for delivery (ids dedupe; RS needs any k
+// of n in any order), so jumping the per-carrier queue is safe.
+void append_small_front(CarrierState& s, uint64_t id, const uint8_t* data, size_t len);
+
+// Same, for the cumulative ACK: the ACK return leg sets the RTT sample, so queueing it
+// behind bulk shards both delays unacked reclamation and poisons the RTT estimate
+// (measured 2026-09-30: rtt_ms 1582 on a ~280 ms path while rs=2.0 bulk was in flight).
+void append_ack_front(CarrierState& s, uint64_t acked_id);
+
 // Re-encode the shards of an unacked Reed-Solomon group from its stored data, using the
 // original (n, k, block_size). Returns ui.n shard buffers: [0, k) are the data shards,
 // [k, n) the recomputed parity. The retransmit/reconnect paths use this so the RS
