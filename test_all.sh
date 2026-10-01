@@ -638,6 +638,34 @@ run_test "bw-flood-window-backpressure" \
     --assert-max-carrier-count 64 \
     --extra-client-args --max-connections 120
 
+# 14 bursty-bulk + 5%-loss-class link (the 2026-09-30 typing-lag regime: interactive
+#     typing behind tmux/redraw bursts on a mostly-idle lossy link). Pre-loss-floor
+#     build: bulk-burst queueing corrupted the q estimator every window it touched
+#     (honest q=0.05 at cold start, then 0.35-0.6 once bursts began), pinning rs at
+#     ~2.0 — 3x burst amplification — and interactive p50 at ~470 ms / p95 ~1.5 s
+#     over a 500 ms-RTT path. Loss-floor build: q holds ~0.03, rs ~0.2, and the p50
+#     gate below (350 ms) fails pre-fix and passes post-fix (measured 254-259 ms x2).
+#     At 30%-loss the floor reads honest-high and rs stays up: no regression there.
+run_test "bursty-bulk-loss-floor-5pct" \
+    --init-latency-override 0.05 \
+    --scenario-bw-flood \
+    --bw-flood-rate-x 1.3 \
+    --bw-flood-burst-every-s 3 \
+    --bw-flood-burst-ms 400 \
+    --link-bandwidth-kbps 512 \
+    --latency-random \
+    --latency-random-low-ms 250 \
+    --latency-random-high-ms 800 \
+    --latency-random-pct 5 \
+    --connections 30 \
+    --packet-size 400 --payload-size 400 \
+    --continuous-duration 40 \
+    --client-debug --server-debug \
+    --test-max-latency 25000 \
+    --test-max-p50-latency-after-warmup 350 \
+    --warmup-seconds 15 \
+    --extra-client-args --max-connections 120
+
 # ============================================================================
 # 14 adapt-download-only-s2c — audit AUD-1: a session with near-zero c2s RS
 #     traffic (download-only shape) must still run the server's redundancy

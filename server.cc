@@ -243,8 +243,14 @@ int run_server(const Args& args) {
   // fixed latency budget. See REDUNDANCY_MODEL.md.
   uint64_t qest_total_gaps = 0;
   uint64_t qest_late_gaps = 0;
-  double   est_loss_q = 0.05;   // start pessimistic until we have a measurement
-  bool     have_loss_q = false;
+  double   est_loss_q = 0.05;   // start pessimistic until the loss floor has measurements
+  // Loss-floor machinery (see LossFloor in net_util.h): per-window loss values from BOTH
+  // sample sources — RS-shard gaps (bulk traffic) and small-copy gaps (continuous, incl.
+  // quiet windows) — feed one windowed-min filter so bulk-queueing corruption cannot
+  // re-arm redundancy against itself while quiet windows keep the honest floor fresh.
+  LossFloor q_loss_floor;
+  uint64_t small_q_total = 0, small_q_late = 0;  // small-copy-gap q window (stall-threshold basis)
+  LossFloor q_jit_floor;              // same filter for the interactive-jitter signal
   std::deque<uint64_t> qest_recent_gaps;  // recent shard gaps (for percentile diagnostics / B tuning)
   // s2c metrics from CLIENT_METRICS (client measures server→client path).
   float s2c_loss_q = 0.0f;   // client-reported s2c per-shard late fraction (latency-budget method)
@@ -593,6 +599,10 @@ int run_server(const Args& args) {
   recv_cb.on_small_extra_copy = [&](uint64_t gap_ns) {
     c2s_small_extra_copy_gap_ns.push_back(gap_ns);
     while (c2s_small_extra_copy_gap_ns.size() > kMaxSpreadSamples) c2s_small_extra_copy_gap_ns.pop_front();
+    // Continuous loss sample (loss-floor input): a copy gap beyond the retransmit-scale
+    // stall threshold means that carrier stalled — same semantics as a late shard.
+    small_q_total += 1;
+    if (gap_ns > carrier_adapt::stall_threshold_ns(get_base_rtt_ns())) small_q_late += 1;
   };
   recv_cb.on_start_connection = [&](int fd, uint64_t carrier_id) {
     auto it = carriers.find(fd);
@@ -1331,11 +1341,24 @@ int run_server(const Args& args) {
         // jitter-vs-budget fraction, so it reflects real loss/overload and does not saturate
         // on base jitter. No 0.5 clamp: a genuinely high stall rate should drive real parity.
         double q = static_cast<double>(qest_late_gaps) / static_cast<double>(qest_total_gaps);
-        // Light smoothing so a single noisy window doesn't swing the config.
-        est_loss_q = have_loss_q ? (0.5 * est_loss_q + 0.5 * q) : q;
-        have_loss_q = true;
+        q_loss_floor.push(now_ns_val, static_cast<float>(q));
         qest_total_gaps = qest_late_gaps = 0;
       }
+      if (small_q_total >= 30) {
+        // Continuous small-copy loss window (fires during quiet periods too, keeping the
+        // loss floor honest between bulk bursts — the shard window alone only samples
+        // during bulk, exactly when its own queueing corrupts it).
+        double qs = static_cast<double>(small_q_late) / static_cast<double>(small_q_total);
+        q_loss_floor.push(now_ns_val, static_cast<float>(qs));
+        small_q_total = small_q_late = 0;
+      }
+      // SIZE from the windowed-min loss floor, not the last window: bulk-queueing only
+      // ever raises measured lateness (2026-09-30: a 5%-loss link measured honest q=0.05
+      // at cold start, then 0.35-0.6 once burst queueing set in — sizing rs from that
+      // re-armed 3x amplification and the loop fed itself). The min over the ~45 s
+      // horizon tracks the honest floor; it rises only when EVERY recent window is late,
+      // i.e. when the loss is genuinely sustained.
+      est_loss_q = q_loss_floor.min_fresh(now_ns_val, static_cast<float>(est_loss_q));
       // A single redundancy value governs BOTH directions, so size it for the worse one:
       // take the max of our c2s loss estimate and the client's reported s2c loss estimate
       // (both measured the same latency-budget way). This protects a lopsided link.
@@ -1361,7 +1384,14 @@ int run_server(const Args& args) {
            && unacked_bytes_cache >= rate_window_cap(s2c_window, get_window_base_rtt_ns()))
           || client_c2s_window_saturated;
       const float rs_hi = send_saturated ? 0.5f : 2.0f;
-      float rs_target = std::min(rs_hi, std::max(0.1f, r_model));
+      // Hard floor ABOVE the old 0.1: the loss floor reacts to PAST loss while parity
+      // protects against FUTURE shock (2026-09-30 wifi-heavy regression: a clean
+      // pre-blackout period floored rs at 0.10, then a 30 s blackout hit k=7-of-8
+      // groups — zero shard margin — and the recovery-phase stragglers became stale-drop
+      // gap-jumps, i.e. STREAM CORRUPTION, 4/4 suite runs). rs >= 0.35 keeps k <= 3/4 n
+      // (a 25% shard-loss margin) at any fleet size; on the bursty low-loss regime this
+      // costs only the 0.1x difference in amplification (1.35x vs 1.1x wire).
+      float rs_target = std::min(rs_hi, std::max(0.35f, r_model));
       if (rs_target >= runtime_rs_redundancy) {
         runtime_rs_redundancy = rs_target;                 // up: immediate
       } else {                                             // down: bounded rate
@@ -1385,8 +1415,13 @@ int run_server(const Args& args) {
       size_t jit_total = 0, jit_late = 0;
       for (uint64_t g : qest_recent_gaps) { jit_total++; if (g > b_interactive) jit_late++; }
       for (uint64_t g : c2s_small_extra_copy_gap_ns) { jit_total++; if (g > b_interactive) jit_late++; }
-      double q_jitter = (jit_total >= 30) ? static_cast<double>(jit_late) / static_cast<double>(jit_total)
+      double q_jit_raw = (jit_total >= 30) ? static_cast<double>(jit_late) / static_cast<double>(jit_total)
                                           : q_used;
+      // Same loss-floor filter as the rs signal: burst queueing inflates the jitter
+      // reading too (measured 0.58-0.74 on the 5%-loss link during bursts vs 0.004-0.05
+      // honest), which drove copies to the cap and multiplied the small-packet wire.
+      if (jit_total >= 30) q_jit_floor.push(now_ns_val, static_cast<float>(q_jit_raw));
+      double q_jitter = q_jit_floor.min_fresh(now_ns_val, static_cast<float>(q_jit_raw));
       // Cap at kMaxSmallCopies: beyond it q_jitter reflects aggregate congestion (all carriers
       // backed up), which copies can't fix and only worsen — see kMaxSmallCopies. This is what
       // stops the runaway to ~carrier-count on a busy link. (The carrier-count cap below still

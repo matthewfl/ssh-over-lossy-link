@@ -667,6 +667,28 @@ def _evaluate_test_criteria(args, all_latencies_ms, stall_events,
                 f"no measurements after {warmup_s:.0f}s warmup — cannot evaluate post-warmup average latency"
             )
 
+    if getattr(args, "test_max_p50_latency_after_warmup", None) is not None:
+        warmup_s = getattr(args, "warmup_seconds", 30.0)
+        if timed_latencies_ms is not None and test_start_time is not None:
+            warmup_cutoff = test_start_time + warmup_s
+            post_warmup_p50 = [lat for ts, lat in timed_latencies_ms if ts >= warmup_cutoff]
+        else:
+            post_warmup_p50 = full_latencies
+        if post_warmup_p50:
+            s = sorted(post_warmup_p50)
+            mid = len(s) // 2
+            p50 = s[mid] if len(s) % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+            threshold = args.test_max_p50_latency_after_warmup
+            if p50 > threshold:
+                failures.append(
+                    f"post-warmup p50 latency {p50:.1f} ms exceeds threshold {threshold:.1f} ms"
+                    f" (n={len(post_warmup_p50)}, warmup={warmup_s:.0f}s)"
+                )
+        else:
+            failures.append(
+                f"no measurements after {warmup_s:.0f}s warmup — cannot evaluate post-warmup p50 latency"
+            )
+
     if getattr(args, "test_min_packets", None) is not None:
         n = len(full_latencies)
         if n < args.test_min_packets:
@@ -2731,7 +2753,7 @@ def main():
               "and assert the server idles at low CPU. Regression gate for the second spin path "
               "(2026-09-11): unsynced raw epoll MODs re-armed EPOLLIN while the window was "
               "saturated, the arm-dedup then skipped the re-mask forever, and a perpetually-ready "
-              "backend fd spun the loop at 100% CPU for the whole reconnect window."),
+              "backend fd spun the loop at 100%%-CPU for the whole reconnect window."),
     )
     parser.add_argument("--client-crash-bulk-s", type=float, default=8.0,
                         help="In --scenario-client-crash-bulk: seconds of bidirectional flood "
@@ -2875,6 +2897,15 @@ def main():
         default=None,
         metavar="N",
         help="Fail if fewer than N packets complete successfully during the test.",
+    )
+    parser.add_argument(
+        "--test-max-p50-latency-after-warmup",
+        type=float,
+        default=None,
+        metavar="MS",
+        help="Fail if the p50 of post-warmup interactive latencies exceeds this (ms)."
+             " Pairs with --warmup-seconds; p50 is far less tail-sensitive than the average,"
+             " so it discriminates steady-state lag regressions the tail noise would mask.",
     )
     parser.add_argument(
         "--test-max-average-latency-after-warmup",

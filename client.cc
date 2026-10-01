@@ -438,7 +438,12 @@ int run_client(const Args& args) {
   // to the server via CLIENT_METRICS so it can size redundancy for the worse direction.
   uint64_t s2c_qest_total_gaps = 0;
   uint64_t s2c_qest_late_gaps = 0;
-  float    s2c_loss_q = 0.0f;   // smoothed s2c late-fraction; sent in CLIENT_METRICS
+  float    s2c_loss_q = 0.0f;   // s2c loss FLOOR (windowed min); sent in CLIENT_METRICS
+  // Loss-floor machinery (see LossFloor in net_util.h): per-window s2c loss values from
+  // BOTH sample sources (RS-shard gaps + continuous small-copy gaps) feed a windowed-min
+  // filter so burst-queueing corruption cannot inflate the reported s2c q.
+  LossFloor s2c_q_floor;
+  uint64_t s2c_small_q_total = 0, s2c_small_q_late = 0;
   // Load measurement for the load-driven carrier target (Lever 1). Count physical packets
   // crossing the fleet per window in both directions (c2s shards/copies we send + s2c shards
   // we receive); the rate drives desired_carriers so each carrier carries only ~tau packets
@@ -641,8 +646,22 @@ int run_client(const Args& args) {
     if (s2c_qest_total_gaps >= 100) {
       float q = static_cast<float>(s2c_qest_late_gaps) / static_cast<float>(s2c_qest_total_gaps);
       if (q > 0.5f) q = 0.5f;
-      s2c_loss_q = 0.5f * s2c_loss_q + 0.5f * q;
+      s2c_q_floor.push(now_ns(), q);
       s2c_qest_total_gaps = s2c_qest_late_gaps = 0;
+    }
+    if (s2c_small_q_total >= 30) {
+      float qs = static_cast<float>(s2c_small_q_late) / static_cast<float>(s2c_small_q_total);
+      if (qs > 0.5f) qs = 0.5f;
+      s2c_q_floor.push(now_ns(), qs);
+      s2c_small_q_total = s2c_small_q_late = 0;
+    }
+    // Report the windowed-min loss floor (see LossFloor in net_util.h): the server takes
+    // max(c2s, s2c) of the two floors; queueing-inflated windows cannot raise it while
+    // honest quiet windows stay inside the horizon.
+    {
+      float f = s2c_q_floor.min_fresh(now_ns(), s2c_loss_q);
+      if (f > 0.5f) f = 0.5f;
+      s2c_loss_q = f;
     }
     {
       uint64_t mq_outstanding = 0;
@@ -745,6 +764,10 @@ int run_client(const Args& args) {
   recv_cb.on_small_extra_copy = [&](uint64_t gap_ns) {
     s2c_small_extra_copy_gap_ns.push_back(gap_ns);
     while (s2c_small_extra_copy_gap_ns.size() > kMaxSpreadSamples) s2c_small_extra_copy_gap_ns.pop_front();
+    // Continuous loss sample for the s2c loss floor (same stall-threshold semantics
+    // as shard gaps; fires during quiet periods too).
+    s2c_small_q_total += 1;
+    if (gap_ns > carrier_adapt::stall_threshold_ns(get_base_rtt_ns())) s2c_small_q_late += 1;
   };
   recv_cb.on_server_metrics = [&](uint64_t max_rtt_ns, uint64_t avg_spread_ns,
                                    uint64_t avg_extra_gap_ns, uint32_t rs_pending_count,

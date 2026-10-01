@@ -208,6 +208,58 @@ struct RateWindow {
   static constexpr uint64_t kCeilBytes = 4 * 1024 * 1024;         // sanity ceiling
 };
 
+// Windowed-min "loss floor" filter (2026-09-30 typing-lag investigation): measured
+// loss (shard/copy lateness fraction) is only ever INCREASED by queueing at the sender's
+// own backlog — bulk bursts corrupt every window they overlap (measured on a 5%-loss
+// link: honest q=0.05 at cold start, then 0.35-0.6 during burst traffic, re-arming the
+// rs amplification whose queueing created the signal). Queueing never LOWERS q, so the
+// minimum over a bounded horizon of per-window values tracks the honest per-shard loss
+// floor: quiet windows (honest) hold it down; burst windows can only pull it up once the
+// honest samples age out of the horizon — which is exactly when the loss is genuinely
+// sustained. The horizon bounds how long a truly degrading link takes to register
+// (the retransmit path covers the transition).
+struct LossFloor {
+  static constexpr size_t kMaxEntries = 64;
+  static constexpr uint64_t kHorizonNs = 45ULL * 1000000000ULL;
+  uint64_t t_ns[kMaxEntries] = {0};
+  float    q[kMaxEntries]    = {0.0f};
+  size_t   count = 0, head = 0;
+
+  void push(uint64_t now, float q_val) {
+    t_ns[head] = now;
+    q[head] = q_val;
+    head = (head + 1) % kMaxEntries;
+    if (count < kMaxEntries) count++;
+  }
+
+  // Minimum over the kMinFresh most recent entries inside the horizon; falls back to
+  // the caller's value when fewer than kMinFresh fresh entries exist. Why kMinFresh and
+  // not "any fresh entry": session warmup (near-zero-latency connects before loss
+  // manifests) pushes ~1-2 clean windows that would otherwise pin the floor at ~0 for a
+  // whole horizon (measured: floor read q=0.000 on a 30%-loss link from warmup windows)
+  // — requiring a handful of recent windows means honest windows outvote warmup, and a
+  // genuinely degrading link registers within a few windows (~10-15 s at interactive
+  // sample rates).
+  static constexpr size_t kMinFresh = 5;
+  float min_fresh(uint64_t now, float fallback) const {
+    if (count == 0) return fallback;
+    // collect fresh entries newest-first (entries are in push order; scan backwards)
+    float best[kMaxEntries];
+    size_t fresh = 0;
+    size_t idx = (head + kMaxEntries - 1) % kMaxEntries;  // newest
+    for (size_t i = 0; i < count && fresh < kMinFresh; i++) {
+      if (now >= t_ns[idx] && now - t_ns[idx] <= kHorizonNs) {
+        best[fresh++] = q[idx];
+      }
+      idx = (idx + kMaxEntries - 1) % kMaxEntries;
+    }
+    if (fresh < kMinFresh) return fallback;
+    float m = best[0];
+    for (size_t i = 1; i < fresh; i++) if (best[i] < m) m = best[i];
+    return m;
+  }
+};
+
 inline uint64_t rate_window_cap(const RateWindow& w, uint64_t base_rtt_ns) {
   // Budget = base-RTT PLUS the queue budget: the cap must cover the bandwidth×delay
   // product (or the window itself becomes the bottleneck and locks at a low-rate
