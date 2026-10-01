@@ -14,8 +14,11 @@
 #include "reed_solomon.h"
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <map>
 #include <string>
+#include <sys/epoll.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace ssholl;
@@ -299,6 +302,179 @@ void test_rs_group_params() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Deterministic partial-write injection: the front-insert framing invariant.
+//
+// flush_carrier_writes advances write_pos per BYTE written, so a partial flush
+// (kernel/pipe buffer fills mid-packet) leaves write_pos inside the head packet.
+// append_small_front/append_ack_front must never insert a packet at that
+// mid-packet offset: doing so splits the queued packet on the wire, the receiver
+// misframes the split header (garbage size, often > MAX_PACKET_PAYLOAD), clears
+// its read buffer losing all framing, and cascades into delivering whole wire
+// images as stream data — measured as silent t2c stream corruption in the
+// wifi-heavy scenarios (2026-09-30: suite-21-certified build went 10/10 corrupt
+// hours later; exposure depends on environmental partial-write timing). This
+// test injects the partial-flush state BY CONSTRUCTION (a pipe with exactly N
+// free bytes gives a byte-exact partial write), so the hazard is exercised
+// deterministically instead of by accident.
+// ---------------------------------------------------------------------------
+
+// Fill a non-blocking pipe's buffer completely. Chunks >1 byte stop early
+// without truly filling it: pipe writes at or below PIPE_BUF are ATOMIC, so a
+// full-size chunk just returns EAGAIN while up to PIPE_BUF-1 bytes stay free
+// (that gap made our first injection attempt write whole packets). Big chunks
+// first for speed, then a 1-byte top-off loop until EAGAIN.
+static void fill_pipe(int fd) {
+  uint8_t big[4096];
+  std::memset(big, 0x5A, sizeof big);
+  for (;;) {
+    ssize_t n = ::write(fd, big, sizeof big);
+    if (n <= 0) break;
+  }
+  const uint8_t one = 0x5A;
+  for (;;) {
+    ssize_t n = ::write(fd, &one, 1);
+    if (n <= 0) break;  // EAGAIN: genuinely full now
+  }
+}
+
+// Drain everything available from a non-blocking fd.
+static void drain_pipe(int fd, std::vector<uint8_t>* into) {
+  uint8_t buf[65536];
+  for (;;) {
+    ssize_t n = ::read(fd, buf, sizeof buf);
+    if (n <= 0) break;  // EAGAIN: empty
+    if (into) into->insert(into->end(), buf, buf + n);
+  }
+}
+
+// One injection case: queue an RS shard, force a partial flush by freeing
+// `free_bytes` pipe bytes (pipe partials are page-granular: freeing 4097..5013
+// bytes makes the 5014-byte write() accept exactly 4096, landing write_pos
+// mid-packet), front-insert a small (or ACK when use_ack) while write_pos sits
+// mid-packet, flush the rest, and byte-compare the emitted stream against the
+// only whole-packet concatenation. expect_jump=true asserts the aligned
+// (write_pos==0) case still jumps the queue; false asserts the mid-packet case
+// falls back to a back-append.
+static void run_front_insert_case(size_t free_bytes, bool use_ack, const char* label,
+                                  bool expect_jump) {
+  int fds[2];
+  check(::pipe(fds) == 0, "front-insert: pipe");
+  check(::fcntl(fds[1], F_SETFL, ::fcntl(fds[1], F_GETFL) | O_NONBLOCK) == 0,
+        "front-insert: set write end nonblocking");
+  check(::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK) == 0,
+        "front-insert: set read end nonblocking");
+  int epfd = ::epoll_create1(0);
+  struct ::epoll_event reg{};
+  reg.events = EPOLLOUT;
+  reg.data.fd = fds[1];
+  check(::epoll_ctl(epfd, EPOLL_CTL_ADD, fds[1], &reg) == 0, "front-insert: epoll add");
+
+  // The head packet must be LARGER than PIPE_BUF (4096): pipe writes at or
+  // below PIPE_BUF are atomic (all-or-EAGAIN), so only an oversized write can
+  // return the byte-exact partial count the injection needs.
+  const uint16_t block = 5000;
+  std::vector<uint8_t> shard(block);
+  for (unsigned i = 0; i < block; ++i) shard[i] = static_cast<uint8_t>(0xA0 + (i & 0x0F));
+
+  std::map<int, CarrierState> carriers;
+  CarrierState& s = carriers[fds[1]];
+  append_rs_shard(s.write_buf, 1, 8, 4, block, 0, shard.data());
+  const size_t rs_wire = s.write_buf.size();  // header + size + n/k/idx + shard
+  check(rs_wire > 4096, "front-insert: head packet must exceed PIPE_BUF so the "
+        "page-granular pipe partial can land mid-packet");
+
+  // Fill the pipe, then free `free_bytes` bytes -> the next write() accepts a
+  // page-granular partial (see the helper comment) landing write_pos mid-packet.
+  fill_pipe(fds[1]);
+  if (free_bytes > 0) {
+    std::vector<uint8_t> tmp(free_bytes);
+    check(::read(fds[0], tmp.data(), free_bytes) == (ssize_t)free_bytes,
+          "front-insert: freed exact bytes");
+  }
+
+  struct ::epoll_event ev{};
+  flush_carrier_writes(carriers, epfd, ev);
+  if (free_bytes == 0) {
+    check(s.write_pos == 0, "front-insert: aligned case has write_pos==0");
+  } else {
+    check(s.write_pos > 0 && s.write_pos < s.write_buf.size(),
+          "front-insert: partial flush left write_pos mid-packet (precondition)");
+  }
+
+  // THE hazard call: front-insert while (possibly) mid-packet.
+  if (use_ack) {
+    append_ack_front(s, 42);
+  } else {
+    const uint8_t hello[5] = {'h', 'e', 'l', 'l', 'o'};
+    append_small_front(s, 2, hello, 5);
+  }
+
+  // The partial-flush output sits at the TAIL of the pipe, behind the filler:
+  // drain everything, keep the newest write_pos bytes (the partial output),
+  // discard the rest. Then flush the whole remaining queue and collect it.
+  std::vector<uint8_t> drained;
+  drain_pipe(fds[0], &drained);
+  std::vector<uint8_t> partial_out;
+  if (s.write_pos > 0) {
+    check(drained.size() >= s.write_pos, "front-insert: drained partial output");
+    partial_out.assign(drained.end() - (std::ptrdiff_t)s.write_pos, drained.end());
+  }
+  std::vector<uint8_t> rest;
+  for (int i = 0; i < 3 && !s.write_buf.empty(); ++i) {
+    flush_carrier_writes(carriers, epfd, ev);
+    drain_pipe(fds[0], &rest);
+  }
+  check(s.write_buf.empty() && s.write_pos == 0, "front-insert: queue fully flushed");
+
+  std::vector<uint8_t> emitted = partial_out;
+  emitted.insert(emitted.end(), rest.begin(), rest.end());
+
+  // The only valid whole-packet concatenations.
+  std::vector<uint8_t> rs_pkt, other_pkt;
+  append_rs_shard(rs_pkt, 1, 8, 4, block, 0, shard.data());
+  if (use_ack) {
+    append_ack(other_pkt, 42);
+  } else {
+    const uint8_t hello[5] = {'h', 'e', 'l', 'l', 'o'};
+    append_small(other_pkt, 2, hello, 5);
+  }
+  std::vector<uint8_t> jump = other_pkt;
+  jump.insert(jump.end(), rs_pkt.begin(), rs_pkt.end());
+  std::vector<uint8_t> back = rs_pkt;
+  back.insert(back.end(), other_pkt.begin(), other_pkt.end());
+  const std::vector<uint8_t>& want = expect_jump ? jump : back;
+  if (emitted != want) {
+    std::fprintf(stderr, "FAIL: %s: emitted %zu bytes, expected %zu (whole-packet %s)\n",
+                 label, emitted.size(), want.size(), expect_jump ? "jump" : "back-append");
+    if (emitted.size() == want.size()) {
+      for (size_t i = 0; i < emitted.size(); ++i) {
+        if (emitted[i] != want[i]) {
+          std::fprintf(stderr, "  first divergence at byte %zu: got %02x want %02x\n",
+                       i, emitted[i], want[i]);
+          break;
+        }
+      }
+    }
+    ++g_failures;
+  }
+
+  ::close(fds[0]);
+  ::close(fds[1]);
+  ::close(epfd);
+}
+
+static void test_front_insert_never_splits_packets() {
+  // Aligned (write_pos==0): the small/ACK must jump to the front — the feature.
+  run_front_insert_case(0, false, "front-insert aligned small jumps", true);
+  run_front_insert_case(0, true, "front-insert aligned ack jumps", true);
+  // Mid-packet partial flush: must fall back to a back-append — never split.
+  // Mid-packet partial flush: must fall back to a back-append — never split.
+  // free_bytes in (4096, rs_wire) makes write() return exactly 4096.
+  run_front_insert_case(5000, false, "front-insert mid-packet small falls back", false);
+  run_front_insert_case(4500, true, "front-insert mid-packet ack falls back", false);
+}
+
 int main() {
   test_out_of_order_small();
   test_duplicate_after_delivery();
@@ -308,6 +484,7 @@ int main() {
   test_rs_retransmit_combines();
   test_rs_reencode_shards();
   test_rs_group_params();
+  test_front_insert_never_splits_packets();
   if (g_failures) {
     std::fprintf(stderr, "packet_io tests: %d failure(s)\n", g_failures);
     return 1;

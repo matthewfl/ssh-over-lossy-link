@@ -320,6 +320,7 @@ void append_small(std::vector<uint8_t>& out, uint64_t id, const uint8_t* data, s
 static void insert_front_packet(CarrierState& s, std::vector<uint8_t>& tmp) {
   const bool aligned = (s.write_pos == 0 || s.write_pos >= s.write_buf.size());
   if (!aligned) {
+    ++s.front_insert_fallbacks;
     s.write_buf.insert(s.write_buf.end(), tmp.begin(), tmp.end());
     return;
   }

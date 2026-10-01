@@ -33,6 +33,10 @@ struct CarrierState {
   uint64_t connect_ns = 0;    // when this carrier finished connecting (set by caller)
   uint64_t bytes_sent_this_window = 0;  // bytes flushed in the current --min-data keepalive window
   uint64_t last_window_reset_ns = 0;    // when bytes_sent_this_window was last reset
+  // Diagnostic (2026-09-30 corruption class): front-inserts rerouted to a back-append
+  // because a partial flush left write_pos mid-packet. >0 in a heavy run proves the
+  // split precondition occurred and the boundary gate handled it.
+  uint64_t front_insert_fallbacks = 0;
 };
 
 // Per-id state when collecting Reed-Solomon shards.

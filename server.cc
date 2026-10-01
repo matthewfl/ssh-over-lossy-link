@@ -953,24 +953,28 @@ int run_server(const Args& args) {
         last_dbg_ns = now_ns_val;
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_data) unacked_bytes += ui.data.size();
+        uint64_t fifb_total = 0;
+        for (const auto& [cfd_s, cs_s] : carriers) fifb_total += cs_s.front_insert_fallbacks;
         if (rs_pending.empty()) {
-          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu fifb=%llu\n",
                   carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(),
                   (unsigned long long)next_deliver_id, backend_read_buf.size(),
                   (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
                   rate_window_cap(s2c_window, get_window_base_rtt_ns())/1024,
                   s2c_window.rate_bps/1024.0,
-                  (unsigned long long)(get_window_base_rtt_ns()/1000000ULL));
+                  (unsigned long long)(get_window_base_rtt_ns()/1000000ULL),
+                  (unsigned long long)fifb_total);
         } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu\n",
+          fprintf(dbg, "[srv] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu backend_buf=%zu rs_redundancy=%.2f small_packet_copies=%u first_rs_id=%llu shards=%zu k=%u n=%u wcap_kb=%zu rate_kbps=%.0f base_rtt_ms=%llu fifb=%llu\n",
                   carriers.size(), unacked_data.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
                   (unsigned long long)next_deliver_id, backend_read_buf.size(),
                   (double)runtime_rs_redundancy, (unsigned)runtime_small_packet_redundancy,
                   (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n,
                   rate_window_cap(s2c_window, get_window_base_rtt_ns())/1024,
                   s2c_window.rate_bps/1024.0,
-                  (unsigned long long)(get_window_base_rtt_ns()/1000000ULL));
+                  (unsigned long long)(get_window_base_rtt_ns()/1000000ULL),
+                  (unsigned long long)fifb_total);
         }
         fflush(dbg);
       }

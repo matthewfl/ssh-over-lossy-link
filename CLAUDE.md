@@ -49,7 +49,24 @@ make clean
   own PID before killing anything.
 - When a test is flaky, add `--debug` logging and measure at the REPLAY of the failing
   scenario; do not hand-build synthetic one-off "/tmp/*audit*.py" measurement harnesses
-  that bypass the suite runner — they drift from the suite's gate and led me past a
+  that bypass the suite runner
+- **Write-path / queue-manipulation commits need the deterministic framing check, not
+  just a green suite.** Race-dependent wire bugs can pass a green full suite when the
+  exposing timing regime is absent — the 2026-09-30 front-insert corruption was suite-
+  certified 36/36 at 19:45 and failed 10/10 the same night (exposure = whether a
+  front-insert lands while a partial flush has write_pos mid-packet; measured 0
+  occurrences in clean heavy runs, so green heavy runs do NOT prove correctness).
+  For commits touching the carrier write path (packet_io `append_*`/
+  `flush_carrier_writes`/`CarrierState.write_buf`/`write_pos`, or carrier-send queue
+  logic in client.cc/server.cc): (1) the `make check` front-insert injection cases in
+  test_packet_io.cc are the certification gate — they force the partial-flush state by
+  construction (pipe partials are page-granular: freeing 4097+ bytes makes an oversized
+  write accept exactly 4096, landing write_pos mid-packet); (2) the heavy wifi scenarios
+  are end-to-end insurance, never the sole discriminator; (3) the `fifb=` field in the
+  [cli]/[srv] dumps counts front-insert fallbacks — 0 in a run means the hazard
+  precondition was NOT exercised (a vacuous pass w.r.t. this bug class), >0 means it
+  occurred and the boundary gate handled it; (4) repeated same-regime passes add
+  essentially no detection power — the deterministic test carries the weight. — they drift from the suite's gate and led me past a
   whole day's worth of suspect-but-fine measurements during the audit.
 - 'Restore-shaped' operations on a dirty tree (git checkout/restore of a tracked file,
   stash pop-and-drop, `sed -i` reversal) can silently WIPE uncommitted work — one bad

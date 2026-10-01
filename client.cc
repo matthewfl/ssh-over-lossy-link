@@ -2234,18 +2234,22 @@ int run_client(const Args& args) {
         last_cli_dump_ns = now_p;
         size_t unacked_bytes = 0;
         for (const auto& [_, ui] : unacked_sends) unacked_bytes += ui.data.size();
+        uint64_t fifb_total = 0;
+        for (const auto& [cfd_c, cs_c] : carriers) fifb_total += cs_c.front_insert_fallbacks;
         if (rs_pending.empty()) {
-          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u\n",
+          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=0 next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u fifb=%llu\n",
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(),
                   (unsigned long long)next_deliver_id, (unsigned long long)next_send_id, stdout_buf.size(),
-                  (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count);
+                  (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count,
+                (unsigned long long)fifb_total);
         } else {
           auto it = rs_pending.begin();
-          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u\n",
+          fprintf(dbg, "[cli] carriers=%zu unacked=%zu unacked_bytes=%zu reassembly=%zu rs_pending=%zu next_deliver_id=%llu next_send_id=%llu stdout_buf=%zu rs_redundancy=%.2f small_packet_copies=%u server_rs_pending=%u first_rs_id=%llu shards=%zu k=%u n=%u fifb=%llu\n",
                   carriers.size(), unacked_sends.size(), unacked_bytes, reassembly.size(), rs_pending.size(),
                   (unsigned long long)next_deliver_id, (unsigned long long)next_send_id, stdout_buf.size(),
                   (double)effective_rs_redundancy, (unsigned)effective_small_packet_redundancy, (unsigned)server_rs_pending_count,
-                  (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n);
+                  (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n,
+                (unsigned long long)fifb_total);
         }
         fflush(dbg);
       }
