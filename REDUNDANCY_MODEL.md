@@ -201,3 +201,33 @@ carrier count ran to `max_connections`. Everything maxed out, permanently. The r
   `server.cc` / `client.cc` (`on_rs_shard_gap` threshold, server adapt block, client carrier
   sizing + `link_stalled`). Tests: `test_carrier_adapt.cc` (`test_stall_threshold`,
   `test_carrier_target`) and the `real-link-jitter-highlat` scenario in `test_all.sh`.
+
+## 10. Revision (2026-10-01): the loss floor — windowed-min `q`
+
+Measured on the production-like bursty repro (tmux-style bursts + 5 %-loss link),
+the instantaneous `q` is **self-corrupted by the redundancy it feeds**: a burst's
+own amplification (rs=2.0 ⇒ ~3× wire, copies up to 16) congests the path, shards
+read "late", `q` measures 0.35–0.6 while the honest per-shard loss is ~0.05, the
+model maxes rs/copies, and the pin survives between bursts because honest quiet
+windows age out of the estimator. The redundancy was endogenously creating the
+loss signal it defended against.
+
+Fix (same logic as min-RTT): queueing is monotone, so the **minimum** over recent
+window-`q` values tracks the honest loss floor. As implemented:
+
+- `LossFloor` (net_util.h): ring of 64 window values, 45 s horizon, minimum over
+  the **kMinFresh=5 most recent fresh** entries (a plain min let near-zero-latency
+  warmup windows pin the floor at 0.000 on a genuinely 30 %-loss link — measured);
+  falls back to the newest value when everything aged out.
+- Two sample sources flush into the same floor: the RS shard-gap windows (which
+  only sample during bulk flow — exactly when corrupted) **plus** a continuous
+  small-copy-gap window (≥30 gaps, same stall-threshold semantics) so quiet
+  periods keep refreshing the floor.
+- The server applies floors to `est_loss_q` (rs sizing) and `q_jit` (copies
+  sizing); the client mirrors for its reported s2c `q`. `rs ≥ 0.35` hard floor
+  (`k ≤ ¾n` shard-loss margin at any fleet size).
+
+Measured: bursty 5 %-loss interactive p50 468 → 254–259 ms (clean-link RTT),
+rs 1.9–2.0 → 0.17–0.35, copies 9–16 → 3–5; 30 %-loss revalidation unchanged
+(p50 parity — at genuinely high loss the floor reads high and the model keeps
+redundancy, as it should).
