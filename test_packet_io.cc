@@ -402,12 +402,21 @@ static void run_front_insert_case(size_t free_bytes, bool use_ack, const char* l
           "front-insert: partial flush left write_pos mid-packet (precondition)");
   }
 
-  // THE hazard call: front-insert while (possibly) mid-packet.
+  // THE hazard call: front-insert while (possibly) mid-packet. The fallback
+  // counter must increment exactly when the insert is rerouted to the back.
+  const uint64_t fallbacks_before = s.front_insert_fallbacks;
   if (use_ack) {
     append_ack_front(s, 42);
   } else {
     const uint8_t hello[5] = {'h', 'e', 'l', 'l', 'o'};
     append_small_front(s, 2, hello, 5);
+  }
+  if (expect_jump) {
+    check(s.front_insert_fallbacks == fallbacks_before,
+          "front-insert: aligned jump must not count a fallback");
+  } else {
+    check(s.front_insert_fallbacks == fallbacks_before + 1,
+          "front-insert: mid-packet fallback must increment the counter exactly once");
   }
 
   // The partial-flush output sits at the TAIL of the pipe, behind the filler:
