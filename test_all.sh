@@ -667,6 +667,38 @@ run_test "bursty-bulk-loss-floor-5pct" \
     --extra-client-args --max-connections 120
 
 # ============================================================================
+# fleet-growth-bursty — 2026-10-01 production incident: the fleet stuck at 87
+#     carriers with desired=30 for ~80 minutes, making every burst completion
+#     wait for k=floor(n/(1+rs)) arrivals (k=64-of-87 at rs 0.35) through the
+#     shared burst queue (measured p95 11.5s at n~120 vs 3.1s at n~30).
+#     Root cause, reproduced in this exact scenario pre-fix: desired_carriers_dyn
+#     pins at max_connections during bursts (burst spread reads as stall fraction
+#     through the divergent n*ln(1-q)/ln(1-rho) sizing), and the window-saturation
+#     growth gate only covered DURING-burst instants — load_pressure adds fired in
+#     the quiet gaps and ratcheted the fleet 30->120 within ~100s (104 adds/240s,
+#     plus rs_pending-pressure adds at 1/10s). Fix: saturation latch-hold gates
+#     load_pressure for 8s after any saturation event; rs_pending adds fire only
+#     below the configured floor; excess release accelerates when >10 above target.
+#     Gate: fleet must stay <= 40 (pre-fix measured n~120 by t=100s).
+# ============================================================================
+run_test "fleet-growth-bursty" \
+    --init-latency-override 0.05 \
+    --scenario-bw-flood \
+    --bw-flood-rate-x 1.3 \
+    --bw-flood-burst-every-s 3 \
+    --bw-flood-burst-ms 400 \
+    --link-bandwidth-kbps 2048 \
+    --latency-random \
+    --latency-random-low-ms 250 \
+    --latency-random-high-ms 800 \
+    --latency-random-pct 5 \
+    --connections 30 \
+    --packet-size 400 --payload-size 400 \
+    --continuous-duration 150 \
+    --assert-max-carrier-count 40 \
+    --extra-client-args --max-connections 120
+
+# ============================================================================
 # 14 adapt-download-only-s2c — audit AUD-1: a session with near-zero c2s RS
 #     traffic (download-only shape) must still run the server's redundancy
 #     adaptation for its own s2c direction: the gate previously required c2s

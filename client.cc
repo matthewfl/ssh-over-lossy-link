@@ -469,6 +469,11 @@ int run_client(const Args& args) {
   const uint64_t reap_check_interval_ns = 2000 * 1000000ULL;
   static constexpr uint64_t reduction_close_interval_ns = 60 * 1000000000ULL;  // 60s between reduction closes
   static constexpr uint64_t excess_release_interval_ns = 15 * 1000000000ULL;   // 15s between excess releases
+  // Fleet-growth saturation hold (2026-10-01 production log: fleet stuck at 87 carriers with
+  // desired=30 for ~80 minutes): after ANY send-window saturation event, suppress
+  // load_pressure carrier adds for this window — see the load_pressure gate in the add block.
+  static constexpr uint64_t kFleetGrowthHoldNs = 8 * 1000000000ULL;
+  uint64_t fleet_growth_hold_ns = 0;   // 0 = no hold; else the hold-until timestamp
 
   // RTT-scaled timeouts: use observed latency so low-latency links get tighter timeouts,
   // high-latency links get longer. Cold start uses rtt_hint_ms or 5 s conservative default,
@@ -1808,8 +1813,18 @@ int run_client(const Args& args) {
         // rate (1 per interval) plus the target's own smoothing avoids oscillation. Runs in
         // ALL modes (the dead-idle reap below is gated and skipped in light SSH traffic, which
         // would otherwise leave grown carriers stuck forever).
+        // Proportional excess release (2026-10-01 production: a growth episode left the
+        // fleet stuck at 87 with desired=30 — at 1-per-15s the unwind needs ~14 minutes of
+        // cumulative quiet, and churn replacements offset releases one-for-one, so it never
+        // happened). Far above the target, release faster: every excess carrier costs
+        // k=floor(n/(1+rs)) arrivals per group through the shared queue. Near the target the
+        // original slow cadence keeps its anti-oscillation smoothing.
+        const size_t excess_carriers = carriers.size() - desired_carriers_dyn;
+        const uint64_t release_interval_now_ns = (excess_carriers > 10)
+            ? 3 * 1000000000ULL    // >10 excess: unwind ~87->30 in ~3 minutes
+            : excess_release_interval_ns;
         if (args.config.auto_adapt && carriers.size() > desired_carriers_dyn && !heavy_backlog
-            && now_p - last_excess_release_ns >= excess_release_interval_ns) {
+            && now_p - last_excess_release_ns >= release_interval_now_ns) {
           int to_close = -1;
           for (auto& [cfd, cs] : carriers) {
             if (cs.connecting) continue;
@@ -1942,13 +1957,21 @@ int run_client(const Args& args) {
       // Client rs_pending: s2c path lossy (client waiting for server shards).
       // Server rs_pending: c2s path lossy (server waiting for client shards); reported via SERVER_METRICS.
       // On very lossy links we add every 10s so n grows and more shards have a chance to arrive.
+      // BELOW THE FLOOR ONLY (2026-10-02): at/above the configured fleet the pending is
+      // completion spread through the shared bottleneck, not path scarcity — adding
+      // carriers then raises the per-group arrival count k=floor(n/(1+rs)) and deepens
+      // the very stall being complained about (measured: 8 adds/300s at n=30 ratcheting
+      // the fleet up on a 15%-spike link; k=64-of-87 groups at rs 0.35 stall for the
+      // slowest arrivals through the shared queue).
       static constexpr size_t RS_PENDING_PRESSURE_THRESHOLD = 50;
       static constexpr uint64_t RS_PENDING_PRESSURE_ADD_INTERVAL_NS = 10 * 1000000000ULL;
       bool rs_pending_pressure = args.config.auto_adapt
+                                && carriers.size() < target_carriers
                                 && rs_pending.size() > RS_PENDING_PRESSURE_THRESHOLD
                                 && (now - last_rs_pending_pressure_add_ns >= RS_PENDING_PRESSURE_ADD_INTERVAL_NS
                                     || last_rs_pending_pressure_add_ns == 0);
       bool server_rs_pending_pressure = args.config.auto_adapt
+                                       && carriers.size() < target_carriers
                                        && server_rs_pending_count > RS_PENDING_PRESSURE_THRESHOLD
                                        && (now - last_rs_pending_pressure_add_ns >= RS_PENDING_PRESSURE_ADD_INTERVAL_NS
                                            || last_rs_pending_pressure_add_ns == 0);
@@ -2012,7 +2035,20 @@ int run_client(const Args& args) {
         for (const auto& [uid, ui] : unacked_sends) c2s_outstanding_for_gate += ui.wire_cost();
         const bool window_saturated = server_s2c_window_saturated
             || (c2s_outstanding_for_gate >= rate_window_cap(c2s_window, get_window_base_rtt_ns()) * 3 / 4);
-        bool load_pressure = !window_saturated
+        // Saturation latch-hold (2026-10-01 production: fleet stuck at 87, desired=30): the
+        // during-burst-only gate above misses the BETWEEN-burst windows of a bursty session.
+        // desired_carriers_dyn pins at max_connections during bursts (burst spread reads as
+        // stall fraction through the divergent n*ln(1-q)/ln(1-rho) sizing — ~34x at q=0.5),
+        // so load_pressure fired in the quiet gaps and ratcheted the fleet 30->120 within
+        // ~100s (measured: 104 load_pressure adds in 240s). A big fleet then needs
+        // k=floor(n/(1+rs)) arrivals per group through the SHARED burst queue (k=64 at
+        // n=87, rs 0.35), making every burst completion slower — measured p95 11.5s at
+        // n~120 vs 3.1s at n~30. So one saturation event gates growth for a hold window
+        // covering the whole burst cycle, not just the saturated instant. A clean link
+        // never saturates and grows exactly as before.
+        if (window_saturated) fleet_growth_hold_ns = now + kFleetGrowthHoldNs;
+        const bool fleet_growth_held = (fleet_growth_hold_ns != 0 && now < fleet_growth_hold_ns);
+        bool load_pressure = !window_saturated && !fleet_growth_held
                              && (carriers.size() >= target_carriers)
                              && (carriers.size() < desired_carriers_dyn);
         bool need_replacement = !pending_reap.empty() && carriers.size() <= target_carriers;

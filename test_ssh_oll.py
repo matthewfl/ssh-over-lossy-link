@@ -1113,7 +1113,13 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         period_start = time.perf_counter()
         while not stop.is_set():
             now = time.perf_counter()
-            in_burst = (not bursty) or ((now - period_start) % burst_every) < (burst_ms / 1000.0)
+            # burst_every <= 0 means "not bursty": degrade to continuous flood (the
+            # pre-bursty behavior). Without this guard the modulo raises ZeroDivisionError
+            # on the first iteration and BOTH writer threads die instantly — every gate
+            # then passes vacuously with zero traffic (2026-10-02: bw-flood-window-backpressure
+            # had been a vacuous pass since the bursty mode landed).
+            in_burst = (not bursty) or burst_every <= 0.0 \
+                or ((now - period_start) % burst_every) < (burst_ms / 1000.0)
             if in_burst:
                 flood = os.urandom(flood_size)
                 ping = os.urandom(ping_size)
@@ -1272,6 +1278,16 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     failures = _evaluate_test_criteria(args, interactive, stall_snap,
                                        timed_latencies_ms=timed_snap,
                                        test_start_time=t_start)
+    # Vacuous-pass guard (2026-10-02): a bw-flood run whose writers die instantly
+    # (or whose link carries nothing at all) sails through every gate — zero
+    # latency samples, zero unacked, zero stall events. bw-flood-window-backpressure
+    # passed five full suites this way after the bursty-mode modulo bug
+    # (burst_every=0 -> ZeroDivisionError) killed both writer threads at t=0.
+    total_completed = (len(ping_snap["s2c"]) + len(ping_snap["c2s"])
+                       + len(flood_snap["s2c"]) + len(flood_snap["c2s"]))
+    if total_completed < 10:
+        failures.append(f"vacuous run: only {total_completed} completions in "
+                        f"{duration:.0f}s (writers dead or link carried nothing)")
     if failures:
         print("\nTEST FAILED:", file=sys.stderr)
         for f in failures:
