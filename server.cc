@@ -820,10 +820,14 @@ int run_server(const Args& args) {
                 // Reset timer so the periodic 3 s retransmit doesn't immediately
                 // fire a redundant duplicate of what we just queued.
                 ui.send_ns = retransmit_now;
-                // Re-stamp the RTT send-time so the eventual ACK measures latency from
-                // this retransmission, not the original pre-outage send (which would
-                // record an RTT ~= the outage duration and inflate every timeout).
-                ack_send_time_ns[uid] = retransmit_now;
+                // Karn's rule: an ACK for a retransmitted id is ambiguous (could answer
+                // the original send), so don't time it at all. Drop the RTT send-time
+                // instead of re-stamping it: a stale in-flight ACK for the ORIGINAL
+                // transmission can arrive milliseconds after a re-stamp and record a
+                // bogus ~2 ms sample, permanently poisoning the monotone session-min
+                // base RTT (seen in production as [srv] base_rtt_ms=2 on a ~300 ms
+                // link). The client applies the same rule via ui.retransmitted.
+                ack_send_time_ns.erase(uid);
               }
               ev.events = EPOLLIN | EPOLLOUT;
               ev.data.fd = client;
@@ -1254,10 +1258,12 @@ int run_server(const Args& args) {
             rt_idx += ui.n;
           }
           ui.send_ns = now_ns_val;  // throttle: don't retransmit again for 3 s
-          // Re-stamp RTT send-time so the eventual ACK measures from this retransmission,
-          // not the original send (which would record an outage-sized RTT and inflate
-          // every RTT-scaled timeout). See the reconnect-retransmit path for the same fix.
-          ack_send_time_ns[uid] = now_ns_val;
+          // Karn's rule: an ACK for a retransmitted id is ambiguous, so don't time it.
+          // Erase the RTT send-time rather than re-stamping it — a stale in-flight ACK
+          // for the original send can land right after a re-stamp and record a bogus
+          // tiny sample that poisons the session-min base RTT forever (production
+          // [srv] base_rtt_ms=2). See the reconnect-retransmit path for the same rule.
+          ack_send_time_ns.erase(uid);
         }
       }
     }
