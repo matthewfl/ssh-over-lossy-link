@@ -630,11 +630,19 @@ def _evaluate_test_criteria(args, all_latencies_ms, stall_events,
     stall_ms = [dur_s * 1000.0 for _, dur_s in stall_events]
 
     if getattr(args, "test_max_latency", None) is not None:
-        worst = max(full_latencies + stall_ms) if (full_latencies or stall_ms) else 0.0
-        if worst > args.test_max_latency:
+        # Liveness invariant: an empty observation stream must never PASS a threshold
+        # gate — max(()) on an empty set silently read as 0.0 and certified the
+        # bw-flood vacuous pass (five green suites with zero traffic, 2026-10-02).
+        if not (full_latencies or stall_ms):
             failures.append(
-                f"max latency {worst:.1f} ms exceeds threshold {args.test_max_latency:.1f} ms"
+                "no completed measurements or stalls — cannot evaluate max latency (vacuous run)"
             )
+        else:
+            worst = max(full_latencies + stall_ms)
+            if worst > args.test_max_latency:
+                failures.append(
+                    f"max latency {worst:.1f} ms exceeds threshold {args.test_max_latency:.1f} ms"
+                )
 
     if getattr(args, "test_max_average_latency", None) is not None:
         if full_latencies:
@@ -1030,6 +1038,14 @@ def _run_continuous(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     test_failures = _evaluate_test_criteria(args, all_latencies_ms, stall_snap,
                                             timed_latencies_ms=timed_snap,
                                             test_start_time=test_start_time)
+    # Liveness invariant: any legit continuous run completes hundreds of measurements
+    # (self-clocked ping-pong per direction). Fewer than 10 means the tunnel carried
+    # almost nothing and every gate reads an empty stream.
+    if len(all_latencies_ms) < 10:
+        test_failures.append(
+            f"vacuous run: only {len(all_latencies_ms)} completed measurements "
+            "(tunnel carried almost nothing)"
+        )
     if test_failures:
         print("\nTEST FAILED:", file=sys.stderr)
         for f in test_failures:
@@ -1459,6 +1475,15 @@ def _run_client_crash_idle(client_proc, tcp_conn, stop_proxy, tcp_listen, args, 
         for th in (th_s2c, th_c2s, th_drain):
             th.join(timeout=3)
         print(f"client-crash: bulk drained {drained[0] // 1024} KB from client stdout")
+        # Liveness invariant (precondition attestation): the CPU-idle verdict is only
+        # meaningful if the flood actually flowed before the kill — passing runs drain
+        # hundreds of MB (worst healthy slow-flood case measured ~5 MB). <1 MB means
+        # the writers died and the reconnect-wait state was never exercised under load.
+        if drained[0] < 1024 * 1024:
+            print(f"client-crash: bulk precondition failed — only {drained[0] // 1024} KB "
+                  "drained (need >= 1 MB; flood never flowed)", file=sys.stderr)
+            stop_proxy.set()
+            return 1
         time.sleep(2.0)  # carrier EOFs propagate; server settles into its reconnect wait
     else:
         # Path A trigger: one odd-sized s2c chunk (< block_size) parks in backend_read_buf
@@ -1875,6 +1900,14 @@ def _run_small_storm(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     failures = _evaluate_test_criteria(args, interactive, stall_snap,
                                        timed_latencies_ms=timed_snap,
                                        test_start_time=t_start)
+    # Liveness invariant: a direction that delivered (almost) nothing makes the overhead
+    # ratio and goodput gates read empty/meaningless streams. Any legit storm run
+    # delivers hundreds of KB; <10 KB per direction means the frames never flowed.
+    for d in ("s2c", "c2s"):
+        if delivered_snap[d] < 10240:
+            failures.append(
+                f"{d} vacuous run: only {delivered_snap[d]} bytes delivered (frames never flowed)"
+            )
     if buckets:
         for d in ("s2c", "c2s"):
             wire = buckets[d].bytes_passed
@@ -2275,8 +2308,9 @@ def check_carrier_stability(client_pid, max_removes, warmup_s=15.0):
     txt = open(log, errors="replace").read()
     ts = re.findall(r"\bt=(\d+)", txt)
     if not ts:
-        print("carrier-stability: no timestamps in client log; skipping", flush=True)
-        return 0
+        print("carrier-stability: no timestamps in client log — no evidence, failing loudly",
+              file=sys.stderr, flush=True)
+        return 1
     warmup_end = int(ts[0]) + int(warmup_s * 1000)
     benign = {"slow_reduction", "excess_release"}  # intended reductions, not churn
     churn = 0
@@ -2308,15 +2342,22 @@ def check_server_stall_ms(max_stall_ms, warmup_s=15.0):
     txt = open(log, errors="replace").read()
     ts = re.findall(r"\bt=(\d+)", txt)
     if not ts:
-        print("stall-ms: no timestamps in server log; skipping", flush=True)
-        return 0
+        print("stall-ms: no timestamps in server log — no evidence, failing loudly",
+              file=sys.stderr, flush=True)
+        return 1
     warmup_end = int(ts[0]) + int(warmup_s * 1000)
     worst = 0
+    n_lines = 0
     for m in re.finditer(r"adapt-model t=(\d+)[^\n]*stall_ms=(\d+)", txt):
         t, stall = int(m.group(1)), int(m.group(2))
         if t < warmup_end:
             continue
+        n_lines += 1
         worst = max(worst, stall)
+    if n_lines == 0:
+        print(f"stall-ms: no adapt-model lines after {warmup_s:.0f}s warmup — no evidence, "
+              "failing loudly (server dead or never adapted)", file=sys.stderr, flush=True)
+        return 1
     ok = worst <= max_stall_ms
     print(f"stall-ms: max stall_ms after {warmup_s:.0f}s warmup = {worst} ms "
           f"(limit {max_stall_ms} ms) -> {'PASS' if ok else 'FAIL'}", flush=True)
@@ -2363,8 +2404,9 @@ def check_server_adapts(min_lines=25, warmup_s=20.0):
     txt = open(log, errors="replace").read()
     ts = re.findall(r"\bt=(\d+)", txt)
     if not ts:
-        print("server-adapts: no timestamps in server log; skipping", flush=True)
-        return 0
+        print("server-adapts: no timestamps in server log — no evidence, failing loudly",
+              file=sys.stderr, flush=True)
+        return 1
     warmup_end = int(ts[0]) + int(warmup_s * 1000)
     n = sum(1 for m in re.finditer(r"adapt-model t=(\d+)", txt) if int(m.group(1)) >= warmup_end)
     ok = n >= min_lines
@@ -2418,8 +2460,9 @@ def check_server_unacked(max_bytes):
     txt = open(logs[0], errors="replace").read()
     vals = [int(m.group(1)) for m in re.finditer(r"\[srv\] [^\n]*?unacked_bytes=(\d+)", txt)]
     if not vals:
-        print("server-unacked: no [srv] lines in the newest server log; skipping", flush=True)
-        return 0
+        print("server-unacked: no [srv] lines in the newest server log — no evidence, "
+              "failing loudly (server dead or debug off)", file=sys.stderr, flush=True)
+        return 1
     peak = max(vals)
     ok = peak <= max_bytes
     print(f"server-unacked: peak unacked_bytes {peak} (limit {max_bytes}) -> {'PASS' if ok else 'FAIL'}",
@@ -2438,16 +2481,24 @@ def check_carrier_count(client_pid, max_count, warmup_s=15.0):
     txt = open(log, errors="replace").read()
     ts = re.findall(r"\bt=(\d+)", txt)
     if not ts:
-        print("carrier-count: no timestamps in client log; skipping", flush=True)
-        return 0
+        print("carrier-count: no timestamps in client log — no evidence, failing loudly",
+              file=sys.stderr, flush=True)
+        return 1
     warmup_end = int(ts[0]) + int(warmup_s * 1000)
     peak = 0
+    n_diag = 0
     # carriers-diag lines carry both t= and n= (the [cli] status lines lack t=).
     for m in re.finditer(r"carriers-diag t=(\d+) n=(\d+)", txt):
         t, n = int(m.group(1)), int(m.group(2))
         if t < warmup_end:
             continue
+        n_diag += 1
         peak = max(peak, n)
+    if n_diag == 0:
+        print(f"carrier-count: no carriers-diag lines after {warmup_s:.0f}s warmup — "
+              "no evidence, failing loudly (client dead before warmup end)",
+              file=sys.stderr, flush=True)
+        return 1
     ok = peak <= max_count
     print(f"carrier-count: peak {peak} carriers after {warmup_s:.0f}s warmup "
           f"(limit {max_count}) -> {'PASS' if ok else 'FAIL'}", flush=True)
@@ -2467,15 +2518,23 @@ def check_max_small_copies(client_pid, max_copies, warmup_s=15.0):
     txt = open(log, errors="replace").read()
     ts = re.findall(r"\bt=(\d+)", txt)
     if not ts:
-        print("small-copies: no timestamps in client log; skipping", flush=True)
-        return 0
+        print("small-copies: no timestamps in client log — no evidence, failing loudly",
+              file=sys.stderr, flush=True)
+        return 1
     warmup_end = int(ts[0]) + int(warmup_s * 1000)
     peak = 0
+    n_diag = 0
     for m in re.finditer(r"carriers-diag t=(\d+).*? copies=(\d+)", txt):
         t, c = int(m.group(1)), int(m.group(2))
         if t < warmup_end:
             continue
+        n_diag += 1
         peak = max(peak, c)
+    if n_diag == 0:
+        print(f"small-copies: no carriers-diag lines after {warmup_s:.0f}s warmup — "
+              "no evidence, failing loudly (client dead before warmup end)",
+              file=sys.stderr, flush=True)
+        return 1
     ok = peak <= max_copies
     print(f"small-copies: peak {peak} copies after {warmup_s:.0f}s warmup "
           f"(limit {max_copies}) -> {'PASS' if ok else 'FAIL'}", flush=True)
@@ -3504,6 +3563,13 @@ def main():
 
     all_latencies_ms = latencies_client_to_tcp + latencies_tcp_to_client
     test_failures = _evaluate_test_criteria(args, all_latencies_ms, [])
+    # Liveness invariant: the plain path always completes its warmup round-trips; fewer
+    # than two measurements means the tunnel never carried anything and every gate
+    # would pass vacuously.
+    if len(all_latencies_ms) < 2:
+        test_failures.append(
+            f"vacuous run: only {len(all_latencies_ms)} completed measurements (tunnel dead)"
+        )
     if test_failures:
         print("\nTEST FAILED:", file=sys.stderr)
         for f in test_failures:
