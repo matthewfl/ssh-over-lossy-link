@@ -188,8 +188,10 @@ its redundancy fields in auto mode** (else client and model fight). In `--no-aut
 client's `SET_CONFIG` fully controls redundancy and the server doesn't adapt.
 
 ### RTT and ACKs (bidirectional)
-- Server sends `ACK` when it has written client→server data to the backend; client
-  measures the c2s RTT from those ACKs.
+- Server sends `ACK` when it has received client→server data in order, as long as at most
+  `kAckAheadOfBackendBytes` (512 KB) of acknowledged data still waits for the backend write
+  (so a slow sshd is not mistaken for loss, yet still backpressures); client measures the
+  c2s RTT from those ACKs.
 - Client sends `ACK` when it has written server→client data to stdout; server measures
   s2c RTT.
 - **ACKs are cumulative and coalesced.** They already meant "all ids ≤ `acked_id`
@@ -255,7 +257,7 @@ model every ~300 ms:
 - **Floor** `max(2, --connections)` always maintained; grow up to `--max-connections`.
 - **Primary lever = stall fraction.** The client sizes from the measured per-shard stall
   fraction `ρ̄` (= `s2c_loss_q`), holding it near `ρ_target`≈0.02: `desired_carriers_dyn =
-  clamp(⌈n·ln(1−ρ̄)/ln(1−ρ_target)⌉, floor, max)` (`carrier_adapt::carrier_target_from_stall`).
+  clamp(⌈n·ln(1−ρ̄)/ln(1−ρ_target)⌉, floor, max)` (`carrier_adapt::carrier_target_for_load`).
   Since `ρ̄ = 1−(1−p)^λ`, a **clean** link (`ρ̄≈0`) stays at the **floor regardless of
   throughput** — *load alone does not grow carriers* (this is what stopped a clean
   high-throughput flood from over-provisioning to the cap, e.g. fixed-10ms at 4000 pps which
@@ -283,8 +285,11 @@ model every ~300 ms:
 ### Reliability mechanisms
 - **Unacked buffer** (`unacked_sends` / `unacked_data`): every SMALL and RS group is
   kept until ACKed. Retransmit paths: (1) on reconnect, replay all unacked onto the new
-  carrier; (2) periodic (~500 ms), resend items older than ~4×RTT to a healthy carrier,
-  tracked by *logical carrier_id* (not fd) so churn doesn't cause dupes.
+  carrier; (2) stall-driven (`packet_io::retransmit_stalled`, shared by both sides): only
+  once the peer's cumulative ACK frontier has been stuck ~4×RTT, a byte-bounded prefix from
+  the head-of-line id, front-inserted on the least-backlogged carriers not yet used for that
+  shard (tracked by *logical carrier_id*). Carriers are TCP: data on a live carrier is
+  delayed, never lost, so blind timer retransmit of everything unacked was a storm.
 - **Dead-connection detection (data-based, no blanket pings)**: immediate (EPOLLHUP /
   read / write EPIPE); **rx-dead** (carrier silent while peers deliver) reported peer→peer
   via `CARRIER_STATUS` over a healthy carrier, with the client confirming its own s2c

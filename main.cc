@@ -96,8 +96,8 @@ void usage(const char* program_name) {
     << c.connect_timeout_sec << "\n"
     << "  --min-data-per-minute N       Idle keepalive: each carrier sends >=N bytes/min (10s windows) so a firewall doesn't close an idle link; 0 disables. Default: "
     << c.min_data_per_minute << "\n"
-    << "  --max-added-latency-ms N      RS redundancy budget: a shard arriving >N ms after its group's\n"
-    << "                                first counts as 'late'; lower N = more parity for tighter latency. Default: "
+    << "  --max-added-latency-ms N      Reserved / currently ignored (the redundancy model now uses an\n"
+    << "                                RTT-relative stall threshold). Accepted for compatibility. Default: "
     << c.max_added_latency_ms << "\n"
     << "  --reconnect-timeout N         Global idle timeout (s); 0 = adaptive (12×RTT, min 60 s, max 300 s); else 1–7200. Default: "
     << c.reconnect_timeout_sec << "\n"
@@ -238,7 +238,9 @@ int main(int argc, char* argv[]) {
     return ssholl::run_server(args);
   }
   if (!args.file_lock.empty()) {
-    int lock_fd = open(args.file_lock.c_str(), O_RDWR | O_CREAT, 0644);
+    // O_CLOEXEC: the forked ssh launcher/carrier children must not inherit (and thereby
+    // keep holding) the startup lock after this process is done with it.
+    int lock_fd = open(args.file_lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (lock_fd < 0) {
       std::cerr << "ssh-oll: cannot open lock file: " << args.file_lock << "\n";
       return 1;

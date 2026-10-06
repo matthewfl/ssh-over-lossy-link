@@ -187,6 +187,11 @@ bool is_heavy_backlog(uint64_t unacked_bytes, size_t unacked_count) {
   return unacked_bytes > kHeavyBacklogBytes || unacked_count > kHeavyBacklogCount;
 }
 
+bool is_interactive_burst(size_t pending_blocks, size_t live_carriers, size_t unacked_count) {
+  if (is_heavy_backlog(0, unacked_count)) return false;
+  return pending_blocks <= std::max<size_t>(1, live_carriers / 2);
+}
+
 bool should_send_idle_ping(bool write_buf_empty, uint64_t now_ns,
                            uint64_t last_send_ns, uint64_t last_recv_ns,
                            uint64_t ping_idle_ns) {

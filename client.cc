@@ -528,6 +528,13 @@ int run_client(const Args& args) {
   // than the link builds only a bounded queue instead of an ever-deepening one. Interactive
   // SMALL packets are counted but never gated.
   RateWindow c2s_window;
+  // Last time the server's cumulative ACK frontier advanced (or we started): retransmits
+  // fire only once it has been stuck for the retransmit timeout (see retransmit_stalled).
+  uint64_t c2s_frontier_progress_ns = now_ns();
+  // Cumulative c2s wire accounting for the [cli] debug dump: where the uploaded bytes go
+  // (fresh RS shards / SMALL copies / retransmits) and how many groups/smalls carried them.
+  struct WireStats { uint64_t rs_bytes = 0, small_bytes = 0, rt_bytes = 0, groups = 0, group_blocks = 0, smalls = 0; };
+  WireStats c2s_wire;
 
   // Track outstanding PINGs so we can debug long RTTs / missing PONGs.
   // Keyed by (fd, ping_id) -> send_time_ns.
@@ -670,7 +677,9 @@ int run_client(const Args& args) {
     }
     {
       uint64_t mq_outstanding = 0;
-      for (const auto& [uid, ui] : unacked_sends) mq_outstanding += ui.data.size();
+      // Wire cost, matching the units of rate_window_cap (payload bytes under-count by the
+      // redundancy factor, so the server's saturation clamp never engaged on uploads).
+      for (const auto& [uid, ui] : unacked_sends) mq_outstanding += ui.wire_cost();
       bool mq_c2s_sat = mq_outstanding >= rate_window_cap(c2s_window, get_window_base_rtt_ns());
       packet_io::append_client_metrics(it->second.write_buf,
                                       m.avg_shard_spread_ns, m.avg_extra_shard_gap_ns,
@@ -878,6 +887,8 @@ int run_client(const Args& args) {
     }
     // Data confirmed delivered: no longer need to retransmit.
     uint64_t acked_bytes = 0;
+    if (!unacked_sends.empty() && unacked_sends.begin()->first <= acked_id)
+      c2s_frontier_progress_ns = recv_time;
     for (auto it_u = unacked_sends.begin(); it_u != unacked_sends.end() && it_u->first <= acked_id; ) {
       acked_bytes += it_u->second.wire_cost();  // wire cost: the rate estimate prices capacity
       it_u = unacked_sends.erase(it_u);
@@ -1047,6 +1058,11 @@ int run_client(const Args& args) {
     // deadlock the stream.
     uint64_t c2s_outstanding = 0;
     for (const auto& [uid, ui] : unacked_sends) c2s_outstanding += ui.wire_cost();
+    // Bulk vs interactive is decided once per pump from the backlog waiting in stdin_buf
+    // (see carrier_adapt::is_interactive_burst).
+    const bool interactive_burst = carrier_adapt::is_interactive_burst(
+        stdin_buf.size() / std::max<size_t>(1, effective_max_packet), carriers.size(),
+        unacked_sends.size());
     while (stdin_buf.size() >= effective_max_packet && !carriers.empty() &&
            rate_window_open(c2s_outstanding, c2s_window, get_window_base_rtt_ns())) {
       const size_t block_size = effective_max_packet;
@@ -1056,8 +1072,7 @@ int run_client(const Args& args) {
       // copy count (copies = ceil(ln eps / ln q), so q ≈ eps^(1/copies)) the server pushes —
       // no extra wire field. Bulk groups (heavy unacked backlog) pass 0 → parity-as-fraction.
       double iq = 0.0;
-      if (args.config.auto_adapt &&
-          !carrier_adapt::is_heavy_backlog(0, unacked_sends.size())) {
+      if (args.config.auto_adapt && interactive_burst) {
         unsigned c = std::max(2u, effective_small_packet_redundancy);
         iq = std::pow(carrier_adapt::kInteractiveEps, 1.0 / static_cast<double>(c));
       }
@@ -1120,6 +1135,9 @@ int run_client(const Args& args) {
           ui.rs_shard_sent_on[si].insert(shard_carriers[si]);
       }
       next_send_id++;
+      c2s_wire.rs_bytes += num_shards * block_size;
+      c2s_wire.groups += 1;
+      c2s_wire.group_blocks += k;
       c2s_outstanding += num_shards * block_size;  // wire cost; RS wire_bytes set below
       if (dbg && unacked_sends.size() > 500 && next_send_id % 100 == 0)
         fprintf(dbg, "[pump-grow t=%llu unacked=%zu next_send_id=%llu k=%u block=%zu outstanding_kb=%zu cap_kb=%zu rate_kbps=%.0f]\n",
@@ -1170,6 +1188,8 @@ int run_client(const Args& args) {
         c2s_packets_sent_window += n_copies;
         c2s_outstanding += chunk * n_copies;  // window accounting at WIRE cost
         ui.wire_bytes = chunk * n_copies;
+        c2s_wire.small_bytes += chunk * n_copies;
+        c2s_wire.smalls += 1;
         if (n_copies > 1) next_send_id++;
         stdin_buf.clear();
         stdin_partial_since_ns = 0;
@@ -1237,7 +1257,9 @@ int run_client(const Args& args) {
         uint8_t buf[READ_BUF_SIZE];
         // Drain stdin completely in one epoll iteration so we don't need multiple
         // wakeups to receive a full payload (avoids extra ~scheduler latency).
-        while (true) {
+        // Bounded by the throttle: a producer as fast as our reads must not be able to grow
+        // stdin_buf without limit inside this one loop (the throttle below only runs after it).
+        while (stdin_buf.size() < STDIN_THROTTLE_BYTES) {
           ssize_t nr = read(STDIN_FILENO, buf, sizeof buf);
           if (nr <= 0) {
             if (nr == 0) {
@@ -1334,15 +1356,13 @@ int run_client(const Args& args) {
                   // the same logical carrier when fds are reused.
                   ui.small_sent_on.insert(it->second.carrier_id);
                 } else {
-                  // Re-encode RS with the same (n, k, block_size) so the receiver can
-                  // combine these shards with any partials it retained.
-                  auto shards = packet_io::rs_reencode_shards(ui);
-                  for (unsigned si = 0; si < ui.n; ++si) {
-                    packet_io::append_rs_shard(it->second.write_buf, uid,
-                                               ui.n, ui.k, ui.block_size, si, shards[si].data());
-                    // Track by logical carrier_id, not raw fd, so the retransmit
-                    // logic can correctly avoid resending the same shard on the
-                    // same logical carrier when fds are reused.
+                  // Replay only the k DATA shards (sliced straight from the stored block, no
+                  // re-encode): they all ride this ONE new carrier, so parity on the same TCP
+                  // connection adds no protection — the receiver needs any k distinct indices of
+                  // the original (n, k, block_size) group, and combines them with any partials.
+                  for (unsigned si = 0; si < ui.k; ++si) {
+                    packet_io::append_rs_shard(it->second.write_buf, uid, ui.n, ui.k, ui.block_size, si,
+                                               ui.data.data() + static_cast<size_t>(si) * ui.block_size);
                     ui.rs_shard_sent_on[si].insert(it->second.carrier_id);
                   }
                 }
@@ -1371,48 +1391,34 @@ int run_client(const Args& args) {
     }
 
     if (stdin_eof && !stdin_buf.empty() && !carriers.empty()) {
-      stdin_partial_since_ns = 0;  // EOF: flush everything now, don't hold for --max-delay
-      while (!stdin_buf.empty()) {
-        size_t chunk = std::min(stdin_buf.size(), effective_max_packet);
-        const bool small_packet = (chunk < effective_max_packet);
-        // Small: n_copies = effective_small_packet_redundancy (RTT-adjusted). Full block: 1 copy (RS handles redundancy).
-        const unsigned n_copies = small_packet
-            ? std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy))
-            : 1u;
+      // EOF: full blocks go out as normal (window-gated) RS groups via the pump; only the
+      // final sub-block tail is flushed immediately as SMALL copies (no --max-delay hold,
+      // nothing more can arrive to coalesce with it). Previously every remaining full block
+      // was sent as a single unprotected SMALL copy that bypassed the send window.
+      pump_stdin_send();
+      if (!stdin_buf.empty() && stdin_buf.size() < effective_max_packet && !carriers.empty()) {
+        const size_t chunk = stdin_buf.size();
+        const unsigned n_copies =
+            std::max(1u, std::min(static_cast<unsigned>(carriers.size()), effective_small_packet_redundancy));
         UnackedItem& ui = unacked_sends[next_send_id];
-        ui.data.assign(stdin_buf.begin(), stdin_buf.begin() + chunk);
+        ui.data.assign(stdin_buf.begin(), stdin_buf.end());
         ui.is_small = true;
         ui.send_ns = now_ns();
-        if (small_packet) {
-          // Round-robin SMALL packets across carriers using the same index as RS shards.
-          // With redundancy N and C carriers, copies for each logical packet go to
-          // consecutive carriers and RS shards continue from where SMALL left off.
-          size_t n_carriers = carriers.size();
-          for (unsigned i = 0; i < n_copies && n_carriers > 0; ++i) {
-            unsigned idx = (next_rr + i) % static_cast<unsigned>(n_carriers);
-            auto it = carriers.begin();
-            std::advance(it, idx);
-            int cfd = it->first;
-            ui.small_sent_on.insert(it->second.carrier_id);
-            queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-          }
-          // next_rr is advanced once at the end of the loop body (below) for both
-          // branches; don't advance here too or the round-robin skips carriers.
-        } else {
+        ui.wire_bytes = chunk * n_copies;
+        const size_t n_carriers = carriers.size();
+        for (unsigned i = 0; i < n_copies; ++i) {
           auto it = carriers.begin();
-          std::advance(it, next_rr % carriers.size());
-          queue_to_carrier(it->first, stdin_buf.data(), chunk, false);
-          ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = it->first;
+          std::advance(it, (next_rr + i) % n_carriers);
+          ui.small_sent_on.insert(it->second.carrier_id);
+          queue_to_carrier(it->first, stdin_buf.data(), chunk, /*same_id=*/true);
+          ev.events = EPOLLIN | EPOLLOUT;
+          ev.data.fd = it->first;
           epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
         }
-        if (small_packet && n_copies > 1)
-          next_send_id++;
-        stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
-        if (!carriers.empty())
-          next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
+        next_rr = (next_rr + n_copies) % static_cast<unsigned>(n_carriers);
+        next_send_id++;
+        stdin_buf.clear();
+        stdin_partial_since_ns = 0;
       }
     }
 
@@ -1421,7 +1427,7 @@ int run_client(const Args& args) {
     // pump drains the buffer through the window — without this the window opens but no
     // new group is encoded and the link wedges. (Also flushes a held sub-block
     // remainder once its --max-delay elapses; the pump enforces that timing itself.)
-    if (!stdin_eof && !stdin_buf.empty() && !carriers.empty())
+    if (!stdin_buf.empty() && !carriers.empty())
       pump_stdin_send();
 
     flush_pending_ack();  // one coalesced cumulative ACK for everything delivered this iteration
@@ -2171,119 +2177,29 @@ int run_client(const Args& args) {
     {
       const uint64_t now_p = now_ns();
 
-      // Timeout-based retransmit: if a send has been unACK'd AND we have alive carriers, resend.
-      // When we have no RTT samples (cold start), use 2.5 s so we retransmit aggressively.
-      // Once RTT is known, use 4×RTT so we don't retransmit before the original could arrive.
+      // Stall-driven retransmit (packet_io::retransmit_stalled): only while the server's
+      // cumulative ACK frontier is stuck, a byte-bounded prefix from the head-of-line id,
+      // front-inserted on the least-backlogged carriers. Timeout = 4xRTT (floor 500 ms);
+      // before >=2 RTT samples, honor the --rtt-ms hint, else a 2.5 s cold-start value.
       if (!unacked_sends.empty() && !carriers.empty()
           && now_p - last_retransmit_check_ns >= 500000000ULL) {
         last_retransmit_check_ns = now_p;
-        // 4×RTT, floored at 500 ms (not 2 s). On the test link (50 ms latency, ~100 ms RTT)
-        // the old 2 s floor meant a dying carrier caused a 2+ s stall before retransmit.
-        // 500 ms is still 5× the one-way latency on that link — conservative enough to
-        // avoid duplicate traffic on healthy connections, aggressive enough to recover fast.
-        // With ≥2 samples, scale from observed RTT. Before that, honor the --rtt-ms
-        // cold-start hint (scaled_ns falls back to it) so high-latency links don't get
-        // spuriously retransmitted every 2.5 s before the first ACKs arrive; only use the
-        // 2.5 s floor when neither samples nor a hint are available.
-        uint64_t retransmit_timeout_ns = (recent_rtt_ns.size() >= 2 || args.config.rtt_hint_ms > 0)
+        const uint64_t retransmit_timeout_ns = (recent_rtt_ns.size() >= 2 || args.config.rtt_hint_ms > 0)
             ? scaled_ns(4, 500000000ULL, 60000000000ULL)
-            : 2500000000ULL;  // 2.5 s when no RTT samples and no hint (cold start)
-        // Collect all ready (non-connecting) carriers for round-robin retransmit.
-        // Spreading shards across multiple carriers means no single carrier failure
-        // can wipe out a retransmit attempt.
-        std::vector<int> rt_carriers;
-        for (auto& [cfd, cs] : carriers)
-          if (!cs.connecting) rt_carriers.push_back(cfd);
-        if (!rt_carriers.empty()) {
-          unsigned rt_idx = 0;
-          const unsigned small_rt_copies = std::max(1u, std::min(3u, static_cast<unsigned>(rt_carriers.size())));
-          // Bound work per cycle: the receiver delivers in order and is blocked only on the
-          // lowest unacked id, so retransmit the lowest N due items (the gap is always
-          // covered) rather than the whole backlog, which starves the loop after a long
-          // outage. Higher ids are reached on later cycles. (Mirrors the server.)
-          const size_t kMaxRetransmitItemsPerCycle = 64;
-          size_t rt_items = 0;
-          for (auto& [uid, ui] : unacked_sends) {
-            if (ui.send_ns == 0 || now_p - ui.send_ns < retransmit_timeout_ns) continue;
-            if (rt_items >= kMaxRetransmitItemsPerCycle) break;
-            ++rt_items;
-            if (ui.is_small) {
-              // Choose only carriers that have not yet carried this SMALL packet.
-              std::vector<int> candidates;
-              for (int cfd : rt_carriers) {
-                auto itc = carriers.find(cfd);
-                if (itc == carriers.end()) continue;
-                uint64_t cid = itc->second.carrier_id;
-                if (!ui.small_sent_on.count(cid)) candidates.push_back(cfd);
-              }
-              // If every live carrier has already carried this SMALL packet, reset
-              // the history and allow another round across all carriers so we don't
-              // get permanently stuck with an undeliverable id.
-              if (candidates.empty()) {
-                candidates = rt_carriers;
-                ui.small_sent_on.clear();
-              }
-              if (!candidates.empty()) {
-                unsigned copies = std::min(small_rt_copies, static_cast<unsigned>(candidates.size()));
-                if (dbg) fprintf(dbg, "[retransmit-small t=%llu uid=%llu age_ms=%llu copies=%u]\n",
-                                 (unsigned long long)(now_p/1000000ULL), (unsigned long long)uid,
-                                 (unsigned long long)((now_p - ui.send_ns)/1000000ULL), copies);
-                for (unsigned c = 0; c < copies; ++c) {
-                  int cfd = candidates[(rt_idx + c) % candidates.size()];
-                  auto itc = carriers.find(cfd);
-                  if (itc == carriers.end()) continue;
-                  ui.small_sent_on.insert(itc->second.carrier_id);
-                  packet_io::append_small(carriers[cfd].write_buf, uid, ui.data.data(), ui.data.size());
-                  ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-                  epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-                }
-                rt_idx += copies;
-              }
-            } else {
-              auto shards = packet_io::rs_reencode_shards(ui);
-              std::set<int> touched;
-              for (unsigned si = 0; si < ui.n; ++si) {
-                // For each shard index, avoid retransmitting on carriers that have
-                // already carried this shard for this uid.
-                auto& sent_set = ui.rs_shard_sent_on[si];
-                std::vector<int> shard_candidates;
-                for (int cfd : rt_carriers) {
-                  auto itc = carriers.find(cfd);
-                  if (itc == carriers.end()) continue;
-                  uint64_t cid = itc->second.carrier_id;
-                  if (!sent_set.count(cid)) shard_candidates.push_back(cfd);
-                }
-                // If every live carrier has already carried this shard, clear the
-                // history and allow another full round on all carriers.
-                if (shard_candidates.empty()) {
-                  shard_candidates = rt_carriers;
-                  sent_set.clear();
-                }
-                if (shard_candidates.empty())
-                  continue;
-                int cfd = shard_candidates[(rt_idx + si) % shard_candidates.size()];
-                auto itc = carriers.find(cfd);
-                if (itc == carriers.end()) continue;
-                packet_io::append_rs_shard(carriers[cfd].write_buf, uid,
-                                           ui.n, ui.k, ui.block_size, si, shards[si].data());
-                sent_set.insert(itc->second.carrier_id);
-                touched.insert(cfd);
-              }
-              if (dbg && !touched.empty()) fprintf(dbg, "[retransmit-rs t=%llu uid=%llu age_ms=%llu n=%u k=%u carriers=%zu unique_cfds=%zu]\n",
-                               (unsigned long long)(now_p/1000000ULL), (unsigned long long)uid,
-                               (unsigned long long)((now_p - ui.send_ns)/1000000ULL),
-                               ui.n, ui.k, rt_carriers.size(), touched.size());
-              for (int cfd : touched) {
-                ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-                epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
-              }
-              rt_idx += ui.n;
-            }
-            // Reset send_ns so we don't retransmit this group again for another 3 s.
-            ui.send_ns = now_p;
-            ui.retransmitted = true;  // Karn: don't time this id's ACK as RTT
-          }
-        }
+            : 2500000000ULL;
+        const uint64_t rt_budget = std::max<uint64_t>(
+            32 * 1024, rate_window_cap(c2s_window, get_window_base_rtt_ns()) / 4);
+        auto rt = packet_io::retransmit_stalled(
+            unacked_sends, carriers, now_p, c2s_frontier_progress_ns, retransmit_timeout_ns, rt_budget,
+            [&](int cfd) { ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
+                           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev); },
+            [&](uint64_t uid, UnackedItem& ui) {
+              if (dbg) fprintf(dbg, "[retransmit-%s t=%llu uid=%llu n=%u k=%u frontier_stuck_ms=%llu]\n",
+                               ui.is_small ? "small" : "rs", (unsigned long long)(now_p/1000000ULL),
+                               (unsigned long long)uid, ui.n, ui.k,
+                               (unsigned long long)((now_p - c2s_frontier_progress_ns)/1000000ULL));
+            });
+        c2s_wire.rt_bytes += rt.bytes;
       }
 
       // ── Debug: periodic state dump (1 Hz max — the [srv] dump self-gates the
@@ -2310,6 +2226,11 @@ int run_client(const Args& args) {
                   (unsigned long long)it->first, it->second.shards.size(), it->second.k, it->second.n,
                 (unsigned long long)fifb_total);
         }
+        fprintf(dbg, "[cli-wire] rs_kb=%llu small_kb=%llu rt_kb=%llu groups=%llu avg_k=%.1f smalls=%llu\n",
+                (unsigned long long)(c2s_wire.rs_bytes / 1024), (unsigned long long)(c2s_wire.small_bytes / 1024),
+                (unsigned long long)(c2s_wire.rt_bytes / 1024), (unsigned long long)c2s_wire.groups,
+                c2s_wire.groups ? (double)c2s_wire.group_blocks / (double)c2s_wire.groups : 0.0,
+                (unsigned long long)c2s_wire.smalls);
         fflush(dbg);
       }
 

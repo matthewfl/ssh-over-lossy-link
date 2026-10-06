@@ -2,6 +2,7 @@
 #include "reed_solomon.h"
 #include "carrier_adapt.h"
 #include <algorithm>
+#include <set>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -178,7 +179,11 @@ bool process_carrier_read(
       uint16_t block_sz = *reinterpret_cast<const uint16_t*>(s.read_buf.data() + sizeof(PacketHeader));
       const auto* prs = reinterpret_cast<const PacketReedSolomon*>(s.read_buf.data());
       size_t total_rs = rs_fixed + block_sz;
-      if (block_sz == 0 || block_sz > MAX_PACKET_PAYLOAD || s.read_buf.size() < total_rs) break;
+      // A zero/oversized block_size is corrupt framing, not a partial packet: waiting for
+      // "more bytes" would wedge this carrier forever (read_buf growing without bound while
+      // the carrier still looks alive). Close it like the other malformed-packet cases.
+      if (block_sz == 0 || block_sz > MAX_PACKET_PAYLOAD) { s.read_buf.clear(); return false; }
+      if (s.read_buf.size() < total_rs) break;
       uint64_t id = h->id;
       if (id > next_deliver_id + MAX_ID_AHEAD) {
         s.read_buf.clear();
@@ -340,6 +345,88 @@ void append_ack_front(CarrierState& s, uint64_t acked_id) {
   std::vector<uint8_t> tmp;
   append_ack(tmp, acked_id);
   insert_front_packet(s, tmp);
+}
+
+void append_rs_shard_front(CarrierState& s, uint64_t id, unsigned n, unsigned k,
+                           uint16_t block_size, unsigned shard_index, const uint8_t* shard_data) {
+  std::vector<uint8_t> tmp;
+  tmp.reserve(sizeof(PacketHeader) + sizeof(uint16_t) + 3 + block_size);
+  append_rs_shard(tmp, id, n, k, block_size, shard_index, shard_data);
+  insert_front_packet(s, tmp);
+}
+
+RetransmitResult retransmit_stalled(
+    std::map<uint64_t, UnackedItem>& unacked,
+    std::map<int, CarrierState>& carriers,
+    uint64_t now_ns, uint64_t frontier_progress_ns, uint64_t timeout_ns, uint64_t byte_budget,
+    const std::function<void(int fd)>& mark_writable,
+    const std::function<void(uint64_t uid, UnackedItem& item)>& on_resent) {
+  RetransmitResult res;
+  if (now_ns - frontier_progress_ns < timeout_ns) return res;  // frontier is moving
+  // Live carriers with their current backlog (bytes not yet handed to the kernel). The
+  // per-call `extra` keeps successive picks spread instead of piling onto one carrier.
+  struct Cand { int fd; uint64_t cid; uint64_t backlog; };
+  std::vector<Cand> cands;
+  for (auto& [fd, cs] : carriers) {
+    if (cs.connecting) continue;
+    cands.push_back({fd, cs.carrier_id, cs.write_buf.size() - std::min(cs.write_pos, cs.write_buf.size())});
+  }
+  if (cands.empty()) return res;
+  // Least-backlogged candidate not in `used` (fallback: least-backlogged overall).
+  auto pick = [&](const std::set<uint64_t>& used) -> Cand* {
+    Cand* best = nullptr;
+    Cand* best_any = nullptr;
+    for (auto& c : cands) {
+      if (!best_any || c.backlog < best_any->backlog) best_any = &c;
+      if (used.count(c.cid)) continue;
+      if (!best || c.backlog < best->backlog) best = &c;
+    }
+    return best ? best : best_any;
+  };
+  for (auto& [uid, ui] : unacked) {
+    if (res.bytes >= byte_budget) break;
+    // Stop at the first item that is not due: it is the head-of-line blocker we just
+    // retried (or one sent recently); walking past it would, cycle after cycle, re-send
+    // the entire backlog the peer is merely holding behind that one blocker.
+    if (ui.send_ns != 0 && now_ns - ui.send_ns < timeout_ns) break;
+    if (ui.is_small) {
+      // Two fresh copies: one stalled carrier must not be able to block the retry.
+      const unsigned copies = std::min<size_t>(2, cands.size());
+      std::set<uint64_t> used = ui.small_sent_on;
+      for (unsigned c = 0; c < copies; ++c) {
+        Cand* cd = pick(used);
+        append_small_front(carriers[cd->fd], uid, ui.data.data(), ui.data.size());
+        cd->backlog += ui.data.size();
+        used.insert(cd->cid);
+        ui.small_sent_on.insert(cd->cid);
+        mark_writable(cd->fd);
+        res.packets++;
+        res.bytes += ui.data.size();
+      }
+    } else {
+      // All n shards (we cannot know which ones the peer is missing), each on a distinct
+      // least-loaded carrier that has not carried that shard index before.
+      auto shards = rs_reencode_shards(ui);
+      std::set<uint64_t> used_this_group;
+      for (unsigned si = 0; si < ui.n; ++si) {
+        std::set<uint64_t> avoid = ui.rs_shard_sent_on[si];
+        avoid.insert(used_this_group.begin(), used_this_group.end());
+        Cand* cd = pick(avoid);
+        append_rs_shard_front(carriers[cd->fd], uid, ui.n, ui.k, ui.block_size, si, shards[si].data());
+        cd->backlog += ui.block_size;
+        used_this_group.insert(cd->cid);
+        ui.rs_shard_sent_on[si].insert(cd->cid);
+        mark_writable(cd->fd);
+        res.packets++;
+        res.bytes += ui.block_size;
+      }
+    }
+    ui.send_ns = now_ns;
+    ui.retransmitted = true;  // Karn: this id's ACK must not be timed as RTT
+    res.items++;
+    if (on_resent) on_resent(uid, ui);
+  }
+  return res;
 }
 
 RsGroupParams rs_group_params(size_t live_carriers, float rs_frac, size_t available_blocks,

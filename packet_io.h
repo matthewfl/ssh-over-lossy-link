@@ -152,6 +152,38 @@ void append_ack_front(CarrierState& s, uint64_t acked_id);
 // Precondition: !ui.is_small and ui.k >= 1 and ui.n > ui.k.
 std::vector<std::vector<uint8_t>> rs_reencode_shards(const UnackedItem& ui);
 
+// Same, for a retransmitted RS shard (the receiver is head-of-line blocked on it, so it must
+// not wait behind the very backlog that delayed the original).
+void append_rs_shard_front(CarrierState& s, uint64_t id, unsigned n, unsigned k,
+                           uint16_t block_size, unsigned shard_index, const uint8_t* shard_data);
+
+// Stall-driven retransmit, shared by both directions.
+//
+// The carriers are TCP connections: a shard written to a live carrier is never lost, only
+// DELAYED (a per-carrier TCP retransmit / RTO backoff). Re-sending is useful only for data
+// the receiver is actually blocked on, and only via a different, currently-moving carrier.
+// The receiver delivers in order and ACKs cumulatively, so it is blocked exactly when the
+// cumulative ACK frontier stops advancing; everything above the blocking id is usually
+// already buffered there. Hence:
+//   • an item is due only when BOTH its own last send AND the last ACK-frontier advance are
+//     older than timeout_ns (while the frontier moves, nothing is "lost" — it is queueing);
+//   • the walk stops at the first not-yet-due item (normally the blocker retried last
+//     cycle), so a stuck frontier re-sends one bounded prefix per timeout, not the backlog;
+//   • items are walked from the lowest id (the head-of-line blocker) and the work is
+//     bounded by a BYTE budget per call, not an item count (the old 64-items x all-n-shards
+//     per 500 ms re-sent mostly data the peer already had, feeding a retransmit storm);
+//   • each re-sent packet is FRONT-inserted on the least-backlogged live carrier that has not
+//     carried that shard/copy yet, so it does not queue behind the backlog that stalled it.
+// on_resent(uid, item) fires once per re-sent item (Karn bookkeeping etc.). mark_writable(fd)
+// fires for every carrier that got new bytes (arm EPOLLOUT).
+struct RetransmitResult { size_t items = 0; size_t packets = 0; uint64_t bytes = 0; };
+RetransmitResult retransmit_stalled(
+    std::map<uint64_t, UnackedItem>& unacked,
+    std::map<int, CarrierState>& carriers,
+    uint64_t now_ns, uint64_t frontier_progress_ns, uint64_t timeout_ns, uint64_t byte_budget,
+    const std::function<void(int fd)>& mark_writable,
+    const std::function<void(uint64_t uid, UnackedItem& item)>& on_resent);
+
 // Reed-Solomon group sizing for the primary send path, identical on both sides.
 //   k: data shards = min(floor(n_carriers / (1 + rs_frac)), available_blocks); >=1 unless
 //      available_blocks == 0 (then k == 0 and the caller should stop — nothing to send yet).

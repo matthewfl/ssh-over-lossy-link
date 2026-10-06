@@ -99,6 +99,15 @@ CarrierQualityResult assess_carriers(
 // (backend_pending / reassembly / rs_pending non-empty) at the call site.
 bool is_heavy_backlog(uint64_t unacked_bytes, size_t unacked_count);
 
+// Should the next RS groups get INTERACTIVE (smoothness-grade) parity rather than bulk
+// parity-as-a-fraction? Only when everything waiting to be encoded fits in about one group
+// (a short burst: a command's output, a keystroke echo) and the sender is not already
+// carrying a heavy backlog. Deciding from the unacked COUNT alone was wrong: the send window
+// keeps a bulk transfer at a few dozen outstanding groups (far below kHeavyBacklogCount), so
+// every bulk group was encoded at jitter-grade parity (measured k=3-of-8, ~2.7x wire, on a
+// 256 KB/s upload: 85 KB/s goodput).
+bool is_interactive_burst(size_t pending_blocks, size_t live_carriers, size_t unacked_count);
+
 // Should a keepalive PING be sent on an idle carrier? True when its write buffer is
 // empty and it has had no send *and* no receive activity for ping_idle_ns.
 bool should_send_idle_ping(bool write_buf_empty, uint64_t now_ns,
