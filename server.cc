@@ -112,6 +112,11 @@ int get_so_error(int fd) {
   return getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 ? err : -1;
 }
 
+// Set by SIGTERM/SIGINT/SIGHUP: leave the main loop through the normal cleanup path
+// (close fds, unlink the socket) instead of dying with the socket file left in /tmp.
+volatile sig_atomic_t g_server_shutdown = 0;
+void server_shutdown_handler(int) { g_server_shutdown = 1; }
+
 }  // namespace
 
 int run_server(const Args& args) {
@@ -146,6 +151,14 @@ int run_server(const Args& args) {
   close(STDIN_FILENO);
   close(STDOUT_FILENO);
   close(STDERR_FILENO);
+  {
+    struct sigaction sa{};
+    sa.sa_handler = server_shutdown_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+  }
 
   // Open per-process debug log if --debug was passed.
   FILE* dbg = nullptr;
@@ -401,9 +414,7 @@ int run_server(const Args& args) {
     } else {
       packet_io::append_pong(it->second.write_buf, id);
     }
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    packet_io::arm_write(carriers, epfd, fd);
   };
 
   // Send small chunk (< block_size) to n_copies carriers using round-robin across the
@@ -426,9 +437,7 @@ int run_server(const Args& args) {
       packet_io::append_small_front(it->second, next_send_id, data, len);
       // Record that this SMALL packet id has been carried on this logical carrier.
       unacked_data[next_send_id].small_sent_on.insert(it->second.carrier_id);
-      ev.events = EPOLLIN | EPOLLOUT;
-      ev.data.fd = fd;
-      epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+      packet_io::arm_write(carriers, epfd, fd);
     }
     if (!carriers.empty())
       next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
@@ -503,9 +512,7 @@ int run_server(const Args& args) {
     int cfd = pending_ack_fd;
     if (!carriers.count(cfd)) cfd = carriers.begin()->first;
     packet_io::append_ack_front(carriers[cfd], pending_ack_id);
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = cfd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+    packet_io::arm_write(carriers, epfd, cfd);
     have_pending_ack = false;
   };
 
@@ -527,9 +534,7 @@ int run_server(const Args& args) {
                                      deque_avg(c2s_shard_spread_ns),
                                      deque_avg(c2s_extra_shard_gap_ns),
                                      static_cast<uint32_t>(rs_pending.size()), mflags);
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    packet_io::arm_write(carriers, epfd, fd);
   };
 
   auto queue_server_config_to_carrier = [&](int fd) {
@@ -540,9 +545,7 @@ int run_server(const Args& args) {
                                    static_cast<uint16_t>(runtime_small_packet_redundancy),
                                    args.config.max_delay_ms,
                                    runtime_rs_redundancy);
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    packet_io::arm_write(carriers, epfd, fd);
   };
 
   auto flush_backend_pending = [&]() {
@@ -764,6 +767,10 @@ int run_server(const Args& args) {
   bool running = true;
 
   while (running) {
+    if (g_server_shutdown) {
+      if (dbg) fprintf(dbg, "[server-signal-exit t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
+      break;
+    }
     loop_watchdog_tick();
     // 500ms bound ensures retransmit/ping checks run promptly even when carriers are idle.
     // When a backend remainder is being held for coalescing (--max-delay), wake sooner so
@@ -819,9 +826,7 @@ int run_server(const Args& args) {
             // data indefinitely on a quiet stream.
             if (next_deliver_id > 0)
               packet_io::append_ack_front(carriers[client], next_deliver_id - 1);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = client;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);
+            packet_io::arm_write(carriers, epfd, client);
             if (backend_fd < 0)
               connect_backend();
             // Re-send any data that was in-flight when all previous carriers died,
@@ -862,9 +867,7 @@ int run_server(const Args& args) {
                 // link). The client applies the same rule via ui.retransmitted.
                 ack_send_time_ns.erase(uid);
               }
-              ev.events = EPOLLIN | EPOLLOUT;
-              ev.data.fd = client;
-              epoll_ctl(epfd, EPOLL_CTL_MOD, client, &ev);
+              packet_io::arm_write(carriers, epfd, client);
             }
             // If there is buffered backend data that couldn't be encoded earlier
             // because all carriers were dead, encode and send it now.
@@ -1066,8 +1069,7 @@ int run_server(const Args& args) {
           }
           if (best >= 0) {
             packet_io::append_carrier_status(carriers[best].write_buf, dead_ids);
-            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = best;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, best, &ev);
+            packet_io::arm_write(carriers, epfd, best);
             if (dbg) fprintf(dbg, "[carrier-status-sent t=%llu over_fd=%d dead_count=%zu]\n",
                              (unsigned long long)(now_ns_val/1000000ULL), best, dead_ids.size());
           }
@@ -1137,9 +1139,7 @@ int run_server(const Args& args) {
             for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(byte_dist(keepalive_gen));
             packet_io::append_ping(cs.write_buf, 0, payload.data(), len);
             outstanding_ping_ns[cfd] = now_ns_val;
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            packet_io::arm_write(carriers, epfd, cfd);
           }
         }
       }
@@ -1156,9 +1156,7 @@ int run_server(const Args& args) {
           if (now_ns_val - last_suggest_close_ns < suggest_close_min_interval_ns) break;
           last_suggest_close_ns = now_ns_val;
           packet_io::append_suggest_close(itc->second.write_buf);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = cfd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          packet_io::arm_write(carriers, epfd, cfd);
           if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=dead_idle]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), cfd);
         }
@@ -1166,9 +1164,7 @@ int run_server(const Args& args) {
             && now_ns_val - last_suggest_close_ns >= suggest_close_min_interval_ns) {
           last_suggest_close_ns = now_ns_val;
           packet_io::append_suggest_close(carriers[quality.rtt_outlier_fd].write_buf);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = quality.rtt_outlier_fd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, quality.rtt_outlier_fd, &ev);
+          packet_io::arm_write(carriers, epfd, quality.rtt_outlier_fd);
           if (dbg) fprintf(dbg, "[suggest-close t=%llu fd=%d reason=rtt_outlier]\n",
                            (unsigned long long)(now_ns_val/1000000ULL), quality.rtt_outlier_fd);
         }
@@ -1205,8 +1201,7 @@ int run_server(const Args& args) {
           32 * 1024, rate_window_cap(s2c_window, get_window_base_rtt_ns()) / 4);
       packet_io::retransmit_stalled(
           unacked_data, carriers, now_ns_val, s2c_frontier_progress_ns, retransmit_timeout_ns, rt_budget,
-          [&](int cfd) { ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-                         epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev); },
+          [&](int cfd) { packet_io::arm_write(carriers, epfd, cfd); },
           [&](uint64_t uid, UnackedItem& ui) {
             // Karn's rule: an ACK for a retransmitted id is ambiguous, so don't time it.
             // Erase the RTT send-time rather than re-stamping it — a stale in-flight ACK
@@ -1552,9 +1547,7 @@ int run_server(const Args& args) {
           shard_carriers[i] = itc->second.carrier_id;
           const uint8_t* shard = (i < k) ? (backend_read_buf.data() + i * block_size) : parity[i - k].data();
           queue_rs_shard_to_carrier(fd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = fd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+          packet_io::arm_write(carriers, epfd, fd);
         }
         if (!carrier_fds.empty())
           next_rr = (next_rr + static_cast<unsigned>(n)) % static_cast<unsigned>(carrier_fds.size());

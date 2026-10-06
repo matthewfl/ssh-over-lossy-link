@@ -350,6 +350,11 @@ model every ~300 ms:
   sets `shared_carrier_id = carrier_id`; the server gets it from the wire.
 - `next_send_id` vs `next_deliver_id`: send-side counter vs receive-side contiguous
   delivery cursor. Don't conflate them.
+- Carrier EPOLLOUT interest goes through `packet_io::arm_write` (and the disarm in
+  `flush_carrier_writes`), tracked in `CarrierState::out_armed`. Never raw-`MOD` a
+  carrier fd: a stale `out_armed=false` while the kernel has EPOLLOUT armed busy-spins the
+  loop, and a stale `true` delays writes until the next wakeup. Any site that registers a
+  carrier WITH EPOLLOUT (client connect) must set `out_armed = true`.
 - When changing the wire format, update **both** the structs in `ssholl.h`, the
   `append_*`/parse code in `packet_io.cc`, *and* the protocol section of `README.md`
   (the README documents the wire format as authoritative).

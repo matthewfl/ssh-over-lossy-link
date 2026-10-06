@@ -234,7 +234,26 @@ also fails that test's 25 s bound intermittently — it was already borderline).
 - `--file-lock` fd opened without `O_CLOEXEC` (every forked ssh child held the lock).
 - `--help` described `--max-added-latency-ms` as active; it is reserved/ignored.
 
+### B14 — epoll_ctl storm, duplicated spawn code, server signal cleanup (FIXED)
+- `flush_carrier_writes` re-registered every idle carrier (`MOD EPOLLIN`) on every call
+  and every append site re-armed `EPOLLOUT` unconditionally: measured 584k `epoll_ctl` vs
+  4.3k `epoll_wait` in a 60 s client upload (84% of its syscall time, 10 carriers). Now
+  `CarrierState::out_armed` + `packet_io::arm_write` only touch the kernel on a real
+  transition: 29k `epoll_ctl` for the same run (~20× fewer), same goodput.
+- client.cc had three copies of the carrier `ssh -L` fork/exec block → `spawn_carrier_ssh`
+  (argv verified identical with a stub `ssh` on PATH).
+- The server had no SIGTERM/SIGINT/SIGHUP handler: killing it left its
+  `/tmp/ssh-oll-server.*` socket behind. It now exits via the normal cleanup path.
+
 ### Known issues NOT fixed this round (candidates for follow-up)
+- **`bw-flood-window-backpressure` is bimodal (pre-existing).** With the suite's exact
+  args (incl. `--client-debug --server-debug`) both the pre-round baseline and this round's
+  build settle into one of two equilibria: (A) s2c ~130 KB/s, c2s ~70 KB/s, s2c ping avg
+  ~11.5 s, max ~20-22 s → PASS; or (B) s2c ~150-166 KB/s, c2s ~35-41 KB/s, avg ~15 s,
+  max ~26.8-28.4 s → FAIL the 25 s bound. Measured: baseline B,B,A; new A,A,B; all three
+  full-suite runs this round hit B (26.77-26.83 s). It is the RateWindow controller's
+  equilibrium selection between the two directions sharing carriers, not a regression;
+  the bound is not loosened here.
 - **q is measured as arrival lateness, so queueing on a shared bottleneck reads as loss.**
   The loss-floor filter and saturation clamps are patches over this; the redundancy model
   still oscillates (observed `stall_ms` 50→300 ms within a minute because it keys off the
@@ -245,13 +264,10 @@ also fails that test's 25 s bound intermittently — it was already borderline).
 - **No receiver feedback on what is missing.** Retransmit still has to resend all n shards
   of a blocked group. A NACK (id + have-bitmap) would let the sender resend exactly the
   missing count — wire-format change, so not done here.
-- `flush_carrier_writes` issues an `epoll_ctl(MOD, EPOLLIN)` for every idle carrier on
-  every call (several calls per loop pass): N carriers × loop rate syscalls. Fixing it
-  safely needs per-carrier armed-state tracking across the ~40 raw MOD sites.
 - `read_buf`/`stdin_buf`/`backend_read_buf` are consumed with front `erase` (O(n²)
   memmove under load); `write_buf` is only compacted when fully drained.
 - Client exits right after stdin EOF without waiting for unacked data/write buffers to
   drain (the server likewise on backend EOF) — trailing bytes can be lost on a lossy link.
-- client.cc has three copies of the SSH carrier fork/exec block; legacy `run_adapt` /
+- Legacy `run_adapt` /
   `compute_from_deques` / most `CLIENT_METRICS` fields / `should_send_idle_ping` are dead or
   near-dead code.

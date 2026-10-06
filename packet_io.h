@@ -37,6 +37,13 @@ struct CarrierState {
   // because a partial flush left write_pos mid-packet. >0 in a heavy run proves the
   // split precondition occurred and the boundary gate handled it.
   uint64_t front_insert_fallbacks = 0;
+  // Whether EPOLLOUT is currently registered for this fd. Every interest change goes
+  // through arm_write / flush_carrier_writes so the kernel is only touched on a real
+  // transition (measured: ~136 epoll_ctl per loop pass with 10 carriers before this —
+  // 84% of the client's syscall time during a bulk upload). Must be set true wherever a
+  // carrier is registered WITH EPOLLOUT (client connect), else the drained-buffer disarm
+  // is skipped and a level-triggered writable fd busy-spins the loop.
+  bool out_armed = false;
 };
 
 // Per-id state when collecting Reed-Solomon shards.
@@ -218,6 +225,10 @@ void append_client_metrics(std::vector<uint8_t>& out, uint64_t avg_shard_spread_
                            uint64_t avg_extra_shard_gap_ns, float fraction_struggling,
                            uint32_t rs_pending_count, bool can_decrease_rs, bool can_decrease_small,
                            bool c2s_window_saturated);
+
+// Register EPOLLOUT interest for a carrier that has bytes queued (no-op if already armed
+// or the fd is not a carrier). flush_carrier_writes disarms it once the buffer drains.
+void arm_write(std::map<int, CarrierState>& carriers, int epfd, int fd);
 
 // Flush write_buf of all carriers to their fds. Removes and closes fd on write error.
 // skip_write: if non-null, skip flushing for carriers where skip_write(fd, state) is true (e.g. client: connecting).

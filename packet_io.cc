@@ -623,6 +623,16 @@ void append_client_metrics(std::vector<uint8_t>& out, uint64_t avg_shard_spread_
   out.insert(out.end(), p, p + sizeof cm);
 }
 
+void arm_write(std::map<int, CarrierState>& carriers, int epfd, int fd) {
+  auto it = carriers.find(fd);
+  if (it == carriers.end() || it->second.out_armed) return;
+  struct epoll_event e{};
+  e.events = EPOLLIN | EPOLLOUT;
+  e.data.fd = fd;
+  epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
+  it->second.out_armed = true;
+}
+
 void flush_carrier_writes(
   std::map<int, CarrierState>& carriers,
   int epfd,
@@ -641,9 +651,12 @@ void flush_carrier_writes(
       ssize_t n = write(fd, s.write_buf.data() + s.write_pos, to_write);
       if (n <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = fd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+          if (!s.out_armed) {
+            ev.events = EPOLLIN | EPOLLOUT;
+            ev.data.fd = fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+            s.out_armed = true;
+          }
           break;
         }
         if (on_removed) on_removed(fd, "write_error");
@@ -660,9 +673,12 @@ void flush_carrier_writes(
     if (s.write_pos >= s.write_buf.size()) {
       s.write_buf.clear();
       s.write_pos = 0;
-      ev.events = EPOLLIN;
-      ev.data.fd = fd;
-      epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+      if (s.out_armed) {
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        s.out_armed = false;
+      }
     }
     ++it;
     next:;

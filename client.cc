@@ -216,6 +216,40 @@ std::string launch_server(const Args& args) {
   return path;
 }
 
+// Fork + exec one carrier: `ssh -n -N -o ExitOnForwardFailure=yes [-o ConnectTimeout=N]
+// -L local_path:socket_path lossy-ssh-host`. The child dies with us (PDEATHSIG on Linux)
+// and never writes to our stdout (it is the ProxyCommand stream). Returns the pid (<0 on
+// fork failure).
+pid_t spawn_carrier_ssh(const Args& args, const std::string& local_path, const std::string& socket_path) {
+  pid_t pid = fork();
+  if (pid != 0) return pid;
+#ifdef __linux__
+  prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
+  // stdout/stderr -> /dev/null: any output on the inherited ProxyCommand stdout would
+  // corrupt the SSH stream.
+  int dn = open("/dev/null", O_WRONLY);
+  if (dn >= 0) {
+    dup2(dn, STDOUT_FILENO);
+    dup2(dn, STDERR_FILENO);
+    close(dn);
+  }
+  std::string spec = local_path + ":" + socket_path;
+  std::vector<const char*> argv_vec = {"ssh", "-n", "-N", "-o", "ExitOnForwardFailure=yes"};
+  char ct_buf[64];
+  if (args.config.connect_timeout_sec > 0) {
+    snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
+    argv_vec.push_back("-o");
+    argv_vec.push_back(ct_buf);
+  }
+  argv_vec.push_back("-L");
+  argv_vec.push_back(spec.c_str());
+  argv_vec.push_back(args.lossy_ssh_host.c_str());
+  argv_vec.push_back(nullptr);
+  execvp("ssh", const_cast<char* const*>(argv_vec.data()));
+  _exit(127);
+}
+
 // Connect to Unix socket at path. Non-blocking; returns fd or -1.
 int connect_unix(const std::string& path) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -293,7 +327,7 @@ int run_client(const Args& args) {
 
     for (unsigned i = 0; i < initial_fork_count; ++i) {
       std::string local_path = client_dir + "/" + std::to_string(i);
-      pid_t pid = fork();
+      pid_t pid = spawn_carrier_ssh(args, local_path, socket_path);
       if (pid < 0) {
         std::perror("ssh-oll: fork");
         for (auto& [_, p] : ssh_idx_to_pid) kill(p, SIGTERM);
@@ -303,39 +337,6 @@ int run_client(const Args& args) {
         }
         remove_client_dir(client_dir);
         return 1;
-      }
-      if (pid == 0) {
-#ifdef __linux__
-        // Exit automatically if the parent (ssh-oll) dies for any reason.
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
-        // Redirect stdout and stderr to /dev/null. stdout must never be written to—
-        // the carrier inherits the ProxyCommand stdout; any output would corrupt the SSH stream.
-        int dn = open("/dev/null", O_WRONLY);
-        if (dn >= 0) {
-          dup2(dn, STDOUT_FILENO);
-          dup2(dn, STDERR_FILENO);
-          close(dn);
-        }
-        std::string spec = local_path + ":" + socket_path;
-        std::vector<const char*> argv_vec;
-        argv_vec.push_back("ssh");
-        argv_vec.push_back("-n");
-        argv_vec.push_back("-N");
-        argv_vec.push_back("-o");
-        argv_vec.push_back("ExitOnForwardFailure=yes");
-        char ct_buf[64];
-        if (args.config.connect_timeout_sec > 0) {
-          snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
-          argv_vec.push_back("-o");
-          argv_vec.push_back(ct_buf);
-        }
-        argv_vec.push_back("-L");
-        argv_vec.push_back(spec.c_str());
-        argv_vec.push_back(args.lossy_ssh_host.c_str());
-        argv_vec.push_back(nullptr);
-        execvp("ssh", const_cast<char* const*>(argv_vec.data()));
-        _exit(127);
       }
       ssh_idx_to_pid[i] = pid;
     }
@@ -603,6 +604,7 @@ int run_client(const Args& args) {
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
       CarrierState& cs = carriers[fd];
       cs.connecting = true;
+      cs.out_armed = true;  // registered with EPOLLOUT (connect completion)
       if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
       if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=initial]\n",
                        (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
@@ -687,9 +689,7 @@ int run_client(const Args& args) {
                                       static_cast<uint32_t>(rs_pending.size()),
                                       m.can_decrease_rs, m.can_decrease_small, mq_c2s_sat);
     }
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    packet_io::arm_write(carriers, epfd, fd);
   };
 
   // Queue one Reed-Solomon shard to one carrier (same id for all shards in block).
@@ -820,9 +820,7 @@ int run_client(const Args& args) {
     } else {
       packet_io::append_pong(it->second.write_buf, id);
     }
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+    packet_io::arm_write(carriers, epfd, fd);
   };
   recv_cb.on_pong = [&](int fd, uint64_t id) {
     auto key = std::make_pair(fd, id);
@@ -964,9 +962,7 @@ int run_client(const Args& args) {
     int cfd = pending_ack_fd;
     if (!carriers.count(cfd)) cfd = carriers.begin()->first;
     packet_io::append_ack_front(carriers[cfd], pending_ack_id);
-    ev.events = EPOLLIN | EPOLLOUT;
-    ev.data.fd = cfd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+    packet_io::arm_write(carriers, epfd, cfd);
     have_pending_ack = false;
   };
 
@@ -1096,9 +1092,7 @@ int run_client(const Args& args) {
         queue_to_carrier(cfd, stdin_buf.data(), chunk, false);  // increments next_send_id
         c2s_packets_sent_window += 1;
         c2s_outstanding += chunk;
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+        packet_io::arm_write(carriers, epfd, cfd);
         stdin_buf.erase(stdin_buf.begin(), stdin_buf.begin() + chunk);
         continue;
       }
@@ -1118,9 +1112,7 @@ int run_client(const Args& args) {
         shard_carriers[i] = it->second.carrier_id;
         const uint8_t* shard = (i < k) ? (stdin_buf.data() + i * block_size) : parity[i - k].data();
         queue_rs_shard_to_carrier(cfd, n, k, static_cast<uint16_t>(block_size), static_cast<unsigned>(i), shard);
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = cfd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+        packet_io::arm_write(carriers, epfd, cfd);
       }
       {
         UnackedItem& ui = unacked_sends[next_send_id];
@@ -1179,9 +1171,7 @@ int run_client(const Args& args) {
           int cfd = it->first;
           ui.small_sent_on.insert(it->second.carrier_id);
           queue_to_carrier(cfd, stdin_buf.data(), chunk, n_copies > 1);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = cfd;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+          packet_io::arm_write(carriers, epfd, cfd);
         }
         if (!carriers.empty())
           next_rr = (next_rr + n_copies) % static_cast<unsigned>(carriers.size());
@@ -1321,18 +1311,14 @@ int run_client(const Args& args) {
             if (it->second.carrier_id == 0) it->second.carrier_id = next_carrier_id_global++;
             it->second.shared_carrier_id = it->second.carrier_id;
             packet_io::append_start_connection(it->second.write_buf, it->second.carrier_id);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = fd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+            packet_io::arm_write(carriers, epfd, fd);
             // Catch-up cumulative ACK: a freshly connected carrier is our first chance
             // to tell the server how much s2c data we've already delivered to stdout, in
             // case ACKs were lost while carriers were down. Without this the server can
             // keep retransmitting already-delivered data indefinitely on a quiet stream.
             if (next_deliver_id > 0) {
               packet_io::append_ack_front(it->second, next_deliver_id - 1);
-              ev.events = EPOLLIN | EPOLLOUT;
-              ev.data.fd = fd;
-              epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+              packet_io::arm_write(carriers, epfd, fd);
             }
             if (!pending_reap.empty()) {
               int to_close = pending_reap.front();
@@ -1371,9 +1357,7 @@ int run_client(const Args& args) {
                 ui.send_ns = retransmit_now;
                 ui.retransmitted = true;  // Karn: don't time this id's ACK as RTT
               }
-              ev.events = EPOLLIN | EPOLLOUT;
-              ev.data.fd = fd;
-              epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+              packet_io::arm_write(carriers, epfd, fd);
             }
           } else if (err != EINPROGRESS && err != 0) {
             remove_carrier(fd, "connect_failed");
@@ -1411,9 +1395,7 @@ int run_client(const Args& args) {
           std::advance(it, (next_rr + i) % n_carriers);
           ui.small_sent_on.insert(it->second.carrier_id);
           queue_to_carrier(it->first, stdin_buf.data(), chunk, /*same_id=*/true);
-          ev.events = EPOLLIN | EPOLLOUT;
-          ev.data.fd = it->first;
-          epoll_ctl(epfd, EPOLL_CTL_MOD, it->first, &ev);
+          packet_io::arm_write(carriers, epfd, it->first);
         }
         next_rr = (next_rr + n_copies) % static_cast<unsigned>(n_carriers);
         next_send_id++;
@@ -1493,6 +1475,7 @@ int run_client(const Args& args) {
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
           CarrierState& cs = carriers[fd];
           cs.connecting = true;
+          cs.out_armed = true;  // registered with EPOLLOUT (connect completion)
           if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
           if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=ssh_connect]\n",
                            (unsigned long long)(now_ns()/1000000ULL), fd, carriers.size());
@@ -1522,9 +1505,7 @@ int run_client(const Args& args) {
                                args.config.max_delay_ms,
                                effective_rs_redundancy,
                                1u);  // auto_adapt=1: server will manage and send SERVER_CONFIG
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        packet_io::arm_write(carriers, epfd, fd);
       }
       // Send s2c path metrics so server can merge with c2s for dual-direction adapt.
       {
@@ -1577,9 +1558,7 @@ int run_client(const Args& args) {
                                args.config.max_delay_ms,
                                effective_rs_redundancy,
                                0u);  // auto_adapt=0
-        ev.events = EPOLLIN | EPOLLOUT;
-        ev.data.fd = fd;
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+        packet_io::arm_write(carriers, epfd, fd);
       }
     }
 
@@ -1711,8 +1690,7 @@ int run_client(const Args& args) {
               if (cp == confirm_ping_sent_ns.end()) {
                 packet_io::append_ping(cs.write_buf, next_send_id);
                 confirm_ping_sent_ns[cfd] = now_p;
-                ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-                epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+                packet_io::arm_write(carriers, epfd, cfd);
               } else if (cs.last_recv_ns > cp->second) {
                 confirm_ping_sent_ns.erase(cp);          // delivered something -> recovered
               } else if (now_p - cp->second > confirm_timeout_ns) {
@@ -1724,8 +1702,7 @@ int run_client(const Args& args) {
             auto itc = carriers.find(cfd);
             if (itc == carriers.end() || itc->second.connecting) continue;
             packet_io::append_suggest_close(itc->second.write_buf);
-            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            packet_io::arm_write(carriers, epfd, cfd);
             confirm_ping_sent_ns.erase(cfd);
             bool aggressive = (!unacked_sends.empty() && carriers.size() > 1);
             if (carriers.size() > target_carriers || aggressive) remove_carrier(cfd, reason);
@@ -1766,9 +1743,7 @@ int run_client(const Args& args) {
               for (size_t i = 0; i < len; ++i) payload[i] = static_cast<uint8_t>(byte_dist(keepalive_gen));
               packet_io::append_ping(cs.write_buf, next_send_id, payload.data(), len);
               outstanding_pings[{cfd, next_send_id}] = now_p;
-              ev.events = EPOLLIN | EPOLLOUT;
-              ev.data.fd = cfd;
-              epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+              packet_io::arm_write(carriers, epfd, cfd);
             }
           }
         }
@@ -1840,8 +1815,7 @@ int run_client(const Args& args) {
           if (to_close >= 0) {
             last_excess_release_ns = now_p;
             packet_io::append_suggest_close(carriers[to_close].write_buf);
-            ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = to_close;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, to_close, &ev);
+            packet_io::arm_write(carriers, epfd, to_close);
             remove_carrier(to_close, "excess_release");
           }
         }
@@ -1874,9 +1848,7 @@ int run_client(const Args& args) {
           // sees SUGGEST_CLOSE it will close fd on its side.
           if (auto itc = carriers.find(cfd); itc != carriers.end()) {
             packet_io::append_suggest_close(itc->second.write_buf);
-            ev.events = EPOLLIN | EPOLLOUT;
-            ev.data.fd = cfd;
-            epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev);
+            packet_io::arm_write(carriers, epfd, cfd);
           }
           if (carriers.size() > target_carriers) {
             // Above target and dead: close immediately so floor maintenance can add
@@ -2078,6 +2050,7 @@ int run_client(const Args& args) {
               if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
                 CarrierState& cs = carriers[fd];
                 cs.connecting = true;
+                cs.out_armed = true;  // registered with EPOLLOUT (connect completion)
                 if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
                 const char* add_reason =
                     (total_write > backpressure_write_threshold) ? "backpressure" :
@@ -2095,37 +2068,7 @@ int run_client(const Args& args) {
             unsigned free_idx = find_free_ssh_index();
             if (free_idx < max_connections) {
               std::string path = client_dir + "/" + std::to_string(free_idx);
-              pid_t pid = fork();
-              if (pid == 0) {
-#ifdef __linux__
-                prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
-                int dn = open("/dev/null", O_WRONLY);
-                if (dn >= 0) {
-                  dup2(dn, STDOUT_FILENO);
-                  dup2(dn, STDERR_FILENO);
-                  close(dn);
-                }
-                std::string spec = path + ":" + socket_path;
-                std::vector<const char*> argv_vec;
-                argv_vec.push_back("ssh");
-                argv_vec.push_back("-n");
-                argv_vec.push_back("-N");
-                argv_vec.push_back("-o");
-                argv_vec.push_back("ExitOnForwardFailure=yes");
-                char ct_buf[64];
-                if (args.config.connect_timeout_sec > 0) {
-                  snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
-                  argv_vec.push_back("-o");
-                  argv_vec.push_back(ct_buf);
-                }
-                argv_vec.push_back("-L");
-                argv_vec.push_back(spec.c_str());
-                argv_vec.push_back(args.lossy_ssh_host.c_str());
-                argv_vec.push_back(nullptr);
-                execvp("ssh", const_cast<char* const*>(argv_vec.data()));
-                _exit(127);
-              }
+              pid_t pid = spawn_carrier_ssh(args, path, socket_path);
               if (pid > 0) {
                 ssh_idx_to_pid[free_idx] = pid;
                 pending_carrier_paths.push_back(path);
@@ -2191,8 +2134,7 @@ int run_client(const Args& args) {
             32 * 1024, rate_window_cap(c2s_window, get_window_base_rtt_ns()) / 4);
         auto rt = packet_io::retransmit_stalled(
             unacked_sends, carriers, now_p, c2s_frontier_progress_ns, retransmit_timeout_ns, rt_budget,
-            [&](int cfd) { ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = cfd;
-                           epoll_ctl(epfd, EPOLL_CTL_MOD, cfd, &ev); },
+            [&](int cfd) { packet_io::arm_write(carriers, epfd, cfd); },
             [&](uint64_t uid, UnackedItem& ui) {
               if (dbg) fprintf(dbg, "[retransmit-%s t=%llu uid=%llu n=%u k=%u frontier_stuck_ms=%llu]\n",
                                ui.is_small ? "small" : "rs", (unsigned long long)(now_p/1000000ULL),
@@ -2319,6 +2261,7 @@ int run_client(const Args& args) {
               if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
                 CarrierState& cs = carriers[fd];
                 cs.connecting = true;
+                cs.out_armed = true;  // registered with EPOLLOUT (connect completion)
                 if (cs.carrier_id == 0) cs.carrier_id = next_carrier_id_global++;
                 const char* floor_reason = carriers.empty() ? "mass_death" : "below_floor";
                 if (dbg) fprintf(dbg, "[carrier-add t=%llu fd=%d total=%zu reason=%s]\n",
@@ -2335,37 +2278,7 @@ int run_client(const Args& args) {
             unsigned free_idx = find_free_ssh_index();
             if (free_idx >= max_connections) break;
             std::string path = client_dir + "/" + std::to_string(free_idx);
-            pid_t pid = fork();
-            if (pid == 0) {
-#ifdef __linux__
-              prctl(PR_SET_PDEATHSIG, SIGTERM);
-#endif
-              int dn = open("/dev/null", O_WRONLY);
-              if (dn >= 0) {
-                dup2(dn, STDOUT_FILENO);
-                dup2(dn, STDERR_FILENO);
-                close(dn);
-              }
-              std::string spec = path + ":" + socket_path;
-              std::vector<const char*> argv_vec;
-              argv_vec.push_back("ssh");
-              argv_vec.push_back("-n");
-              argv_vec.push_back("-N");
-              argv_vec.push_back("-o");
-              argv_vec.push_back("ExitOnForwardFailure=yes");
-              char ct_buf[64];
-              if (args.config.connect_timeout_sec > 0) {
-                snprintf(ct_buf, sizeof ct_buf, "ConnectTimeout=%u", args.config.connect_timeout_sec);
-                argv_vec.push_back("-o");
-                argv_vec.push_back(ct_buf);
-              }
-              argv_vec.push_back("-L");
-              argv_vec.push_back(spec.c_str());
-              argv_vec.push_back(args.lossy_ssh_host.c_str());
-              argv_vec.push_back(nullptr);
-              execvp("ssh", const_cast<char* const*>(argv_vec.data()));
-              _exit(127);
-            }
+            pid_t pid = spawn_carrier_ssh(args, path, socket_path);
             if (pid > 0) {
               ssh_idx_to_pid[free_idx] = pid;
               pending_carrier_paths.push_back(path);
