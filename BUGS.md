@@ -245,15 +245,27 @@ also fails that test's 25 s bound intermittently — it was already borderline).
 - The server had no SIGTERM/SIGINT/SIGHUP handler: killing it left its
   `/tmp/ssh-oll-server.*` socket behind. It now exits via the normal cleanup path.
 
+### B15 — Hidden multi-MB backend kernel queue (FIXED)
+`bw-flood-window-backpressure` failed its 25 s interactive-latency bound in all three full
+suites earlier this round, and the pre-round code fails it too. Bisect with the current
+harness (3 runs per build, max ping latency): db718dd 23.1/23.4/23.1 s; df22830
+25.1(FAIL)/23.1/24.0; a2e43a5 23.6/22.7/21.4; 682c0c0 23.0/28.0(FAIL)/21.6; 5485a0b
+21.8/23.1/22.0. So it was marginal since at least Sep 11, not a single-commit regression.
+The test was not exercising real traffic Sep 30 – Oct 2 (bursty-mode harness crash fixed
+in 5485a0b), which hid the drift.
+Cause: when the s2c send window is closed the server stops reading the backend (by
+design), and Linux autotunes the loopback receive buffer to several MB, so the producer's
+output queues in the kernel, invisible to the window. Anything written after it (the
+interactive ping) waits for that queue to drain at link speed. Fix: `SO_RCVBUF` 128 KB on
+the backend socket, set before connect. Results:
+- ping max 21-28 s → 13-14 s (8/8 runs across 64/128/256 KB);
+- total goodput unchanged at 256 KB/s;
+- s2c-only 4 MB/s download: 2275/2282 KB/s → 2280/2280 KB/s (no throughput cost).
+With a real sshd the total backlog is still bounded by the SSH channel window. This mainly
+helps other channels multiplexed behind a bulk transfer and how much stale output is
+queued ahead of a Ctrl-C. Full suite: 38/38.
+
 ### Known issues NOT fixed this round (candidates for follow-up)
-- **`bw-flood-window-backpressure` is bimodal (pre-existing).** With the suite's exact
-  args (incl. `--client-debug --server-debug`) both the pre-round baseline and this round's
-  build settle into one of two equilibria: (A) s2c ~130 KB/s, c2s ~70 KB/s, s2c ping avg
-  ~11.5 s, max ~20-22 s → PASS; or (B) s2c ~150-166 KB/s, c2s ~35-41 KB/s, avg ~15 s,
-  max ~26.8-28.4 s → FAIL the 25 s bound. Measured: baseline B,B,A; new A,A,B; all three
-  full-suite runs this round hit B (26.77-26.83 s). It is the RateWindow controller's
-  equilibrium selection between the two directions sharing carriers, not a regression;
-  the bound is not loosened here.
 - **q is measured as arrival lateness, so queueing on a shared bottleneck reads as loss.**
   The loss-floor filter and saturation clamps are patches over this; the redundancy model
   still oscillates (observed `stall_ms` 50→300 ms within a minute because it keys off the
@@ -261,6 +273,8 @@ also fails that test's 25 s bound intermittently — it was already borderline).
   progress) would be more honest.
 - **`recently_decoded_ns` keeps only 64 groups**: at bulk rates a late shard's group has
   usually aged out, so late shards go uncounted — q is biased low at high throughput.
+- Bulk s2c download on a clean 4 MB/s link: goodput ~2.28 MB/s of 4 MB/s wire (~1.8x
+  overhead, the rs >= 0.35 floor plus parity sized from queueing-inflated q).
 - **No receiver feedback on what is missing.** Retransmit still has to resend all n shards
   of a blocked group. A NACK (id + have-bitmap) would let the sender resend exactly the
   missing count — wire-format change, so not done here.

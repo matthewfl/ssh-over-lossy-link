@@ -80,6 +80,9 @@ int create_listen_socket(const std::string& path, mode_t mode) {
   return fd;
 }
 
+// Backend socket receive buffer (see connect_tcp).
+constexpr int kBackendRcvBufBytes = 128 * 1024;
+
 // Connect to host:port. Returns fd (non-blocking) or -1. Caller checks EINPROGRESS.
 int connect_tcp(const std::string& host, uint16_t port) {
   struct addrinfo hints{}, *res = nullptr;
@@ -95,6 +98,19 @@ int connect_tcp(const std::string& host, uint16_t port) {
     return -1;
   }
   set_nonblocking(fd);
+  // Bound the kernel's receive buffer for sshd's output BEFORE connect (it fixes the
+  // window scale). Autotuning grows a loopback receive buffer to several MB, and when the
+  // s2c send window is closed we stop reading — so a bulk producer's output then queues
+  // HERE, invisible to the window, and an interactive echo queued behind it waits for
+  // megabytes to drain at link speed. A small buffer pushes that backpressure into sshd
+  // itself, where its channel flow control holds it. Loopback RTT is ~0, so this cannot
+  // limit throughput. Measured on bw-flood-window-backpressure (256 KB/s, 2x flood):
+  // interactive ping max 21-28 s -> 13-14 s, total goodput unchanged (64-256 KB all
+  // behave alike; 128 KB chosen).
+  {
+    int rcvbuf = kBackendRcvBufBytes;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+  }
   int r = connect(fd, res->ai_addr, res->ai_addrlen);
   freeaddrinfo(res);
   if (r == 0) return fd;
