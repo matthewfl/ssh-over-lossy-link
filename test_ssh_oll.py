@@ -1097,7 +1097,7 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
     flood_size = max(1024, int(getattr(args, "bw_flood_chunk_kb", 64)) * 1024)
     ping_size = 64
     link_bps = max(1.0, float(getattr(args, "link_bandwidth_kbps", 0)) * 1024.0)
-    flood_rate = link_bps * max(1.0, float(getattr(args, "bw_flood_rate_x", 2.0)))
+    flood_rate = link_bps * max(0.05, float(getattr(args, "bw_flood_rate_x", 2.0)))
     pair_bytes = flood_size + ping_size
     pair_period_s = pair_bytes / flood_rate  # producer rate per direction
 
@@ -1115,7 +1115,7 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
 
     STALL_S = 3.0
 
-    def writer(send_all, expected, bursty=False):
+    def writer(send_all, expected, bursty=False, pings_only=False):
         # Latency is measured from wire-entry, not from scheduling intent: send_all() can
         # legitimately BLOCK for long stretches (the send window's whole point is to push
         # backpressure into the producing app), and under a sustained >1x offered load that
@@ -1134,8 +1134,8 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
             # on the first iteration and BOTH writer threads die instantly — every gate
             # then passes vacuously with zero traffic (2026-10-02: bw-flood-window-backpressure
             # had been a vacuous pass since the bursty mode landed).
-            in_burst = (not bursty) or burst_every <= 0.0 \
-                or ((now - period_start) % burst_every) < (burst_ms / 1000.0)
+            in_burst = (not pings_only) and ((not bursty) or burst_every <= 0.0
+                or ((now - period_start) % burst_every) < (burst_ms / 1000.0))
             if in_burst:
                 flood = os.urandom(flood_size)
                 ping = os.urandom(ping_size)
@@ -1164,14 +1164,19 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
                 expected.put(("ping", ping, time.perf_counter()))
                 time.sleep(max(0.0, ping_gap_s - (time.perf_counter() - now)))
 
+    flood_dir = getattr(args, "bw_flood_direction", "both") or "both"
+    bursty_mode = not getattr(args, "bw_flood_continuous", False)
+
     def s2c_writer():
-        writer(tcp_conn.sendall, exp_s2c, bursty=True)
+        writer(tcp_conn.sendall, exp_s2c, bursty=bursty_mode,
+               pings_only=(flood_dir == "c2s"))
 
     def c2s_writer():
         def send_all(data):
             client_proc.stdin.write(data)
             client_proc.stdin.flush()
-        writer(send_all, exp_c2s, bursty=True)
+        writer(send_all, exp_c2s, bursty=bursty_mode,
+               pings_only=(flood_dir == "s2c"))
 
     def reader(name, stream, expected):
         buf = b""
@@ -1280,6 +1285,17 @@ def _run_bw_flood(client_proc, tcp_conn, stop_proxy, tcp_listen, args):
         _stats(f"{d} ping (interactive behind bulk)", ping_snap[d])
     for d in ("s2c", "c2s"):
         _stats(f"{d} flood chunk completion", flood_snap[d])
+    elapsed_s = max(1e-9, time.perf_counter() - t_start)
+    for d in ("s2c", "c2s"):
+        if flood_snap[d]:
+            print(f"  {d} flood goodput: {len(flood_snap[d]) * flood_size / 1024 / elapsed_s:.0f} KB/s")
+    if getattr(args, "client_debug", False):
+        try:
+            with open(f"/tmp/ssh-oll-client-{client_proc.pid}.log", errors="replace") as lf:
+                rt = sum(1 for line in lf if line.startswith(("[retransmit-rs", "[retransmit-small")))
+            print(f"  client retransmit events: {rt}")
+        except OSError:
+            pass
     print(f"  flood producer: {pair_bytes / 1024:.0f} KB every {pair_period_s * 1000:.0f} ms/direction "
           f"(~{flood_rate / 1024:.0f} KB/s into a ~{link_bps / 1024:.0f} KB/s link, each way)")
 
@@ -2773,6 +2789,19 @@ def main():
         default=300.0,
         metavar="MS",
         help="In --scenario-bw-flood with --bw-flood-burst-every-s: burst duration in ms. Default 300.",
+    )
+    parser.add_argument(
+        "--bw-flood-direction",
+        choices=("both", "c2s", "s2c"),
+        default="both",
+        help="In --scenario-bw-flood: which direction(s) carry the bulk flood. 'c2s' models a "
+             "large upload (client->server) with interactive pings only on the reverse path. "
+             "Default both.",
+    )
+    parser.add_argument(
+        "--bw-flood-continuous",
+        action="store_true",
+        help="In --scenario-bw-flood: flood continuously (no burst/quiet cycle).",
     )
     parser.add_argument(
         "--scenario-small-storm",
