@@ -172,3 +172,86 @@ relevant comments.
   double-blackout reconnect scenario before the fixes and can after.
 - Regression set (sanity / no-auto / connection-death-t2c / wifi-stop-then-recover):
   run after fixes to confirm no regression in the non-blackout paths.
+
+---
+
+## Round 3 (2026-10-06) — bulk upload stall / "lots of resending" review
+
+Trigger: a large client→server upload stalled and the client log showed heavy resending —
+which makes little sense over TCP carriers (a packet on a live carrier is delayed, never
+lost). New repro: `--scenario-bw-flood --bw-flood-direction c2s --bw-flood-continuous`
+(upload-only flood; added to the harness this round) on a 256 KB/s link with 100 ms base
+latency and 5% 1 s stall spikes. The client debug log now carries a `[cli-wire]` line with
+cumulative c2s wire bytes split into fresh RS / SMALL / retransmit.
+
+### B9 — Blind timer retransmit = retransmit storm (FIXED)
+Both sides re-sent EVERY unacked item older than 4×RTT (all n shards of up to 64 groups
+per 500 ms), appended at the BACK of carrier queues (behind the backlog that delayed the
+originals, sometimes onto the stalled carrier itself). ACKs are cumulative, so one group
+stuck behind a TCP RTO made everything after it look lost — while the peer already held
+it. Fix: `packet_io::retransmit_stalled` (one shared implementation replacing two
+copy-pasted ~110-line blocks): nothing is re-sent while the peer's cumulative ACK frontier
+advances; once it has been stuck for the timeout, a byte-bounded prefix from the
+head-of-line id is re-sent (stopping at the first recently-retried item), front-inserted on
+the least-backlogged carriers that have not carried that shard/copy.
+
+### B10 — Server ACKed only after the backend write (FIXED)
+A slow sshd (disk-bound scp, full channel window) stopped ACKs, which the client could not
+tell from network loss → it retransmitted data the server already held, and every c2s RTT
+sample included backend latency (inflating every RTT-scaled timeout). Fix: ACK on in-order
+receipt while at most `kAckAheadOfBackendBytes` (512 KB) of acknowledged data still waits
+for the backend, so a genuinely stalled backend still backpressures via the ACK clock.
+
+### B11 — Upload saturation flag in wrong units (FIXED)
+`CLIENT_METRICS.c2s_window_saturated` compared PAYLOAD bytes against a window cap in WIRE
+bytes, under-counting by the redundancy factor, so the server's saturation clamp (rs ≤ 0.5
+while a window is pinned) never engaged for uploads: rs ran to 1.4–2.0 on a link whose
+only "loss" was its own queueing.
+
+### B12 — Bulk transfers encoded with interactive parity (FIXED)
+"Interactive vs bulk" was `unacked_count <= 128`, but the send window holds a bulk transfer
+at a few dozen outstanding groups, so EVERY bulk group got jitter-grade parity (measured
+k=3-of-8, ~2.7× wire). Now `carrier_adapt::is_interactive_burst`: interactive only when the
+data waiting to be encoded fits in ~one group (and no heavy backlog). Both sides.
+
+Measured (upload repro above, 60 s): goodput 85 → 150–157 KB/s, upload-path interactive
+p50 5.4 s → 3.6 s, groups k=3-of-8 → k=6-of-9. `bw-flood-window-backpressure` A/B (2 runs
+each): s2c ping max 23.9/28.2 s → 21.2/20.4 s, c2s goodput 55/37 → 74/73 KB/s (the baseline
+also fails that test's 25 s bound intermittently — it was already borderline).
+
+### B13 — Smaller fixes
+- Reconnect replay (all carriers died, first new one connects) put all n shards of every
+  unacked group on that ONE carrier; parity on the same TCP connection adds nothing. Now
+  replays only the k data shards (no re-encode).
+- A zero/oversized RS `block_size` (corrupt framing) made the parser wait forever for
+  "more bytes": the carrier wedged with an unbounded read buffer while still looking
+  alive. Now closes the carrier like other malformed packets.
+- Client stdin read loop drained until EAGAIN before applying the 256 KB throttle: a
+  producer as fast as our reads could grow `stdin_buf` without bound. Loop is now bounded.
+- stdin-EOF drain sent every remaining full block as a single unprotected SMALL copy,
+  bypassing RS and the send window. Full blocks now go through the normal pump; only the
+  final sub-block tail is flushed immediately.
+- `--file-lock` fd opened without `O_CLOEXEC` (every forked ssh child held the lock).
+- `--help` described `--max-added-latency-ms` as active; it is reserved/ignored.
+
+### Known issues NOT fixed this round (candidates for follow-up)
+- **q is measured as arrival lateness, so queueing on a shared bottleneck reads as loss.**
+  The loss-floor filter and saturation clamps are patches over this; the redundancy model
+  still oscillates (observed `stall_ms` 50→300 ms within a minute because it keys off the
+  *recent-window min* RTT). A loss signal from actual carrier stalls (e.g. per-carrier
+  progress) would be more honest.
+- **`recently_decoded_ns` keeps only 64 groups**: at bulk rates a late shard's group has
+  usually aged out, so late shards go uncounted — q is biased low at high throughput.
+- **No receiver feedback on what is missing.** Retransmit still has to resend all n shards
+  of a blocked group. A NACK (id + have-bitmap) would let the sender resend exactly the
+  missing count — wire-format change, so not done here.
+- `flush_carrier_writes` issues an `epoll_ctl(MOD, EPOLLIN)` for every idle carrier on
+  every call (several calls per loop pass): N carriers × loop rate syscalls. Fixing it
+  safely needs per-carrier armed-state tracking across the ~40 raw MOD sites.
+- `read_buf`/`stdin_buf`/`backend_read_buf` are consumed with front `erase` (O(n²)
+  memmove under load); `write_buf` is only compacted when fully drained.
+- Client exits right after stdin EOF without waiting for unacked data/write buffers to
+  drain (the server likewise on backend EOF) — trailing bytes can be lost on a lossy link.
+- client.cc has three copies of the SSH carrier fork/exec block; legacy `run_adapt` /
+  `compute_from_deques` / most `CLIENT_METRICS` fields / `should_send_idle_ping` are dead or
+  near-dead code.
