@@ -318,13 +318,17 @@ model every ~300 ms:
 - `--debug` writes verbose logs to `/tmp/ssh-oll-{client,server}-<pid>.log`. The server
   is daemonized with closed stdio, so this is the only way to see server-side state.
 - **Loop watchdog** (`net_util.h`): if one main-loop iteration takes >30 s
-  (`SSHOLL_WATCHDOG_SEC` overrides), it writes `[loop-watchdog-fired: … stuck for N s …]`
-  plus a raw backtrace of the stuck point to the debug log (and stderr), then aborts.
-  Resolve frames with `addr2line -f -C -e <the exact ssh-oll binary> <+0xOFFSETs>` (built
-  with `-g`). A *whole-process* freeze (VM pause, host starvation, SIGSTOP) is detected by
-  the SIGALRM handler itself running late and only logs `[loop-watchdog-skip: …]`. Note the
-  debug log is stdio-buffered (flushed ~1 Hz), so up to ~1 s of lines before an abort are
-  lost.
+  (`SSHOLL_WATCHDOG_SEC` overrides), the SIGALRM handler — running on the stuck thread —
+  write()s straight to the debug-log fd (no stdio; the stuck code may hold the FILE lock):
+  `[loop-watchdog-fired t=… stuck_s=… phase=… pid=… exe=…]`, a raw backtrace, and
+  `[loop-watchdog-end resolve with: addr2line -f -C -i -e <exe> …]`, then fsync + abort.
+  `phase` is the last `loop_phase("…")` marker the main loop passed (sections like
+  `events`, `retransmit`, `adapt`, `s2c-pump`) — keep markers on new loop sections, since at
+  -O2 most of the loop inlines into `run_server`/`run_client`. Built with `-g` so addr2line
+  gives file:line for the exact deployed binary. A *whole-process* freeze (VM pause, host
+  starvation, SIGSTOP) is detected by the handler itself running late and only logs
+  `[loop-watchdog-skip t=…]`. Debug logs are line-buffered, so every complete line before
+  an abort/crash is on disk.
 - Reproduce link conditions locally with `test_ssh_oll.py --latency-ms` /
   `--latency-random` and the named scenarios in `test_all.sh` (e.g. the
   `wifi-stop-then-recover*` and `connection-death-*` tests for reconnection bugs).

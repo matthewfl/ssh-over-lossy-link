@@ -561,6 +561,10 @@ int run_client(const Args& args) {
     char dbg_path[128];
     snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-client-%d.log", (int)getpid());
     dbg = fopen(dbg_path, "w");
+    // Line-buffered: every complete line reaches the file immediately, so nothing is lost if
+    // the process dies abnormally (watchdog abort, crash). The handler cannot fflush itself:
+    // the stuck thread may be inside stdio holding the FILE lock.
+    if (dbg) setvbuf(dbg, nullptr, _IOLBF, 0);
   }
 
   // Liveness watchdog (also armed before launch_server above): the main loop is
@@ -1193,6 +1197,7 @@ int run_client(const Args& args) {
   bool running = true;
 
   while (running) {
+    loop_phase("loop-top");
     if (g_shutdown_requested) break;
     if (test_hang_after_sec > 0 && now_ns() - test_hang_start_ns > static_cast<uint64_t>(test_hang_after_sec) * 1000000000ULL) {
       // Simulated stuck syscall: never return (watchdog must fire).
@@ -1227,6 +1232,7 @@ int run_client(const Args& args) {
       uint64_t remaining_ms = (max_delay_ns > elapsed) ? ((max_delay_ns - elapsed) / 1000000ULL + 1) : 0;
       if (static_cast<int>(remaining_ms) < epoll_timeout_ms) epoll_timeout_ms = static_cast<int>(remaining_ms);
     }
+    loop_phase("epoll_wait");
     int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), epoll_timeout_ms);
     if (n < 0) {
       if (errno == EINTR) {
@@ -1238,6 +1244,7 @@ int run_client(const Args& args) {
       break;
     }
 
+    loop_phase("events");
     for (int i = 0; i < n; ++i) {
       int fd = events[i].data.fd;
       uint32_t e = events[i].events;
@@ -1374,6 +1381,7 @@ int run_client(const Args& args) {
       }
     }
 
+    loop_phase("stdin-eof-drain");
     if (stdin_eof && !stdin_buf.empty() && !carriers.empty()) {
       // EOF: full blocks go out as normal (window-gated) RS groups via the pump; only the
       // final sub-block tail is flushed immediately as SMALL copies (no --max-delay hold,
@@ -1404,6 +1412,7 @@ int run_client(const Args& args) {
       }
     }
 
+    loop_phase("c2s-pump");
     // Run the sender pump periodically even when STDIN is throttled out of epoll: an
     // arriving ACK can re-open the send window while stdin_buf is full, and only the
     // pump drains the buffer through the window — without this the window opens but no
@@ -1416,6 +1425,7 @@ int run_client(const Args& args) {
     flush_carrier_writes();
     flush_stdout();
 
+    loop_phase("pending-connects");
     // Try to complete pending SSH carrier connections.
     for (auto it = pending_carrier_paths.begin(); it != pending_carrier_paths.end(); ) {
       std::string prefix = client_dir + "/";
@@ -1492,6 +1502,7 @@ int run_client(const Args& args) {
       }
     }
 
+    loop_phase("config-metrics");
     // When !auto_adapt, client manages redundancy and pushes SET_CONFIG. When auto_adapt, server manages it and sends SERVER_CONFIG.
     if (args.config.auto_adapt && !carriers.empty()) {
       // Send initial SET_CONFIG once so server knows auto is on and gets initial values.
@@ -1562,6 +1573,7 @@ int run_client(const Args& args) {
       }
     }
 
+    loop_phase("health-check");
     // Ping + dead-carrier detection. Run BEFORE reap so we send PING first and give PONG
     // time to arrive before considering silence-based reap.
     {
@@ -1880,6 +1892,7 @@ int run_client(const Args& args) {
     if (args.config.auto_adapt && !carriers.empty()) {
       const uint64_t now = now_ns();
 
+      loop_phase("carrier-adapt");
       // Carrier target (Lever 1, primary) = load × loss. Measure the fleet packet rate (c2s
       // shards/copies we send + s2c shards we receive, both incl. redundancy) and cap each
       // carrier's load at ~tau packets per recovery window W (= RTT): n* = ceil(R·W/tau) —
@@ -2116,6 +2129,7 @@ int run_client(const Args& args) {
       }
     }
 
+    loop_phase("retransmit-rs-drain");
     // ── Timeout-based retransmit / RS stale-drain ────────────────────────────
     {
       const uint64_t now_p = now_ns();
@@ -2225,6 +2239,7 @@ int run_client(const Args& args) {
       }
     }
 
+    loop_phase("floor-maintenance");
     // ── Unconditional floor maintenance ─────────────────────────────────────
     // Keep at least target_carriers connections. Add replacements when pending_reap
     // non-empty and at or below target. When above target, we don't add—we slowly

@@ -182,6 +182,10 @@ int run_server(const Args& args) {
     char dbg_path[128];
     snprintf(dbg_path, sizeof dbg_path, "/tmp/ssh-oll-server-%d.log", (int)getpid());
     dbg = fopen(dbg_path, "w");
+    // Line-buffered: every complete line reaches the file immediately, so nothing is lost if
+    // the process dies abnormally (watchdog abort, crash). The handler cannot fflush itself:
+    // the stuck thread may be inside stdio holding the FILE lock.
+    if (dbg) setvbuf(dbg, nullptr, _IOLBF, 0);
   }
   // Liveness watchdog (see client.cc): abort instead of hanging silently if the
   // single-threaded loop fails to iterate for >30 s.
@@ -783,6 +787,7 @@ int run_server(const Args& args) {
   bool running = true;
 
   while (running) {
+    loop_phase("loop-top");
     if (g_server_shutdown) {
       if (dbg) fprintf(dbg, "[server-signal-exit t=%llu]\n", (unsigned long long)(now_ns()/1000000ULL));
       break;
@@ -806,11 +811,13 @@ int run_server(const Args& args) {
       uint64_t remaining_ms = (runtime_max_delay_ns > elapsed) ? ((runtime_max_delay_ns - elapsed) / 1000000ULL + 1) : 0;
       if (static_cast<int>(remaining_ms) < poll_timeout_ms) poll_timeout_ms = static_cast<int>(remaining_ms);
     }
+    loop_phase("epoll_wait");
     int n = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), poll_timeout_ms);
     if (n < 0) {
       if (errno == EINTR) continue;
       break;
     }
+    loop_phase("events");
     for (int i = 0; i < n; i++) {
       int fd = events[i].data.fd;
       uint32_t e = events[i].events;
@@ -1046,6 +1053,7 @@ int run_server(const Args& args) {
       }
     }
 
+    loop_phase("health-check");
     // ── Ping / inactivity-check / carrier quality (suggest close) ───────────
     // 500 ms: detect dead carriers promptly so we send SUGGEST_CLOSE and client can recover quickly.
     if (now_ns_val - last_ping_check_ns >= 500000000ULL) {
@@ -1203,6 +1211,7 @@ int run_server(const Args& args) {
       }
     }
 
+    loop_phase("retransmit");
     // Stall-driven retransmit (packet_io::retransmit_stalled): only while the client's
     // cumulative ACK frontier is stuck, a byte-bounded prefix from the head-of-line id,
     // front-inserted on the least-backlogged carriers. Timeout = 4xRTT (floor 500 ms);
@@ -1232,6 +1241,7 @@ int run_server(const Args& args) {
           });
     }
 
+    loop_phase("rs-drain");
     // RS stale-group drain: evict incomplete groups from memory after 4×RTT (min 10 s).
     // We do NOT jump next_deliver_id. Jumping introduces a hole in the SSH byte stream,
     // which SSH detects as a MAC failure and closes the connection. Instead we wait for
@@ -1278,6 +1288,7 @@ int run_server(const Args& args) {
       }
     }
 
+    loop_phase("adapt");
     // When auto_adapt, server manages its own redundancy and informs the client. Run the model
     // when EITHER self-measured c2s spread samples are available OR the client reports a fresh
     // s2c loss estimate: a download-only session (client sends only SMALL pings) never feeds
@@ -1448,6 +1459,7 @@ int run_server(const Args& args) {
         queue_server_config_to_carrier(carriers.begin()->first);
       }
     }
+    loop_phase("metrics");
     // Report observed link quality (from ACKs received from client) so client can adapt carriers.
     if (!carriers.empty() && !server_recent_rtt_ns.empty() && now_ns_val - last_metrics_ns >= metrics_interval_ns) {
       last_metrics_ns = now_ns_val;
@@ -1476,6 +1488,7 @@ int run_server(const Args& args) {
         fflush(dbg);
       }
     }
+    loop_phase("s2c-pump");
     // Refresh the send-window state once per loop pass: outstanding = queued-but-unACKed
     // data; the window caps it (see RateWindow in net_util.h). Reading the backend is wanted
     // only while the window is open AND the pre-encode buffer isn't already holding a full
@@ -1623,6 +1636,7 @@ int run_server(const Args& args) {
         backend_partial_since_ns = 0;
       }
     }
+    loop_phase("flush");
     flush_backend_pending();
     flush_pending_ack();  // belt-and-suspenders: emit the coalesced ACK even if a backend
                           // early-return above skipped flush_backend_pending's own flush

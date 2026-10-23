@@ -308,7 +308,13 @@ Same experiment post-fix: survives.
 ### B17 — Watchdog abort was undiagnosable (FIXED)
 The handler now writes the stall duration and a `backtrace_symbols_fd` backtrace of the
 stuck point (it runs on the stuck thread) to the debug log as well as stderr, then fsyncs.
-Built with `-g` so `addr2line -f -C -e ssh-oll +0xOFF…` gives file:line.
+Built with `-g` so `addr2line -f -C -i -e ssh-oll +0xOFF…` gives file:line. The record is
+self-contained and written with raw write()s from the handler: `t=` (same units as the
+log), stall seconds, `phase=` (last `loop_phase()` marker the loop passed — needed because
+at -O2 the loop body inlines into `run_server`), pid, binary path, and the exact resolve
+command. Debug logs are now line-buffered (`setvbuf _IOLBF`) so every complete line before
+an abort or crash is on disk (previously up to ~1 s of stdio-buffered lines were lost; the
+handler itself can't fflush — the stuck code may hold the FILE lock).
 
 Root cause of the reported abort is not proven: six user-shaped repro runs (280 ms-class
 RTT, loss, 30-120 carriers, bidirectional / bursty / upload, 150-180 s each, 3 s watchdog)

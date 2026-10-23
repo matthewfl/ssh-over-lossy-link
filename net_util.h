@@ -63,6 +63,10 @@ inline volatile sig_atomic_t g_tick_seen = 0;  // stamped by loop iterations (se
 inline int g_log_fd = -1;                       // raw debug-log fd for async-safe write
 inline volatile sig_atomic_t g_last_handler = 0;  // when the itimer handler last ran (seconds)
 inline uint64_t g_stall_seconds = 30;           // configurable for tests
+// Which section of the main loop is running (set via loop_phase()). Printed by the
+// abort path: at -O2 most of the loop is inlined into run_server/run_client, so the
+// phase pins the stuck section even when a backtrace frame is coarse.
+inline const char* volatile g_loop_phase = "startup";
 
 inline uint64_t now_seconds() {
   struct timespec ts{};
@@ -85,6 +89,21 @@ inline void write_all(int fd, const char* p, size_t n) {
   (void)w;
 }
 
+inline uint64_t now_ms() {
+  struct timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000ULL + static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
+}
+
+// Fixed-buffer line builder for the signal handler (no malloc, no stdio).
+struct SigLine {
+  char buf[600];
+  size_t n = 0;
+  SigLine& s(const char* p) { while (p && *p && n < sizeof buf - 1) buf[n++] = *p++; return *this; }
+  SigLine& u(uint64_t v) { if (n + 24 < sizeof buf) n += fmt_u64(buf + n, v); return *this; }
+  void out(int fd) const { write_all(fd, buf, n); }
+};
+
 inline void handler(int) {
   const uint64_t now = now_seconds();
   // Whole-process freeze (VM pause/migration, host CPU starvation, swap storm, SIGSTOP):
@@ -96,45 +115,50 @@ inline void handler(int) {
   const uint64_t prev_handler = static_cast<uint64_t>(g_last_handler);
   g_last_handler = static_cast<sig_atomic_t>(now);
   if (now - prev_handler > 3u * kLoopWatchdogPollSeconds) {
-    char line[128];
-    size_t n = 0;
-    static const char a[] = "[loop-watchdog-skip: whole process was frozen ~";
-    for (char c : a) if (c) line[n++] = c;
-    n += fmt_u64(line + n, now - prev_handler);
-    static const char b[] = " s (not a loop hang); continuing]\n";
-    for (char c : b) if (c) line[n++] = c;
-    write_all(g_log_fd, line, n);
+    SigLine l;
+    l.s("[loop-watchdog-skip t=").u(now_ms()).s(" whole process was frozen ~").u(now - prev_handler)
+     .s(" s (not a loop hang); continuing]\n");
+    l.out(g_log_fd);
     g_tick_seen = static_cast<sig_atomic_t>(now);
     return;
   }
   const uint64_t last = static_cast<uint64_t>(g_tick_seen);
   if (last != 0 && now - last > g_stall_seconds) {
     // The handler runs ON the stuck main thread, so a backtrace taken here IS the stuck
-    // location. Written to the debug log (the server is a daemon with no stderr) and to
-    // stderr (the client's terminal). Resolve frames with:
-    //   addr2line -f -C -e <ssh-oll binary> <+0xOFFSET values>
-    char line[160];
-    size_t n = 0;
-    static const char a[] = "[loop-watchdog-fired: main loop stuck for ";
-    for (char c : a) if (c) line[n++] = c;
-    n += fmt_u64(line + n, now - last);
-    static const char b[] = " s in one iteration; backtrace of the stuck point follows, then abort]\n";
-    for (char c : b) if (c) line[n++] = c;
-    write_all(STDERR_FILENO, line, n);
-    write_all(g_log_fd, line, n);
+    // location. Everything goes straight to the debug-log fd with write() (no stdio: the
+    // stuck thread may hold the FILE lock), so it lands even though the process aborts
+    // right after; also to stderr (the client's terminal). The record is self-contained:
+    // timestamp in the log's t= units, stall length, loop phase, pid, binary path and the
+    // exact command to resolve the frames.
+    char exe[256];
+    ssize_t el = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
+    exe[el > 0 ? el : 0] = '\0';
+    if (el <= 0) { exe[0] = '?'; exe[1] = '\0'; }
+    SigLine l;
+    l.s("[loop-watchdog-fired t=").u(now_ms()).s(" stuck_s=").u(now - last)
+     .s(" phase=").s(g_loop_phase).s(" pid=").u(static_cast<uint64_t>(::getpid()))
+     .s(" exe=").s(exe).s(" — main loop made no progress in one iteration; backtrace of the stuck point follows, then abort]\n");
+    l.out(STDERR_FILENO);
+    l.out(g_log_fd);
 #ifdef SSHOLL_HAVE_BACKTRACE
     void* frames[64];
     int nf = ::backtrace(frames, 64);
     if (g_log_fd >= 0) ::backtrace_symbols_fd(frames, nf, g_log_fd);
     ::backtrace_symbols_fd(frames, nf, STDERR_FILENO);
 #endif
-    static const char z[] = "[loop-watchdog-end]\n";
-    write_all(g_log_fd, z, sizeof(z) - 1);
+    SigLine z;
+    z.s("[loop-watchdog-end resolve with: addr2line -f -C -i -e ").s(exe)
+     .s(" <the +0x... offsets above that belong to that binary>]\n");
+    z.out(g_log_fd);
+    z.out(STDERR_FILENO);
     if (g_log_fd >= 0) ::fsync(g_log_fd);
     ::abort();
   }
 }
 }  // namespace watchdog_detail
+
+// Record which main-loop section is running (string literal; read by the abort path).
+inline void loop_phase(const char* phase) { watchdog_detail::g_loop_phase = phase; }
 
 // Stamp the current time as loop progress. Call once per event-loop iteration.
 inline void loop_watchdog_tick() {
