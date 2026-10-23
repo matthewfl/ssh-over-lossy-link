@@ -317,6 +317,14 @@ model every ~300 ms:
 
 - `--debug` writes verbose logs to `/tmp/ssh-oll-{client,server}-<pid>.log`. The server
   is daemonized with closed stdio, so this is the only way to see server-side state.
+- **Loop watchdog** (`net_util.h`): if one main-loop iteration takes >30 s
+  (`SSHOLL_WATCHDOG_SEC` overrides), it writes `[loop-watchdog-fired: … stuck for N s …]`
+  plus a raw backtrace of the stuck point to the debug log (and stderr), then aborts.
+  Resolve frames with `addr2line -f -C -e <the exact ssh-oll binary> <+0xOFFSETs>` (built
+  with `-g`). A *whole-process* freeze (VM pause, host starvation, SIGSTOP) is detected by
+  the SIGALRM handler itself running late and only logs `[loop-watchdog-skip: …]`. Note the
+  debug log is stdio-buffered (flushed ~1 Hz), so up to ~1 s of lines before an abort are
+  lost.
 - Reproduce link conditions locally with `test_ssh_oll.py --latency-ms` /
   `--latency-random` and the named scenarios in `test_all.sh` (e.g. the
   `wifi-stop-then-recover*` and `connection-death-*` tests for reconnection bugs).

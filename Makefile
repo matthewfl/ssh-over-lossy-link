@@ -12,12 +12,12 @@ EPOLL_SHIM_PREFIX ?= $(shell brew --prefix epoll-shim 2>/dev/null)
 ifeq ($(EPOLL_SHIM_PREFIX),)
 $(error epoll-shim not found. Install with: brew install epoll-shim)
 endif
-CXXFLAGS      = -std=c++17 -Wall -Wextra -O2 -I$(EPOLL_SHIM_PREFIX)/include/libepoll-shim
+CXXFLAGS      = -std=c++17 -Wall -Wextra -O2 -g -I$(EPOLL_SHIM_PREFIX)/include/libepoll-shim
 EPOLL_LDFLAGS = -L$(EPOLL_SHIM_PREFIX)/lib -lepoll-shim
 else
 # Linux: native epoll
 CXX           ?= g++
-CXXFLAGS      = -std=c++17 -Wall -Wextra -O2
+CXXFLAGS      = -std=c++17 -Wall -Wextra -O2 -g
 EPOLL_LDFLAGS =
 endif
 

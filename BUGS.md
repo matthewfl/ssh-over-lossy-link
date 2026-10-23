@@ -285,3 +285,33 @@ queued ahead of a Ctrl-C. Full suite: 38/38.
 - Legacy `run_adapt` /
   `compute_from_deques` / most `CLIENT_METRICS` fields / `should_send_idle_ping` are dead or
   near-dead code.
+
+---
+
+## Round 4 (2026-10-23) — server killed by its own loop watchdog
+
+Report: the session dropped; the server debug log ended with
+`[loop-watchdog-fired: main loop made no progress; aborting (see stderr)` — stderr goes
+nowhere for the daemonized server, and the abort recorded nothing about WHERE it was stuck.
+
+### B16 — Watchdog aborted healthy processes after a whole-process freeze (FIXED)
+The watchdog is a 5 s SIGALRM itimer that aborts when the loop's tick is >30 s stale. If
+the WHOLE process stops running for >30 s (VM pause/migration, host CPU starvation, swap
+storm, SIGSTOP), the first SIGALRM after resume sees the stale tick and aborts before the
+idle loop can stamp it. Reproduced: server with `SSHOLL_WATCHDOG_SEC=3`, SIGSTOP 20 s,
+SIGCONT → abort, backtrace in `epoll_wait` (a healthy idle loop). Fix: the handler records
+when IT last ran; if that gap exceeds 3 poll periods the process was frozen, not stuck —
+log `[loop-watchdog-skip: …]`, re-stamp, continue. A genuinely stuck loop still receives
+the handler on schedule, so real hangs still abort (`loop-watchdog-hang-abort` passes).
+Same experiment post-fix: survives.
+
+### B17 — Watchdog abort was undiagnosable (FIXED)
+The handler now writes the stall duration and a `backtrace_symbols_fd` backtrace of the
+stuck point (it runs on the stuck thread) to the debug log as well as stderr, then fsyncs.
+Built with `-g` so `addr2line -f -C -e ssh-oll +0xOFF…` gives file:line.
+
+Root cause of the reported abort is not proven: six user-shaped repro runs (280 ms-class
+RTT, loss, 30-120 carriers, bidirectional / bursty / upload, 150-180 s each, 3 s watchdog)
+never stalled an iteration, no unbounded loop was found by review, and the server's last
+state was quiet (unacked=0, rs_pending=0). A whole-process freeze of the server host fits
+the evidence; if it was a real hang, the next occurrence now leaves a backtrace.

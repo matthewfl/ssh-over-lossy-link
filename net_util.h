@@ -23,6 +23,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__GLIBC__) || defined(__APPLE__)
+#include <execinfo.h>
+#define SSHOLL_HAVE_BACKTRACE 1
+#endif
 
 namespace ssholl {
 
@@ -57,6 +61,7 @@ inline constexpr int kLoopWatchdogPollSeconds = 5;           // itimer cadence
 namespace watchdog_detail {
 inline volatile sig_atomic_t g_tick_seen = 0;  // stamped by loop iterations (seconds)
 inline int g_log_fd = -1;                       // raw debug-log fd for async-safe write
+inline volatile sig_atomic_t g_last_handler = 0;  // when the itimer handler last ran (seconds)
 inline uint64_t g_stall_seconds = 30;           // configurable for tests
 
 inline uint64_t now_seconds() {
@@ -65,15 +70,67 @@ inline uint64_t now_seconds() {
   return static_cast<uint64_t>(ts.tv_sec);
 }
 
+// Async-signal-safe unsigned -> decimal into buf; returns length.
+inline size_t fmt_u64(char* buf, uint64_t v) {
+  char tmp[24];
+  size_t n = 0;
+  do { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; } while (v && n < sizeof tmp);
+  for (size_t i = 0; i < n; ++i) buf[i] = tmp[n - 1 - i];
+  return n;
+}
+
+inline void write_all(int fd, const char* p, size_t n) {
+  if (fd < 0) return;
+  ssize_t w = ::write(fd, p, n);
+  (void)w;
+}
+
 inline void handler(int) {
   const uint64_t now = now_seconds();
+  // Whole-process freeze (VM pause/migration, host CPU starvation, swap storm, SIGSTOP):
+  // the itimer handler ITSELF ran late, so this process was not executing at all — the
+  // main loop is not stuck, it simply was not scheduled. A genuinely stuck loop still
+  // gets this handler every kLoopWatchdogPollSeconds; only its own tick goes stale.
+  // Aborting here killed healthy sessions (2026-10-23: the first SIGALRM after a >30 s
+  // freeze saw the stale tick before the idle loop could run). Re-arm and carry on.
+  const uint64_t prev_handler = static_cast<uint64_t>(g_last_handler);
+  g_last_handler = static_cast<sig_atomic_t>(now);
+  if (now - prev_handler > 3u * kLoopWatchdogPollSeconds) {
+    char line[128];
+    size_t n = 0;
+    static const char a[] = "[loop-watchdog-skip: whole process was frozen ~";
+    for (char c : a) if (c) line[n++] = c;
+    n += fmt_u64(line + n, now - prev_handler);
+    static const char b[] = " s (not a loop hang); continuing]\n";
+    for (char c : b) if (c) line[n++] = c;
+    write_all(g_log_fd, line, n);
+    g_tick_seen = static_cast<sig_atomic_t>(now);
+    return;
+  }
   const uint64_t last = static_cast<uint64_t>(g_tick_seen);
   if (last != 0 && now - last > g_stall_seconds) {
-    static const char msg[] =
-        "[loop-watchdog-fired: main loop made no progress; aborting (see stderr)\n";
-    ssize_t w = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    if (g_log_fd >= 0) w = ::write(g_log_fd, msg, sizeof(msg) - 1);
-    (void)w;
+    // The handler runs ON the stuck main thread, so a backtrace taken here IS the stuck
+    // location. Written to the debug log (the server is a daemon with no stderr) and to
+    // stderr (the client's terminal). Resolve frames with:
+    //   addr2line -f -C -e <ssh-oll binary> <+0xOFFSET values>
+    char line[160];
+    size_t n = 0;
+    static const char a[] = "[loop-watchdog-fired: main loop stuck for ";
+    for (char c : a) if (c) line[n++] = c;
+    n += fmt_u64(line + n, now - last);
+    static const char b[] = " s in one iteration; backtrace of the stuck point follows, then abort]\n";
+    for (char c : b) if (c) line[n++] = c;
+    write_all(STDERR_FILENO, line, n);
+    write_all(g_log_fd, line, n);
+#ifdef SSHOLL_HAVE_BACKTRACE
+    void* frames[64];
+    int nf = ::backtrace(frames, 64);
+    if (g_log_fd >= 0) ::backtrace_symbols_fd(frames, nf, g_log_fd);
+    ::backtrace_symbols_fd(frames, nf, STDERR_FILENO);
+#endif
+    static const char z[] = "[loop-watchdog-end]\n";
+    write_all(g_log_fd, z, sizeof(z) - 1);
+    if (g_log_fd >= 0) ::fsync(g_log_fd);
     ::abort();
   }
 }
@@ -91,11 +148,16 @@ inline void loop_watchdog_tick() {
 inline void arm_loop_watchdog(int log_fd = -1) {
   using namespace watchdog_detail;
   g_log_fd = log_fd;
+#ifdef SSHOLL_HAVE_BACKTRACE
+  // backtrace() may dlopen libgcc on its first call (not signal-safe): warm it up here.
+  { void* warm[4]; (void)::backtrace(warm, 4); }
+#endif
   if (const char* e = getenv("SSHOLL_WATCHDOG_SEC")) {
     long v = atol(e);
     if (v >= 1) g_stall_seconds = static_cast<uint64_t>(v);
   }
   g_tick_seen = static_cast<sig_atomic_t>(now_seconds());
+  g_last_handler = g_tick_seen;  // freeze detection is valid from the very first tick
   struct sigaction sa{};
   sa.sa_handler = handler;
   sigemptyset(&sa.sa_mask);
